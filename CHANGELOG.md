@@ -1,5 +1,10 @@
 # Release notes
 
+## v1.8.4
+
+- The README lists three ways to clone: SSH key, HTTPS login or `gh`. `gh` is
+  no longer presented as required.
+
 ## v1.8.3
 
 - The README asks for `gh auth setup-git` once, so the upgrade's `git pull`

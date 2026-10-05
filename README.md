@@ -29,7 +29,7 @@ it, so teammates do not approve the same package again.
 |---|---|
 | Claude Code | Hooks must be enabled (they are by default). |
 | `uv`, or Python 3.11+ | The installer adds `uv` to `~/.local/bin` if it is missing. Every machine that runs Claude Code in the project needs one of them. |
-| `git`, and `gh` set up once: `gh auth login`, then `gh auth setup-git` | `gh` fetches the private repository with your GitHub login, and `setup-git` lets the upgrade's `git pull` use it too. |
+| `git` with a GitHub login that has access to this repository | An SSH key, an HTTPS login (keychain, Git Credential Manager, token), or `gh`. See step 1. |
 | Network access to `registry.npmjs.org`, `pypi.org` and `api.osv.dev` | Without it, reviews fail and nothing is installed. |
 
 There are no package dependencies: the guard uses the Python standard library
@@ -37,13 +37,28 @@ only.
 
 ---
 
-## Install or upgrade
+## Install
 
-**1. Fetch the guard and install it into your project.** The same two commands
-install the first time and upgrade later:
+**1. Fetch the guard and install it into your project.**
+
+First time, clone with the GitHub login you already use (pick one line):
 
 ```bash
-if [ -d ~/.cache/package-guard ]; then git -C ~/.cache/package-guard pull --ff-only; else gh repo clone Fefar-AT/package-guard ~/.cache/package-guard -- --depth 1; fi
+git clone --depth 1 git@github.com:Fefar-AT/package-guard.git ~/.cache/package-guard          # SSH key
+git clone --depth 1 https://github.com/Fefar-AT/package-guard.git ~/.cache/package-guard      # HTTPS login
+gh repo clone Fefar-AT/package-guard ~/.cache/package-guard -- --depth 1 && gh auth setup-git # gh, no git login yet
+```
+
+Then install:
+
+```bash
+sh ~/.cache/package-guard/install.sh /path/to/your-project
+```
+
+To upgrade later, pull and install again:
+
+```bash
+git -C ~/.cache/package-guard pull --ff-only
 sh ~/.cache/package-guard/install.sh /path/to/your-project
 ```
 
