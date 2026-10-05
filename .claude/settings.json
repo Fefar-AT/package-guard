@@ -1,0 +1,49 @@
+{
+  "permissions": {
+    "_comment": "Guard state is written only by the guard CLI behind its prompts. These rules stop the Edit/Write tools; hook.py stops Bash writes naming the directory. The hook source directory is not listed here: the installer adds separate rules that lock the guard's own files in the projects it installs into.",
+    "deny": [
+      "Edit(.claude/package-guard/**)",
+      "Edit(~/.config/package-guard/**)",
+      "Edit(.claude/hooks/package_guard/trusted-packages.json)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/run.sh\" \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/hook.py\" 2",
+            "_comment": "A timed-out PreToolUse hook lets the command through (documented harness behaviour), so this ceiling is a fail-open bound. hook.py bounds its own work to stay under it: _REVIEW_BATCH new reviews per run within _REVIEW_BUDGET_SECONDS, with the arithmetic next to those constants. Change this and those together.",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/run.sh\" \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/post_hook.py\" 0",
+            "_comment": "The reconciliation layer. This timeout is NOT a security bound and cannot contribute to the fail-open the PreToolUse ceiling is: (1) the command has already run when this fires, so a timeout here does not let anything through that was going to be blocked; (2) post_hook.py makes no network call -- its whole cost is local stat() and small file reads, so there is nothing to budget or defer, and none of the PreToolUse batch/deadline machinery exists here; (3) anything it misses is re-derived from the same filesystem by the next PreToolUse advance and refused by the Stop hook, because the watermark is durable and project-scoped rather than per-invocation. It fails OPEN by design: this hook is not the gate, and a PostToolUse hook that failed closed would block the agent after a command that already ran. 15s is generous for a local scan; if it is ever hit, the scan is walking something it should not be (see disk_guard.SKIP_DIRECTORIES and MAX_SCAN_DEPTH).",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/run.sh\" \"$CLAUDE_PROJECT_DIR/.claude/hooks/package_guard/stop_hook.py\" 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

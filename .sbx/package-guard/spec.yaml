@@ -1,0 +1,53 @@
+# Docker Sandboxes kit: Package Guard in every sandbox.
+#
+#   sbx run claude --kit <path-to-this-directory> .
+#   sbx create --name <n> claude --kit <path-to-this-directory> .
+#
+# On sandbox creation it runs the Package Guard one-liner against the
+# workspace, so Claude Code inside the sandbox is gated from its first command.
+# The sandbox's outbound proxy is closed by default; the allow list below is
+# exactly what the installer and the guard need. PG_REPO points at the
+# published repository; while that repository is private, the sandbox needs a
+# git credential for github.com (a token in the clone URL, or a credential
+# helper the image carries) or the install step fails at the clone.
+
+kind: mixin
+name: package-guard
+
+setup:
+  install:
+    - command: >-
+        curl -fsSL "${PG_INSTALL_URL}" |
+        PG_REPO="${PG_REPO}" PG_REF="${PG_REF}" sh -s -- "${WORKDIR}"
+
+environment:
+  variables:
+    PG_REPO: "https://github.com/Fefar-AT/package-guard.git"
+    PG_REF: "release"
+    PG_INSTALL_URL: "https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh"
+
+permissions:
+  network:
+    allow:
+      # the guard's evidence sources: registries and OSV, plus the
+      # reputation tier's npm downloads, the PyPI top-packages list and the
+      # repository manifest on raw GitHub. Without these every
+      # package is unresolved and goes to the vetter.
+      - registry.npmjs.org
+      - api.npmjs.org
+      - pypi.org
+      - api.osv.dev
+      - hugovk.github.io
+      - raw.githubusercontent.com
+      # the installer: uv (and a managed CPython if the image has no 3.11+);
+      # github.com covers the Package Guard repository and uv's release
+      # assets on objects.githubusercontent.com
+      - astral.sh
+      - github.com
+      - objects.githubusercontent.com
+
+agentInstructions:
+  content: |
+    This project runs Package Guard. Before any npm / pip / uv command that
+    acquires a package, invoke the `package-guard` skill and follow it. A
+    denial that starts with PACKAGE_GUARD_ is expected; never work around it.

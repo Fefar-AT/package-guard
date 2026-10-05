@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "catalog_version": "2026-09-07.1",
+  "reviewed_at": "2026-09-07",
+  "expires_at": "2027-03-06",
+  "packages": [
+    {
+      "ecosystem": "npm",
+      "name": "react",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/react/react",
+      "source": "https://react.dev/learn/add-react-to-an-existing-project"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "react-dom",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/react/react",
+      "source": "https://react.dev/learn/add-react-to-an-existing-project"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "express",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/expressjs/express",
+      "source": "https://github.com/expressjs/express"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "commander",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/tj/commander.js",
+      "source": "https://github.com/tj/commander.js"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "marked",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/markedjs/marked",
+      "source": "https://github.com/markedjs/marked"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "date-fns",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/date-fns/date-fns",
+      "source": "https://github.com/date-fns/date-fns"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "zod",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/colinhacks/zod",
+      "source": "https://github.com/colinhacks/zod"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "typescript",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/microsoft/TypeScript",
+      "source": "https://github.com/microsoft/TypeScript"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "lodash",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/lodash/lodash",
+      "source": "https://github.com/lodash/lodash"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "axios",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/axios/axios",
+      "source": "https://github.com/axios/axios"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "prettier",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/prettier/prettier",
+      "source": "https://github.com/prettier/prettier"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "eslint",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/eslint/eslint",
+      "source": "https://github.com/eslint/eslint"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "vite",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/vitejs/vite",
+      "source": "https://github.com/vitejs/vite"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "vitest",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/vitest-dev/vitest",
+      "source": "https://github.com/vitest-dev/vitest"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "next",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/vercel/next.js",
+      "source": "https://github.com/vercel/next.js"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@types/node",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/DefinitelyTyped/DefinitelyTyped",
+      "source": "https://github.com/DefinitelyTyped/DefinitelyTyped"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@types/react",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/DefinitelyTyped/DefinitelyTyped",
+      "source": "https://github.com/DefinitelyTyped/DefinitelyTyped"
+    },
+    {
+      "ecosystem": "npm",
+      "name": "@testing-library/react",
+      "registry": "https://registry.npmjs.org",
+      "repository": "https://github.com/testing-library/react-testing-library",
+      "source": "https://github.com/testing-library/react-testing-library"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "requests",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/psf/requests",
+      "source": "https://github.com/psf/requests"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "numpy",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/numpy/numpy",
+      "source": "https://github.com/numpy/numpy"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "pandas",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pandas-dev/pandas",
+      "source": "https://github.com/pandas-dev/pandas"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "scipy",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/scipy/scipy",
+      "source": "https://github.com/scipy/scipy"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "flask",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pallets/flask",
+      "source": "https://github.com/pallets/flask"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "django",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/django/django",
+      "source": "https://github.com/django/django"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "fastapi",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/fastapi/fastapi",
+      "source": "https://github.com/fastapi/fastapi"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "pydantic",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pydantic/pydantic",
+      "source": "https://github.com/pydantic/pydantic"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "pytest",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pytest-dev/pytest",
+      "source": "https://github.com/pytest-dev/pytest"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "click",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pallets/click",
+      "source": "https://github.com/pallets/click"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "rich",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/Textualize/rich",
+      "source": "https://github.com/Textualize/rich"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "httpx",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/encode/httpx",
+      "source": "https://github.com/encode/httpx"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "sqlalchemy",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/sqlalchemy/sqlalchemy",
+      "source": "https://github.com/sqlalchemy/sqlalchemy"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "pillow",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/python-pillow/Pillow",
+      "source": "https://github.com/python-pillow/Pillow"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "pyyaml",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/yaml/pyyaml",
+      "source": "https://github.com/yaml/pyyaml"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "packaging",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/pypa/packaging",
+      "source": "https://github.com/pypa/packaging"
+    },
+    {
+      "ecosystem": "pypi",
+      "name": "typing-extensions",
+      "registry": "https://pypi.org",
+      "repository": "https://github.com/python/typing_extensions",
+      "source": "https://github.com/python/typing_extensions"
+    }
+  ]
+}
