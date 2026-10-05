@@ -29,7 +29,7 @@ it, so teammates do not approve the same package again.
 |---|---|
 | Claude Code | Hooks must be enabled (they are by default). |
 | `uv`, or Python 3.11+ | The installer adds `uv` to `~/.local/bin` if it is missing. Every machine that runs Claude Code in the project needs one of them. |
-| `git`, and `gh` logged in (`gh auth login`) | `gh` fetches the private repository with your existing GitHub login. |
+| `git`, and `gh` set up once: `gh auth login`, then `gh auth setup-git` | `gh` fetches the private repository with your GitHub login, and `setup-git` lets the upgrade's `git pull` use it too. |
 | Network access to `registry.npmjs.org`, `pypi.org` and `api.osv.dev` | Without it, reviews fail and nothing is installed. |
 
 There are no package dependencies: the guard uses the Python standard library
@@ -181,6 +181,8 @@ version still needs your approval in each project.
 | Symptom | Cause | Fix |
 |---|---|---|
 | The clone asks for a password or says "not found" | The repository is private and your GitHub account has no access | Ask the maintainer for access; run `gh auth login` |
+| The clone says "Repository not found" although you have access | Your git config sends GitHub URLs over SSH (`url...insteadOf`) with a key from another account | Run `git config --global --get-regexp insteadof`, and remove the rule or use the account's SSH key |
+| The upgrade's `git pull` asks for a username | git cannot use your `gh` login | Run `gh auth setup-git` once |
 | Every command is denied with "no runner found" | Claude Code started from the macOS dock without `~/.local/bin` on PATH | Start `claude` from a terminal |
 | A package installs with no prompt | The hooks are not loaded | Restart Claude Code in the project root; run `--check` |
 | A refusal that does not start with `PACKAGE_GUARD_` | Something other than the guard blocked it | Read the message; the guard is not involved |

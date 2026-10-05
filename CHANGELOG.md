@@ -1,5 +1,10 @@
 # Release notes
 
+## v1.8.3
+
+- The README asks for `gh auth setup-git` once, so the upgrade's `git pull`
+  can use your `gh` login, and covers two clone failures in Troubleshooting.
+
 ## v1.8.2
 
 - Install and upgrade use the same two commands: `gh repo clone` on the first
