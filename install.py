@@ -53,6 +53,8 @@ STATE_DIR = Path(".claude/package-guard")
 SETTINGS = Path(".claude/settings.json")
 
 COMPONENTS = (HOOK_DIR, AGENT_FILE, SKILL_DIR)
+# Written inside the hook copy, so it is committed and removed with it.
+VERSION_FILE = HOOK_DIR / "VERSION"
 
 # The guard's own settings are the source of truth: entries are recognised by
 # these substrings, so the installer carries no copy of a hook command that
@@ -193,7 +195,7 @@ def _check_source() -> None:
     if not (SOURCE / HOOK_DIR / "run.sh").is_file():
         raise InstallError(
             f"{SOURCE / HOOK_DIR} has no run.sh; this checkout predates the runner. "
-            "Install from the release branch."
+            "Install from the main branch."
         )
 
 
@@ -422,7 +424,23 @@ def install(target: Path, sandbox: bool = False) -> list[str]:
     changed += _append_claude_md(target)
     changed += _seed_state(target)
     changed += _append_gitignore(target)
+    (target / VERSION_FILE).write_text(source_version() + "\n", encoding="utf-8")
     return changed
+
+
+def source_version() -> str:
+    """The release this clone holds; a development checkout has no VERSION."""
+    try:
+        return (SOURCE / "VERSION").read_text(encoding="utf-8").strip() or "dev"
+    except OSError:
+        return "dev"
+
+
+def installed_version(target: Path) -> str | None:
+    try:
+        return (target / VERSION_FILE).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def seed_user_catalog(path: Path | None = None) -> str:
@@ -583,7 +601,7 @@ def _settings_or_empty(target: Path) -> dict:
 
 def _next_steps(target: Path, sandboxed: bool) -> list[str]:
     """What the person who ran the installer does next, in order."""
-    lines = ["", f"Package Guard installed in {target}", ""]
+    lines = ["", f"Package Guard installed in {target}: {source_version()}", ""]
     if sandboxed:
         lines += [
             "Sandbox: ON. Bash cannot write the guard's files or approvals; every host",
@@ -643,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.check:
             rows = check(target, args.sandbox)
+            print(f"installed {installed_version(target) or 'unknown (installed before v1.8.2)'}"
+                  f"; this clone is {source_version()}")
             for ok, what in rows:
                 print(f"{'pass' if ok else 'MISSING'}  {what}")
             return 0 if all(ok for ok, _ in rows) else 1

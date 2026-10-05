@@ -13,37 +13,45 @@ pinned to the exact version you saw.
 Approval is per `name@version`, recorded in the project, and committed with
 it, so teammates do not approve the same package again.
 
+> **Before you install**
+>
+> - macOS, Linux or WSL2 only. Native Windows is not supported.
+> - Claude installs packages with `npm`, `npx`, `pip` and `uv` only. `pnpm`,
+>   `yarn`, `bun`, `pipx`, `poetry` and `conda` are refused, so a project that
+>   uses one of them cannot use the guard yet.
+> - Internal use only. Do not share it outside the organization.
+
 ---
 
 ## Requirements
 
 | Need | Notes |
 |---|---|
-| macOS, Linux or WSL2 | Native Windows is not supported. |
 | Claude Code | Hooks must be enabled (they are by default). |
 | `uv`, or Python 3.11+ | The installer adds `uv` to `~/.local/bin` if it is missing. Every machine that runs Claude Code in the project needs one of them. |
-| `git` | For the installer. |
+| `git`, and `gh` logged in (`gh auth login`) | `gh` fetches the private repository with your existing GitHub login. |
 | Network access to `registry.npmjs.org`, `pypi.org` and `api.osv.dev` | Without it, reviews fail and nothing is installed. |
 
 There are no package dependencies: the guard uses the Python standard library
-only, and writes nothing outside your project.
+only.
 
 ---
 
-## Install
+## Install or upgrade
 
-**1. Install into your project.**
+**1. Fetch the guard and install it into your project.** The same two commands
+install the first time and upgrade later:
 
 ```bash
-git clone --depth 1 --branch release https://github.com/Fefar-AT/package-guard.git ~/.cache/package-guard
+if [ -d ~/.cache/package-guard ]; then git -C ~/.cache/package-guard pull --ff-only; else gh repo clone Fefar-AT/package-guard ~/.cache/package-guard -- --depth 1; fi
 sh ~/.cache/package-guard/install.sh /path/to/your-project
 ```
 
 A path that does not exist yet becomes a new project, with `git init`. Once
-the repository is public, this one-liner does the same from inside a project:
+the repository is public, this one-liner does both from inside a project:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/main/install.sh | sh
 ```
 
 **2. Commit.** The installer prints the exact `git add` and `git commit` to run.
@@ -54,15 +62,36 @@ curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/inst
 **4. Try it.** Ask Claude to add a package, for example "add date-fns". You
 should get one permission prompt showing the package's evidence.
 
-Check an install at any time:
+Check an install, and the version it runs, at any time:
 
 ```bash
 python3 ~/.cache/package-guard/install.py /path/to/your-project --check
 ```
 
-**Upgrade:** run step 1 again. **Remove:**
+**Remove:**
 `python3 ~/.cache/package-guard/install.py /path/to/your-project --uninstall`.
 Removal keeps `vetted.json` and `declined.json`, your record of decisions.
+
+## What gets added to your project
+
+Review these before you commit them:
+
+- `.claude/hooks/package_guard/`: the guard, with a `VERSION` file
+- `.claude/agents/package-vetter.md` and `.claude/skills/package-guard/`
+- `.claude/settings.json`: the guard's hooks and deny rules, merged into what
+  is already there
+- `.claude/package-guard/`: `vetted.json`, `declined.json` and
+  `reports/.gitignore`, your approvals
+- `CLAUDE.md`: a `## Packages` section, appended
+- `.gitignore`: four lines for the guard's machine-local files
+
+Outside the project, the installer writes only the clone in
+`~/.cache/package-guard`, and `uv` in `~/.local/bin` if it was missing.
+
+## Feedback
+
+Open an issue at https://github.com/Fefar-AT/package-guard/issues and include
+the `installed vX` line that `--check` prints.
 
 ---
 

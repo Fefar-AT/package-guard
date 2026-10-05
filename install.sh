@@ -1,9 +1,9 @@
 #!/bin/sh
 # Package Guard bootstrap -- one command on a developer machine.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- <new-dir>    creates <new-dir>, git init, guards it
-#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh                    guards the current directory
-#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- <project>    guards an existing <project>
+#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/main/install.sh | sh -s -- <new-dir>    creates <new-dir>, git init, guards it
+#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/main/install.sh | sh                    guards the current directory
+#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/main/install.sh | sh -s -- <project>    guards an existing <project>
 #   sh install.sh [<project>]                                same, from a clone
 #
 # A target that does not exist yet is a fresh project: the directory is created
@@ -32,7 +32,7 @@
 #
 # Settings, all overridable from the environment:
 #   PG_REPO   git URL of the Package Guard repository
-#   PG_REF    branch or tag to install (default: release)
+#   PG_REF    branch or tag to install (default: main)
 #   PG_HOME   where the clone lives (default: ~/.cache/package-guard)
 #   PG_UV_VERSION      uv version to install when needed (default: pinned below)
 #   PG_PY_VERSION      CPython to install when no 3.11+ exists (default: pinned below)
@@ -42,7 +42,7 @@
 set -eu
 
 PG_REPO="${PG_REPO:-https://github.com/Fefar-AT/package-guard.git}"
-PG_REF="${PG_REF:-release}"
+PG_REF="${PG_REF:-main}"
 PG_HOME="${PG_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/package-guard}"
 # Pinned so every machine runs the same runner. Bump deliberately, with a run
 # of the install matrix; PG_UV_VERSION overrides for a one-off.
@@ -190,7 +190,7 @@ else
 fi
 
 [ -f "$src/.claude/hooks/package_guard/run.sh" ] \
-    || fail "$src has no run.sh: that ref predates the runner. Use PG_REF=release."
+    || fail "$src has no run.sh: that ref predates the runner. Use PG_REF=main."
 
 # --- 4. install ----------------------------------------------------------------
 

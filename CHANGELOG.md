@@ -1,5 +1,15 @@
 # Release notes
 
+## v1.8.2
+
+- Install and upgrade use the same two commands: `gh repo clone` on the first
+  run, `git pull` after that. A private repository now works with your
+  existing `gh` login.
+- The branch is now `main`.
+- The installer and `--check` print the installed version.
+- The README lists what you need before installing, what the install adds to
+  your project, and where to send feedback.
+
 ## v1.8.1
 
 First release from this repository.
