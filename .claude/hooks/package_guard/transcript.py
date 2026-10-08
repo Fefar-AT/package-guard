@@ -550,6 +550,9 @@ def _assignments(records) -> tuple:
 def _asked_of(record, by_use, by_agent) -> set:
     """The review ids the vetter that delivered `record` was asked about."""
     origin = _origin(record)
+    attachment = record.get("attachment")
+    if not origin and isinstance(attachment, dict) and isinstance(attachment.get("origin"), dict):
+        origin = attachment["origin"]
     if origin.get("kind") == "peer":
         return set(by_agent.get(origin.get("from"), ()))
     asked = set()
@@ -578,6 +581,13 @@ def _vetter_texts(record, launches, agents, descriptions=None):
         attachment = record.get("attachment")
         if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
             queued = attachment.get("prompt")
+            origin = attachment.get("origin")
+            if (isinstance(origin, dict) and origin.get("kind") == "peer"
+                    and origin.get("from") in agents and isinstance(queued, str)):
+                # Current builds deliver the hand-back as a queued command
+                # whose harness-written origin names the vetter's agent id.
+                yield _handback_report(queued)
+                return
     if queued is not None:
         # A session can end before the queued notification becomes a user
         # turn; the queue record is then the only copy of the report.

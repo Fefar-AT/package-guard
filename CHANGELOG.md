@@ -1,5 +1,11 @@
 # Release notes
 
+## v1.8.5
+
+- Package Guard reads a vetter's report on current Claude Code builds, which
+  deliver it as a queued message. Before this, approvals of packages that
+  needed the vetter were refused.
+
 ## v1.8.4
 
 - The README lists three ways to clone: SSH key, HTTPS login or `gh`. `gh` is
