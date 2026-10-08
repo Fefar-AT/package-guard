@@ -27,6 +27,7 @@ Standard library only.
 """
 from __future__ import annotations
 
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -149,7 +150,33 @@ def direct_names(scope: Scope) -> set:
     return set()
 
 
-def scope_packages(scope: Scope) -> list:
+def environments(directory, root=None, current=()) -> list:
+    """The Python environments to reconcile for the scope in `directory`, in order.
+
+    1. `current`: the environment the command being decided names, which the
+       hook passes in -- this module never reads a command;
+    2. the environments the hook recorded for this directory when it allowed
+       a command naming one (`store.recorded_environments`);
+    3. `<directory>/.venv`.
+
+    Every one is read, not just the first that exists: a project can install
+    into an outside environment and later into `.venv` again, and reading one
+    would blind the scan to the other. Duplicates by real path are dropped.
+    """
+    candidates = [Path(p) for p in current]
+    if root is not None:
+        candidates += [Path(p) for p in store.recorded_environments(root, directory)]
+    candidates.append(Path(directory) / ".venv")
+    found, seen = [], set()
+    for candidate in candidates:
+        key = os.path.realpath(candidate)
+        if key not in seen:
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+
+def scope_packages(scope: Scope, root=None, current=()) -> list:
     """Installed packages of a scope, already intersected with its direct set."""
     wanted = direct_names(scope)
     if not wanted:
@@ -157,12 +184,14 @@ def scope_packages(scope: Scope) -> list:
     if scope.kind == "npm":
         installed = inventory.node_modules_packages(scope.directory)
     else:
-        installed = inventory.dist_info_packages(Path(scope.directory) / ".venv")
+        installed = []
+        for environment in environments(scope.directory, root, current):
+            installed.extend(inventory.dist_info_packages(environment))
     return [package for package in installed if package.name in wanted]
 
 
 def collect(project_root, npx_cache_root=None, uv_tools_root=None,
-            uv_environments_root=None):
+            uv_environments_root=None, root=None, current=None):
     """(packages, scopes): every in-scope installed package, deduplicated.
 
     Three of the five sources are their own direct set: the npx cache records
@@ -170,11 +199,16 @@ def collect(project_root, npx_cache_root=None, uv_tools_root=None,
     bin/ proxy stands in for a receipt that does not exist. Those roots are
     machine-GLOBAL -- they hold packages from unrelated projects, and only the
     one-time seed keeps those out of the finding set.
+
+    `root` is the guard root whose recorded environments are read; `current`
+    maps a directory to the environments the command being decided names.
     """
     scopes = discover_scopes(project_root)
+    current = {os.path.realpath(d): tuple(paths) for d, paths in (current or {}).items()}
     packages = []
     for scope in scopes:
-        packages.extend(scope_packages(scope))
+        packages.extend(scope_packages(
+            scope, root, current.get(os.path.realpath(scope.directory), ())))
     packages.extend(inventory.npx_cache_packages(npx_cache_root))
     packages.extend(inventory.uv_tool_packages(uv_tools_root))
     packages.extend(inventory.uvx_environment_packages(uv_environments_root))
@@ -248,7 +282,7 @@ def open_findings(root) -> list:
 def reconcile(root, project_root=None, detected_by: str = "PostToolUse",
               session_id=None, command=None, npx_cache_root=None,
               uv_tools_root=None, uv_environments_root=None, now=None,
-              session_started=None) -> Result:
+              session_started=None, environments=None) -> Result:
     """Compare disk against the declared, vetted and already-decided sets.
 
     `session_started` (a datetime, from `transcript.session_started`) is the
@@ -256,6 +290,9 @@ def reconcile(root, project_root=None, detected_by: str = "PostToolUse",
     before it was put there by something other than this session, and is
     absorbed without a finding. An entry that cannot be dated is not absorbed.
     None applies no cutoff.
+
+    `environments` maps a directory to the Python environments the command
+    being decided names; the recorded ones are read whatever it says.
 
     Raises store.StoreError if guard state is unreadable; every caller decides
     its own failure policy for that, because they differ (the Stop hook fails
@@ -267,6 +304,8 @@ def reconcile(root, project_root=None, detected_by: str = "PostToolUse",
         npx_cache_root=npx_cache_root,
         uv_tools_root=uv_tools_root,
         uv_environments_root=uv_environments_root,
+        root=root,
+        current=environments,
     )
     state = store.load_disk_state(root)
     existing = open_findings(root)

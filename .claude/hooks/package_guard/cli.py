@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sys
 import time
+from concurrent import futures
 from pathlib import Path
 
 # The floor, checked before the siblings are imported (see hook.py). Exit 2: this
@@ -69,10 +70,167 @@ def _label(identity: dict) -> str:
     return f"{identity['ecosystem']}:{identity['name']}@{identity['version']}"
 
 
-def _summary(report: dict, root) -> str:
+# `show` re-fetches the evidence it prints, under the same kind of budget as the
+# approve prompt's refresh. Past it, or on a provider failure, the stored
+# review-time evidence is printed and labelled as such.
+_SHOW_REFRESH_SECONDS = 60.0
+_SHOW_WORKERS = 8
+
+
+def _refresh(reports) -> dict:
+    """review_id -> a fresh vetting.gather() result, or None when it failed."""
+    if not reports:
+        return {}
+
+    def fetch(report):
+        identity = report["resolved_identity"]
+        request = pg_manifest.as_request(
+            identity["name"], identity["version"], "(show refresh)", identity["ecosystem"])
+        if identity["ecosystem"] != "pypi":
+            return vetting.gather(request)
+        # The interpreter the review judged the wheels against, and where it
+        # came from, as the approve prompt's refresh does.
+        source = vetting.reviewed_python_source(report)
+        if source:
+            return vetting.gather(request, python=vetting.reviewed_python(report), python_source=source)
+        return vetting.gather(request, python=vetting.reviewed_python(report))
+
+    pool = futures.ThreadPoolExecutor(max_workers=min(_SHOW_WORKERS, len(reports)))
+    submitted = {report["review_id"]: pool.submit(fetch, report) for report in reports}
+    done, _not_done = futures.wait(list(submitted.values()), timeout=_SHOW_REFRESH_SECONDS)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return {rid: (future.result() if future in done and future.exception() is None else None)
+            for rid, future in submitted.items()}
+
+
+def _view(report: dict, found) -> dict | None:
+    """The stored report with its evidence replaced by a fresh gather, or None
+    when the refresh did not produce evidence to print."""
+    if not isinstance(found, dict) or any(
+            str(f).startswith("mandatory provider failure") for f in found.get("hard_findings") or []):
+        return None
+    view = dict(report)
+    view["mandatory_checks"] = found.get("mandatory") or report.get("mandatory_checks") or {}
+    view["evidence"] = found.get("evidence") or {}
+    view["optional_checks"] = dict(report.get("optional_checks") or {},
+                                   provenance=found.get("provenance"),
+                                   reputation=found.get("reputation"))
+    if "release_continuity" in found:
+        view["optional_checks"]["release_continuity"] = found["release_continuity"]
+    view["risk_signals"] = found.get("risk_signals") or []
+    view["hard_findings"] = found.get("hard_findings") or []
+    return view
+
+
+def _age(days) -> str:
+    if not isinstance(days, int) or isinstance(days, bool):
+        return "unknown"
+    return f"{days // 365}y ({days} days)" if days >= 365 else f"{days} day(s)"
+
+
+def _count(value) -> str:
+    return f"{value:,}" if isinstance(value, int) and not isinstance(value, bool) else "unknown"
+
+
+def _yes_no(value, yes: str, no: str) -> str:
+    return yes if value is True else no if value is False else "unknown"
+
+
+def _evidence_lines(report: dict) -> list:
+    """Every fact the approve prompt leaves out, one labelled line each."""
     identity = report["resolved_identity"]
-    osv = report["mandatory_checks"].get("osv", {})
-    evidence = report.get("evidence", {})
+    evidence = report.get("evidence") or {}
+    optional = report.get("optional_checks") or {}
+    osv = (report.get("mandatory_checks") or {}).get("osv") or {}
+    lines = [
+        "Vulnerability/malware database (OSV) ids: "
+        f"{', '.join(osv.get('ids') or []) or 'no matching record was returned'}",
+        f"Repository: {evidence.get('repository_url') or 'none listed'}",
+    ]
+    if identity.get("ecosystem") == "pypi":
+        lines.append("Install-time code: " + (vetting.assumed_wheel(evidence) or {
+            "wheel": "wheel (none)", "sdist-only": "sdist only (setup.py may run)",
+            "sdist-build": "no wheel for this platform (setup.py may run)",
+        }.get(evidence.get("distribution"), "not determined")))
+    else:
+        lines.append(f"Install scripts: {', '.join(evidence.get('install_scripts') or []) or 'none'}")
+    provenance = optional.get("provenance")
+    if isinstance(provenance, dict):
+        attested = "attested" + (f" ({provenance['url']})" if provenance.get("url") else "") \
+            if provenance.get("attested") else "not attested"
+    else:
+        attested = "not checked"
+    maintainers = [str(m) for m in evidence.get("maintainers") or []]
+    lines += [
+        f"Provenance: {attested}",
+        f"Publisher: {evidence.get('publisher') or 'not recorded'}"
+        + (f" (npm trusted publishing: {evidence['trusted_publisher']})"
+           if evidence.get("trusted_publisher") else ""),
+        f"Maintainers: {', '.join(maintainers) or 'none listed'}",
+        f"Age: package {_age(evidence.get('package_age_days'))}, "
+        f"version {_age(evidence.get('version_age_days'))}",
+        f"Releases: {_count(evidence.get('release_count'))}; "
+        f"dependencies: {_count(evidence.get('dependency_count'))}",
+        f"License: {evidence.get('license') or 'none declared'} "
+        f"({evidence.get('license_class') or 'class not recorded'})",
+    ]
+    reputation = optional.get("reputation")
+    if isinstance(reputation, dict):
+        trust = reputation.get("trust")
+        # A trust-catalog identity skips the popularity research: unknown
+        # there means not asked, not unreadable.
+        skipped = ("not checked (trust catalog identity)"
+                   if isinstance(trust, dict) and trust.get("status") == "trusted" else None)
+        manifest = reputation.get("manifest") if isinstance(reputation.get("manifest"), dict) else {}
+        near = [n for n in reputation.get("near_names") or [] if isinstance(n, dict)]
+        # PyPI's near names carry the top list's monthly counts.
+        period = "month" if identity.get("ecosystem") == "pypi" else "week"
+        near_text = ", ".join(f"{n.get('name')} ({_count(n.get('weekly_downloads'))}/{period})"
+                              for n in near)
+        if reputation.get("lookalike_of"):
+            near_text += f"; possible lookalike of {reputation['lookalike_of']}"
+        downloads = reputation.get("weekly_downloads")
+        lines += [
+            f"Weekly downloads: {skipped if downloads is None and skipped else _count(downloads)}",
+            "Repository manifest: " + {
+                True: "names this package", False: "names a different package",
+            }.get(manifest.get("names_package"), skipped or "could not be read")
+            + (f" ({manifest['url']})" if manifest.get("url") else ""),
+            f"Near names: {near_text or skipped or 'none found'}",
+        ]
+        if isinstance(trust, dict):
+            line = f"Trust: {trust.get('status')}"
+            if trust.get("status") == "trusted":
+                line += (f" identity (catalog {trust.get('catalog_version')}, canonical repository "
+                         f"{trust.get('repository')}); this does not grant this project's approval")
+            elif trust.get("reason"):
+                line += f" ({trust.get('reason')})"
+            lines.append(line)
+        lines.append(f"Reputation: {reputation.get('tier')}")
+        for reason in reputation.get("unmet") or []:
+            lines.append(f"  unmet: {reason}")
+    else:
+        lines.append("Reputation: not checked")
+    continuity = optional.get("release_continuity")
+    if isinstance(continuity, dict):
+        lines.append(
+            f"Release continuity: baseline {continuity.get('baseline') or 'none'}; "
+            f"this version {_yes_no(continuity.get('attested'), 'attested', 'not attested')}; "
+            f"baseline {_yes_no(continuity.get('baseline_attested'), 'attested', 'not attested')}; "
+            f"publisher {_yes_no(continuity.get('same_publisher'), 'same as the baseline', 'changed')}; "
+            f"new install scripts: {', '.join(map(str, continuity.get('new_install_scripts') or [])) or 'none'}; "
+            f"new dependencies: {', '.join(map(str, continuity.get('new_dependencies') or [])) or 'none'}")
+    for finding in report.get("hard_findings") or []:
+        lines.append(f"Hard finding: {finding}")
+    for signal in report.get("risk_signals") or []:
+        lines.append(f"Risk signal: {signal}")
+    return lines
+
+
+def _summary(report: dict, root, found=None) -> str:
+    """Everything the review holds, with its evidence refreshed when `found`
+    carries a fresh gather, and stamped with both times either way."""
+    identity = report["resolved_identity"]
     status = report["verdict"]
     if store.is_vetted(root, identity):
         status += " (vetted)"
@@ -84,30 +242,17 @@ def _summary(report: dict, root) -> str:
         later = store.superseded_by(root, report)
         if later is not None:
             status += f" (superseded by {_label(later)}, approved {later.get('approved_at')})"
+    view = _view(report, found)
+    stamp = (f"Evidence: refreshed {store.utcnow()}; reviewed {report.get('created_at')}"
+             if view is not None else
+             f"Evidence: as of the review, {report.get('created_at')} (the refresh did not finish)")
     lines = [
-        f"Review {report['review_id']} ({report['created_at']})",
+        f"Review {report['review_id']} ({report.get('created_at')})",
         f"Package: {_label(identity)}",
         f"Registry: {identity['registry']}",
         f"Verdict: {status}",
-        f"OSV ids: {', '.join(osv.get('ids') or []) or 'no matching OSV record was returned'}",
-        f"Repository: {evidence.get('repository_url') or 'none listed'}",
-        f"Install scripts: {', '.join(evidence.get('install_scripts') or []) or 'none'}",
-    ]
-    for finding in report.get("hard_findings") or []:
-        lines.append(f"Hard finding: {finding}")
-    for signal in report.get("risk_signals") or []:
-        lines.append(f"Risk signal: {signal}")
-    reputation = (report.get("optional_checks") or {}).get("reputation")
-    if isinstance(reputation, dict):
-        lines.append(f"Reputation: {reputation.get('tier')}")
-        trust = reputation.get("trust")
-        if isinstance(trust, dict):
-            lines.append(f"User identity trust: {trust.get('status')} (catalog {trust.get('catalog_version')})")
-            lines.append("Identity trust does not grant this project's exact-version installation approval.")
-        for reason in reputation.get("unmet") or []:
-            lines.append(f"  unmet: {reason}")
-    else:
-        lines.append("Reputation: not checked")
+        stamp,
+    ] + _evidence_lines(view if view is not None else report)
     if report.get("retry_command"):
         lines.append(f"Retry command: {report['retry_command']}")
     return "\n".join(lines)
@@ -249,13 +394,42 @@ def _reconcile(root) -> int:
     for problem in blocked:
         print(f"BLOCKED: {problem}")
     if ids:
-        joined = " ".join(ids)
+        # The hook's own split and order, so every command printed here is one
+        # approve accepts: recommended ids first, then the decision ids.
+        import hook as pg_hook
+        established, unresolved, lookalikes = [], [], []
+        for rid in ids:
+            try:
+                report = store.load_report(root, rid)
+            except store.StoreError:
+                report = {}
+            if vetting.is_established(report):
+                established.append(rid)
+            elif report and pg_hook._lookalike_of(report):
+                lookalikes.append(rid)
+            else:
+                unresolved.append(rid)
         print("")
-        print("Next: Agent tool -> subagent_type package-vetter, ONCE, with the review ids "
-              f"whose reputation is unresolved (run `show` on [{joined}]); an established id "
-              "needs no vetter. Then for every RECOMMEND or established id, one simple "
-              "standalone command:")
-        print(f"  {store.cli_command(root, 'approve', joined)}")
+        if established:
+            print(f"Next, the established ids [{' '.join(established)}]: recommended, no vetter "
+                  "needed. Say in one line per package whether it is the mainstream choice for "
+                  "its purpose, then approve them first, each command exactly as written and as a "
+                  "simple standalone command, one after another:")
+            for command in pg_hook._approve_commands(root, established):
+                print(f"  {command}")
+        if unresolved or lookalikes:
+            vetted = " ".join(unresolved + lookalikes)
+            print(f"{'Then' if established else 'Next'}: Agent tool -> subagent_type "
+                  f"package-vetter, ONCE, with the unresolved review ids [{vetted}]. Once its "
+                  "report is in, approve in this order, never both kinds in one approve, at "
+                  f"most {pg_hook._APPROVE_BATCH_MAX} ids per approve, each a simple standalone "
+                  "command: the RECOMMEND ids first, then, after one short chat line per package "
+                  "with your suggestion, the NEEDS_HUMAN_REVIEW ids.")
+            print(f"  {store.cli_command(root, 'approve', '<RECOMMEND ids>')}")
+            print(f"  {store.cli_command(root, 'approve', '<NEEDS_HUMAN_REVIEW ids>')}")
+            print("A DO_NOT_RECOMMEND, TYPO_SQUAT or lookalike id gets no approve command: "
+                  "approve it alone, only if the user asks."
+                  + (f" Lookalike ids: [{' '.join(lookalikes)}]." if lookalikes else ""))
         print("Approving closes the finding. Removing the package closes it too, with no "
               "permanent record.")
     return 0
@@ -349,7 +523,8 @@ def main(argv) -> int:
         root = store.project_root(__file__)
         reports = _load_all(root, review_ids)
         if command == "show":
-            print("\n\n".join(_summary(r, root) for r in reports))
+            fresh = _refresh(reports)
+            print("\n\n".join(_summary(r, root, fresh.get(r["review_id"])) for r in reports))
             return 0
         if command == "approve":
             return _approve(root, reports)

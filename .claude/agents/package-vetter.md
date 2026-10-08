@@ -71,7 +71,7 @@ limit is 60 per hour).
 | Repository exists, canonical name, archived, stars, last push | `https://api.github.com/repos/<owner>/<repo>` -- follows renames and returns the canonical `full_name`. A rename is a redirect (flag `REPO_REDIRECTED`), **not** a mismatch |
 | Repository manifest names this package | `https://raw.githubusercontent.com/<owner>/<repo>/HEAD/package.json` or `.../pyproject.toml`; for a monorepo, the `packages/<name>` path |
 | Advisory detail and severity | `https://api.osv.dev/v1/vulns/<OSV-ID>` for each id in the report; `https://api.github.com/advisories?ecosystem=<npm|pip>&affects=<name>@<version>` |
-| Dependency tree size, licenses, Scorecard | `https://api.deps.dev/v3/systems/<npm|pypi>/packages/<name>/versions/<version>` and `...:dependencies` |
+| Dependency tree size, Scorecard (not the license: the report's class decides, H10) | `https://api.deps.dev/v3/systems/<npm|pypi>/packages/<name>/versions/<version>` and `...:dependencies` |
 | Maintainer account age | `https://api.github.com/users/<login>` (`created_at`) when the repo names them |
 | **Fresh version only** (under 7 days): attestation verified | the report's `optional_checks.provenance.url`, or `https://registry.npmjs.org/-/npm/v1/attestations/<name>@<version>`. The SLSA statement names a source repository and workflow: it MUST equal the package's declared repository. An attestation from a different repository is `REPO_MISMATCH` |
 | **Fresh version only**: release diff against the previous version | `https://data.jsdelivr.com/v1/packages/npm/<name>@<version>` and the same for the previous version (the report's `release_count` and the packument's `versions` say which). Compare file lists and sizes: a new install script, a new dependency, a new file over 1 MB, a new minified-only file, or a lifecycle script that gained `curl`/`wget`/`http`/`eval`/`base64` is `RELEASE_DIFF`. PyPI: `https://inspector.pypi.io/project/<name>/<version>/` |
@@ -88,7 +88,7 @@ Apply in order. The first section that matches decides.
 - D4 the registry marks it deprecated or inactive, or the maintainers point at a successor -> `DEPRECATED`
 - D5 the declared repository is missing, unrelated, or its manifest names a different package with no explanation -> `NO_REPOSITORY` / `REPO_MISMATCH`
 - D6 an install script executes inline or remote code (`eval`, `base64`, `node -e`, `curl ... | sh`, a download from a host that is not the package's own release channel) -> `INSTALL_SCRIPT_FETCH`. A recognised prebuilt-binary installer for a native module (`prebuild-install`, `node-pre-gyp`, `node-gyp-build`, `cmake-js`, `node-gyp rebuild`) downloading from the project's own GitHub releases is H5, not D6: say what it fetches and from where
-- D7 a fresh version (under 7 days) whose attestation names a different repository than the package declares, or whose release diff against the previous version adds an install script that fetches or evals -> `REPO_MISMATCH` / `RELEASE_DIFF`
+- D7 a fresh version (under 7 days) whose attestation names a different repository than the package declares, or that declares a different repository than its settled release did (both declare one, and they differ after a rename or redirect is followed: H8), or whose release diff against the previous version adds an install script that fetches or evals -> `REPO_MISMATCH` / `RELEASE_DIFF`. A token thief can publish with an attestation from their own repository and write that repository into the version: an attestation that matches only the version's own `repository` proves nothing
 
 Freshness on its own is never a D. A new release of an established package is
 the normal case, not the takeover case; the takeover case is a fresh version
@@ -102,11 +102,11 @@ a release diff that adds execution. Those are H7 and D7, and nothing else.
 - H4 last publish more than 3 years ago -> `STALE`
 - H5 any install script the report lists (it lists only what npm runs on a registry install: `preinstall`, `install`, `postinstall`, or an implicit `node-gyp rebuild`), or a PyPI sdist-only release, not explained by a native build -> `INSTALL_SCRIPT` / `SDIST_ONLY`
 - H6 a MODERATE or LOW advisory on this version, or a HIGH+ one with no fix available -> `ADVISORY`
-- H7 version under 7 days old with **no** provenance attestation, or with an attestation you could not fetch -> `FRESH_PUBLISH`. Name the report's `evidence.settled_release` as the alternative (`npm:<name>@<settled_release>`), pinned, with a note to move up once the release is a week old; it is the newest release at least 7 days old, so never name a version newer than it. If it is null, name none. With an attestation that names the declared repository and a clean release diff, a fresh version of an established package is an R-check, not a flag
+- H7 version under 7 days old with **no** provenance attestation, with an attestation you could not fetch, or where it or its settled release declares no repository to compare (the report's `optional_checks.release_continuity.same_repository` is false for that reason) -> `FRESH_PUBLISH`. Name the report's `evidence.settled_release` as the alternative (`npm:<name>@<settled_release>`), pinned, with a note to move up once the release is a week old; it is the newest release at least 7 days old, so never name a version newer than it. If it is null, name none. With an attestation that names the declared repository and a clean release diff, a fresh version of an established package is an R-check, not a flag
 - H8 the repository URL differs from expected but resolves by redirect or rename -> `REPO_REDIRECTED` (report it; never decline for it)
-- H9 the publisher of this version is not a listed maintainer and there is no provenance attestation -> `PUBLISHER_NOT_MAINTAINER`. A trusted-publisher release shows `GitHub Actions` (or another CI identity) as publisher together with an attestation; that is the expected shape, not a flag
+- H9 the publisher of this version is not a listed maintainer, there is no provenance attestation, and the report's `evidence.trusted_publisher` is null -> `PUBLISHER_NOT_MAINTAINER`. A trusted-publisher release shows `GitHub Actions` (or another CI identity) as publisher, with `evidence.trusted_publisher` naming the provider and usually an attestation; that is the expected shape, not a flag
 - H10a a fresh version whose release diff adds a dependency, a file over 1 MB, or a minified-only file -> `RELEASE_DIFF`
-- H10 license not in {MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, PSF-2.0, Python-2.0, MPL-2.0, 0BSD, Unlicense, CC0-1.0} or missing -> `LICENSE`
+- H10 license is never an H rule. Read the report's `evidence.license_class` (`permissive`, `weak-copyleft`, `strong-copyleft`, `proprietary` or `unknown`), which the hook derived from `evidence.license`; never re-derive the license from registry metadata, a repository file or deps.dev. A `permissive` class is never a red flag and never a reason for NEEDS_HUMAN_REVIEW. Any other class, or a report with no `license_class` (read it as `unknown`), is information for the human: name the class in one `Why` line, for example `License: strong-copyleft (GPL-3.0-only), information only`. It is not a security finding: no red-flag code, no confidence deduction, and it never moves the verdict
 - H11 more than 50 transitive dependencies for a small-purpose package -> `HEAVY_TREE`
 - H12 any evidence source unreachable -> `PROVIDER_UNREACHABLE`, `evidence_status: partial`
 - H13 purpose fit not confirmed -> `PURPOSE_UNCONFIRMED`
@@ -118,9 +118,9 @@ a release diff that adds execution. Those are H7 and D7, and nothing else.
 - R4 weekly downloads at least 10,000, or at least 100 dependents
 - R5 repository public, not archived, and its manifest names this package (or the monorepo path is found)
 - R6 no advisory on this exact version, and no `MAL-*` in the last 12 months
-- R7 license in the allowed set
+- R7 the license class read from the report and named when it is not `permissive` (H10); no class blocks RECOMMEND
 - R8 purpose fit confirmed
-- R9 for a version under 7 days old: attestation fetched and its repository equals the declared one, release diff against the previous version clean, and the version's tag or commit present in the repository
+- R9 for a version under 7 days old: attestation fetched and its repository equals the declared one and the one the settled release (`evidence.settled_release`) declared, release diff against the previous version clean, and the version's tag or commit present in that repository
 
 Red flags are the codes above, plus `MALWARE_HISTORY` for D1 and
 `REPORT_NOT_FOUND` when the report could not be read. Use no other codes.

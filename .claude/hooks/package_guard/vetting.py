@@ -7,10 +7,13 @@ Standard library only.
 """
 from __future__ import annotations
 
+import ast
+import configparser
 import json
 import re
 import sys
 import threading
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -57,7 +60,10 @@ _PYPI_INACTIVE = "Development Status :: 7 - Inactive"
 # fetched instead.
 NPM_DOWNLOADS_URL = "https://api.npmjs.org/downloads/point/last-week/"
 NPM_SEARCH_URL = "https://registry.npmjs.org/-/v1/search"
-PYPI_TOP_URL = "https://hugovk.github.io/top-pypi-packages/top-pypi-packages.min.json"
+# The list moved from hugovk.github.io, which now answers with a redirect to
+# this host. A cross-host redirect is refused (`_request_json`), so the URL
+# names the host that serves the list.
+PYPI_TOP_URL = "https://hugovk.dev/top-pypi-packages/top-pypi-packages.min.json"
 GITHUB_RAW_URL = "https://raw.githubusercontent.com"
 ESTABLISHED_MIN_AGE_DAYS = 365
 ESTABLISHED_MIN_RELEASES = 5
@@ -69,16 +75,82 @@ NEAR_NAME_SEARCH_SIZE = 20
 # The bulk downloads endpoint takes at most 128 names; searched neighbours
 # come first, then the enumerated mutations.
 NEAR_NAME_BULK_LIMIT = 100
-ALLOWED_LICENSES = frozenset({
-    "MIT", "ISC", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "PSF-2.0",
-    "Python-2.0", "MPL-2.0", "0BSD", "Unlicense", "CC0-1.0",
+# License is evidence for the human, never a criterion of the tier: a license
+# is policy, not identity, and no license string tells a lookalike from the
+# real package. The review records a short display string and one of these
+# classes. Ids are SPDX, matched case-insensitively.
+LICENSE_CLASSES = ("permissive", "weak-copyleft", "strong-copyleft", "proprietary", "unknown")
+PERMISSIVE_LICENSES = frozenset({
+    "MIT", "ISC", "BSD-2-Clause", "BSD-3-Clause", "Apache-2.0", "PSF-2.0", "Python-2.0",
+    "0BSD", "Unlicense", "CC0-1.0", "Zlib", "MIT-0", "X11", "BlueOak-1.0.0", "Unicode-3.0",
+    "Unicode-DFS-2016", "BSD-1-Clause", "BSD-2-Clause-Patent", "BSD-3-Clause-Clear", "BSL-1.0",
+    "NCSA", "UPL-1.0", "WTFPL", "MIT-CMU", "HPND", "PostgreSQL", "curl", "Python-2.0.1",
+    "zlib-acknowledgement", "libpng-2.0", "CC-BY-3.0", "CC-BY-4.0", "AFL-3.0", "Artistic-2.0",
+    # Not SPDX ids: what a bare "BSD License" classifier or a public-domain
+    # dedication is shown as.
+    "BSD", "Public Domain",
 })
+# Version families by prefix, after an `-only`, `-or-later` or `+` suffix is
+# dropped.
+_COPYLEFT_FAMILIES = (
+    ("agpl", "strong-copyleft"), ("gpl", "strong-copyleft"), ("sspl", "strong-copyleft"),
+    ("osl", "strong-copyleft"), ("lgpl", "weak-copyleft"), ("mpl", "weak-copyleft"),
+    ("epl", "weak-copyleft"), ("cddl", "weak-copyleft"), ("eupl", "weak-copyleft"),
+    ("cpl", "weak-copyleft"), ("ms-rl", "weak-copyleft"),
+)
+# Exceptions that let code link against a GPL library without taking its terms.
+_LINKING_EXCEPTIONS = frozenset({
+    "classpath-exception-2.0", "gcc-exception-2.0", "gcc-exception-3.1", "llvm-exception",
+    "linking-exception", "openjdk-assembly-exception-1.0",
+})
+# Free-text names (trove classifiers, and what authors write in a short PyPI
+# `license` field) mapped to an SPDX id, lower case.
+_LICENSE_NAMES = {
+    "mit": "MIT", "mit license": "MIT", "the mit license": "MIT", "mit licence": "MIT",
+    "expat": "MIT", "mit no attribution license (mit-0)": "MIT-0",
+    "bsd": "BSD", "bsd license": "BSD", "bsd licence": "BSD",
+    "new bsd": "BSD-3-Clause", "new bsd license": "BSD-3-Clause", "modified bsd license": "BSD-3-Clause",
+    "3-clause bsd license": "BSD-3-Clause", "bsd 3-clause": "BSD-3-Clause",
+    "bsd 3-clause license": "BSD-3-Clause", "bsd-3": "BSD-3-Clause",
+    "2-clause bsd license": "BSD-2-Clause", "bsd 2-clause": "BSD-2-Clause",
+    "bsd 2-clause license": "BSD-2-Clause", "simplified bsd": "BSD-2-Clause", "bsd-2": "BSD-2-Clause",
+    "apache": "Apache-2.0", "apache 2": "Apache-2.0", "apache 2.0": "Apache-2.0",
+    "apache-2": "Apache-2.0", "apache license 2.0": "Apache-2.0", "apache license, version 2.0": "Apache-2.0",
+    "apache license version 2.0": "Apache-2.0", "apache software license": "Apache-2.0",
+    "apache software license 2.0": "Apache-2.0", "asl 2.0": "Apache-2.0",
+    "isc": "ISC", "isc license": "ISC", "isc license (iscl)": "ISC",
+    "psf": "PSF-2.0", "psf license": "PSF-2.0", "python software foundation license": "PSF-2.0",
+    "mozilla public license 2.0 (mpl 2.0)": "MPL-2.0", "mozilla public license 2.0": "MPL-2.0",
+    "mpl 2.0": "MPL-2.0", "mozilla public license 1.1 (mpl 1.1)": "MPL-1.1",
+    "the unlicense": "Unlicense", "the unlicense (unlicense)": "Unlicense", "unlicense": "Unlicense",
+    "zlib": "Zlib", "zlib/libpng license": "Zlib",
+    "cc0 1.0 universal (cc0 1.0) public domain dedication": "CC0-1.0",
+    "boost software license 1.0 (bsl-1.0)": "BSL-1.0",
+    "universal permissive license (upl)": "UPL-1.0", "blue oak model license (blueoak-1.0.0)": "BlueOak-1.0.0",
+    "public domain": "Public Domain",
+    "gnu general public license (gpl)": "GPL", "gpl": "GPL",
+    "gnu general public license v2 (gplv2)": "GPL-2.0-only",
+    "gnu general public license v2 or later (gplv2+)": "GPL-2.0-or-later",
+    "gnu general public license v3 (gplv3)": "GPL-3.0-only",
+    "gnu general public license v3 or later (gplv3+)": "GPL-3.0-or-later",
+    "gnu affero general public license v3": "AGPL-3.0-only",
+    "gnu affero general public license v3 or later (agplv3+)": "AGPL-3.0-or-later",
+    "gnu lesser general public license v2 (lgplv2)": "LGPL-2.0-only",
+    "gnu lesser general public license v2 or later (lgplv2+)": "LGPL-2.0-or-later",
+    "gnu lesser general public license v3 (lgplv3)": "LGPL-3.0-only",
+    "gnu lesser general public license v3 or later (lgplv3+)": "LGPL-3.0-or-later",
+    "gnu library or lesser general public license (lgpl)": "LGPL", "lgpl": "LGPL",
+    "eclipse public license 1.0 (epl-1.0)": "EPL-1.0", "eclipse public license 2.0 (epl-2.0)": "EPL-2.0",
+    "other/proprietary license": "Proprietary", "proprietary": "Proprietary",
+}
+# The longest display string the report keeps.
+_LICENSE_DISPLAY_MAX = 80
 # Calls the reputation step can add to one review. npm: downloads (1), the
 # repository manifest (up to 2), the near-name search (1) and the neighbours'
 # downloads in one bulk call (1). PyPI: the top list (1, once per process)
-# and the repository pyproject (up to 2). hook._REVIEW_CALLS carries the
-# per-review total the review budget bounds; PyPI's three mandatory calls plus
-# three fit under the same seven.
+# and the repository build files (up to 3: pyproject.toml, then setup.cfg and
+# setup.py). hook._REVIEW_CALLS carries the per-review total the review budget
+# bounds; PyPI's three mandatory calls plus four fit under the same seven.
 REPUTATION_CALLS = 5
 _SAFE_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
 _SAFE_PATH = re.compile(r"[A-Za-z0-9_./@-]+")
@@ -89,8 +161,62 @@ class ProviderError(Exception):
     """A mandatory evidence provider failed. Unknown packages fail closed."""
 
 
+class TransientProviderError(ProviderError):
+    """A timeout or a connection reset: the one failure a mandatory call
+    retries (`_mandatory_json`). An HTTP status is never transient."""
+
+
+class ResponseTooLarge(ProviderError):
+    """A provider answered with more than MAX_BODY_BYTES. Only the npm
+    packument has a smaller document to fall back to (`_vet_npm`); anywhere
+    else this fails closed like any provider failure."""
+
+
 class HardDeny(Exception):
     """Deterministic evidence that forbids this package outright."""
+
+
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to HTTPS on the host that was asked.
+
+    Every provider host is named in this module, and a sandbox egress
+    allowlist names the same hosts. A redirect to another host would read
+    evidence from a source nobody chose, or fail somewhere the report cannot
+    explain, so it is a provider failure. A same-host redirect (PyPI
+    normalising a project name) is followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlsplit(req.full_url)
+        new = urllib.parse.urlsplit(urllib.parse.urljoin(req.full_url, newurl))
+        if new.scheme != "https" or (new.hostname or "").lower() != (old.hostname or "").lower():
+            raise ProviderError(f"{req.full_url}: HTTP {code} redirect to another host "
+                                f"({new.scheme}://{new.hostname}) refused")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameHostRedirect())
+
+# Documents the review reads as text rather than JSON: the build files of a
+# repository's Python project.
+_TEXT_SUFFIXES = (".toml", ".cfg", ".py")
+
+
+def _transient(exc) -> bool:
+    """A timeout or a connection reset, raised directly or wrapped by urllib."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    return isinstance(reason, (TimeoutError, ConnectionResetError))
+
+
+def _declared_length(response) -> int | None:
+    headers = getattr(response, "headers", None)
+    try:
+        value = headers.get("Content-Length") if headers is not None else None
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _request_json(url: str, data=None):
@@ -104,29 +230,71 @@ def _request_json(url: str, data=None):
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        with _OPENER.open(request, timeout=TIMEOUT_SECONDS) as response:
+            # A declared length over the cap is refused before the body is
+            # read: the 68 MB packument of @prisma/client took 95 s to read.
+            declared = _declared_length(response)
+            if declared is not None and declared > MAX_BODY_BYTES:
+                raise ResponseTooLarge(f"{url}: response of {declared} bytes exceeds the "
+                                       f"{MAX_BODY_BYTES}-byte limit")
             raw = response.read(MAX_BODY_BYTES + 1)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return None
         raise ProviderError(f"{url}: HTTP {exc.code}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        if _transient(exc):
+            raise TransientProviderError(f"{url}: {exc}")
         raise ProviderError(f"{url}: {exc}")
     if len(raw) > MAX_BODY_BYTES:
-        raise ProviderError(f"{url}: response exceeds size limit")
+        raise ResponseTooLarge(f"{url}: response exceeds the {MAX_BODY_BYTES}-byte limit")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         raise ProviderError(f"{url}: response is not UTF-8")
     # One seam for every provider, so a test that replaces this function
-    # replaces all of them. A pyproject.toml is the one non-JSON document the
-    # review reads; it is returned as text for tomllib.
-    if url.endswith(".toml"):
+    # replaces all of them. A repository's Python build files are the only
+    # non-JSON documents the review reads; they are returned as text. Only on
+    # the raw-file host: a registry name may itself end in `.py`.
+    if url.startswith(GITHUB_RAW_URL + "/") and url.endswith(_TEXT_SUFFIXES):
         return text
     try:
         return json.loads(text)
     except (ValueError, RecursionError):
         raise ProviderError(f"{url}: response is not valid JSON")
+
+
+# A mandatory provider call (the registry documents and OSV) is retried once
+# after a timeout or a connection reset, never after an HTTP status. The hook
+# sets the deadline (`set_retry_deadline`): a retry starts only when the
+# backoff and one more full request still end before it, so every retry is
+# over before the review deadline and the hook's budget arithmetic is
+# unchanged. With no deadline set (a CLI process, outside any hook) the one
+# retry is always allowed.
+RETRY_BACKOFF_SECONDS = 1.0
+_retry_deadline = None
+
+
+def set_retry_deadline(deadline) -> None:
+    """A time.monotonic() value no retry may run past, or None for no bound."""
+    global _retry_deadline
+    _retry_deadline = deadline
+
+
+def _retry_fits() -> bool:
+    deadline = _retry_deadline
+    return deadline is None or time.monotonic() + RETRY_BACKOFF_SECONDS + TIMEOUT_SECONDS <= deadline
+
+
+def _mandatory_json(url: str, data=None):
+    """`_request_json` for a mandatory provider, with its one retry."""
+    try:
+        return _request_json(url, data)
+    except TransientProviderError:
+        if not _retry_fits():
+            raise
+    time.sleep(RETRY_BACKOFF_SECONDS)
+    return _request_json(url, data)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +339,210 @@ def _text(value) -> str | None:
 
 def _count(value) -> int | None:
     return len(value) if isinstance(value, (dict, list)) else None
+
+
+# ---------------------------------------------------------------------------
+# License: a display string and a class, never a criterion
+# ---------------------------------------------------------------------------
+
+# AND keeps the lowest rank, OR the highest. An id the review does not know
+# sits under every copyleft class: it may be anything.
+_CLASS_RANK = {"permissive": 4, "weak-copyleft": 3, "strong-copyleft": 2, "unknown": 1, "proprietary": 0}
+_LICENSE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9.:+-]*")
+_CANONICAL_LICENSE = {name.lower(): name for name in PERMISSIVE_LICENSES}
+_SPDX_OPERATORS = ("AND", "OR", "WITH")
+
+
+def _license_id_class(license_id: str) -> str:
+    """The class of one license id, ignoring an `-only`, `-or-later` or `+` suffix."""
+    key = license_id.lower()
+    if key in ("unlicensed", "proprietary") or key.startswith("see license in"):
+        return "proprietary"
+    base = re.sub(r"(-only|-or-later|\+)$", "", key)
+    if key in _CANONICAL_LICENSE or base in _CANONICAL_LICENSE:
+        return "permissive"
+    for prefix, license_class in _COPYLEFT_FAMILIES:
+        if base.startswith(prefix):
+            return license_class
+    return "unknown"
+
+
+def _short(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= _LICENSE_DISPLAY_MAX else text[:_LICENSE_DISPLAY_MAX - 1] + "…"
+
+
+def _combine_licenses(parts: list, operator: str) -> tuple:
+    """(display, class, every id recognised, compound) for parts joined by AND or OR."""
+    if len(parts) == 1:
+        return parts[0]
+    display = f" {operator} ".join(f"({p[0]})" if p[3] else p[0] for p in parts)
+    pick = min if operator == "AND" else max
+    license_class = pick((p[1] for p in parts), key=_CLASS_RANK.__getitem__)
+    return display, license_class, all(p[2] for p in parts), True
+
+
+def _spdx(text) -> tuple | None:
+    """(display, class, every id recognised) for an SPDX license expression,
+    or None when the text is not one.
+
+    Operators and ids are matched case-insensitively; WITH binds tighter than
+    AND, which binds tighter than OR. WITH keeps the class of the license it
+    qualifies, except that a linking exception makes a GPL weak copyleft.
+    """
+    tokens = re.findall(r"\(|\)|[^\s()]+", text or "")
+    if not tokens or len(tokens) > 100:
+        return None
+    position = 0
+
+    def peek():
+        return tokens[position].upper() if position < len(tokens) else None
+
+    def take():
+        nonlocal position
+        if position >= len(tokens):
+            raise ValueError("expression ends early")
+        position += 1
+        return tokens[position - 1]
+
+    def expression(depth):
+        if depth > 20:
+            raise ValueError("nested too deeply")
+        parts = [term(depth)]
+        while peek() == "OR":
+            take()
+            parts.append(term(depth))
+        return _combine_licenses(parts, "OR")
+
+    def term(depth):
+        parts = [factor(depth)]
+        while peek() == "AND":
+            take()
+            parts.append(factor(depth))
+        return _combine_licenses(parts, "AND")
+
+    def factor(depth):
+        token = take()
+        if token == "(":
+            inner = expression(depth + 1)
+            if take() != ")":
+                raise ValueError("unbalanced parenthesis")
+            return inner
+        if token == ")" or token.upper() in _SPDX_OPERATORS or not _LICENSE_ID.fullmatch(token):
+            raise ValueError(f"not a license id: {token}")
+        license_class = _license_id_class(token)
+        display = _CANONICAL_LICENSE.get(token.lower(), token)
+        known = license_class != "unknown"
+        if peek() == "WITH":
+            take()
+            exception = take()
+            if exception.upper() in _SPDX_OPERATORS or not _LICENSE_ID.fullmatch(exception):
+                raise ValueError(f"not a license exception: {exception}")
+            if license_class == "strong-copyleft" and exception.lower() in _LINKING_EXCEPTIONS:
+                license_class = "weak-copyleft"
+            display = f"{display} WITH {exception}"
+        return display, license_class, known, False
+
+    try:
+        display, license_class, known, _compound = expression(0)
+    except ValueError:
+        return None
+    if position != len(tokens):
+        return None
+    return display, license_class, known
+
+
+def _license_name(text) -> tuple | None:
+    """(display, class) for a license written in words or as SPDX, or None."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    named = _LICENSE_NAMES.get(" ".join(text.lower().split()))
+    if named:
+        return named, _license_id_class(named)
+    parsed = _spdx(text)
+    if parsed and parsed[2]:
+        return _short(parsed[0]), parsed[1]
+    return None
+
+
+def _one_license(text: str) -> tuple:
+    """(display, class) for one declared license string, whatever its shape."""
+    text = text.strip()
+    if text.upper().startswith("SEE LICENSE IN"):
+        return _short(text), "proprietary"
+    parsed = _spdx(text)
+    if parsed:
+        return _short(parsed[0]), parsed[1]
+    return _license_name(text) or (_short(text), "unknown")
+
+
+def _any_of(found: list) -> tuple:
+    """Several declared licenses the user may choose between, as one OR."""
+    if not found:
+        return None, "unknown"
+    parts = [(display, license_class, True, bool(re.search(r" (AND|OR) ", display)))
+             for display, license_class in found]
+    display, license_class, _known, _compound = _combine_licenses(parts, "OR")
+    return _short(display), license_class
+
+
+def _npm_license(version_meta: dict) -> tuple:
+    """(display, class) from package.json: `license`, else the legacy
+    `licenses[]`, several read as OR. (None, "unknown") when none is declared."""
+    value = version_meta.get("license")
+    if isinstance(value, dict):
+        value = value.get("type")
+    if isinstance(value, str) and value.strip():
+        return _one_license(value)
+    entries = version_meta.get("licenses")
+    found = []
+    for entry in entries if isinstance(entries, list) else []:
+        name = _text(entry)
+        if name and name.strip():
+            found.append(_one_license(name))
+    return _any_of(found)
+
+
+def _pypi_license(info: dict) -> tuple:
+    """(display, class) from PyPI metadata, first answer wins:
+
+    1. the PEP 639 `license_expression`;
+    2. a `license` field of at most 80 characters that parses as SPDX with
+       every id recognised;
+    3. the license classifiers, several read as OR;
+    4. a short `license` field that names a license in words;
+    5. otherwise unknown, shown as the field's first line.
+
+    (None, "unknown") when nothing at all is declared.
+    """
+    expression = _text(info.get("license_expression"))
+    if expression:
+        parsed = _spdx(expression)
+        return (_short(parsed[0]), parsed[1]) if parsed else (_short(expression), "unknown")
+    declared = _text(info.get("license"))
+    declared = declared.strip() if declared else None
+    short = declared if declared and len(declared) <= _LICENSE_DISPLAY_MAX else None
+    if short:
+        parsed = _spdx(short)
+        if parsed and parsed[2]:
+            return _short(parsed[0]), parsed[1]
+    found = []
+    for classifier in info.get("classifiers") or []:
+        if not isinstance(classifier, str) or not classifier.startswith("License ::"):
+            continue
+        name = classifier.split("::")[-1].strip()
+        if name and name != "OSI Approved":
+            entry = _license_name(name) or (_short(name), "unknown")
+            if entry not in found:
+                found.append(entry)
+    if found:
+        return _any_of(found)
+    if short:
+        return _license_name(short) or (_short(short), "unknown")
+    if declared:
+        first = next((line for line in declared.splitlines() if line.strip()), declared)
+        return _short(first), "unknown"
+    return None, "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -242,9 +614,302 @@ def _cooldown_unavailable_signal(reason: str, version: str) -> str:
             f"without checking it is at least {FRESH_VERSION_DAYS} days old")
 
 
+def _settled_release(ecosystem: str, version: str, published: dict, now=None) -> str | None:
+    """The newest final release ranked at or below `version` that is at least
+    FRESH_VERSION_DAYS old, or None: what a fresh release is compared with.
+
+    Never simply the previous release. An attacker who controls an account can
+    publish two releases an hour apart, and the first would vouch for the
+    second. The ranking is the cool-down's, without its attestation shortcut.
+    """
+    pick, record = _cooled(ecosystem, version, published, False, now=now)
+    return pick if record else None
+
+
+# ---------------------------------------------------------------------------
+# npm release continuity: a fresh release against its settled baseline
+# ---------------------------------------------------------------------------
+
+def _attested(version_meta) -> bool:
+    dist = version_meta.get("dist") if isinstance(version_meta, dict) else None
+    return isinstance(dist, dict) and isinstance(dist.get("attestations"), dict) \
+        and bool(dist["attestations"])
+
+
+def _publisher_identity(version_meta) -> tuple | None:
+    """Who published a version, as the packument records it.
+
+    A trusted-publisher release is identified by its provider and OIDC
+    configuration, an account release by the account name. npm wrote the
+    configuration id with an `oidc:` prefix on older records and without it on
+    newer ones, so the prefix is dropped; the approver and the email are not
+    part of the identity.
+    """
+    user = version_meta.get("_npmUser") if isinstance(version_meta, dict) else None
+    if not isinstance(user, dict):
+        name = _text(user)
+        return ("account", name) if name else None
+    trusted = user.get("trustedPublisher")
+    if isinstance(trusted, dict) and (trusted.get("id") or trusted.get("oidcConfigId")):
+        config = trusted.get("oidcConfigId")
+        config = config.removeprefix("oidc:") if isinstance(config, str) else None
+        return ("trusted", str(trusted.get("id") or ""), config)
+    name = user.get("name")
+    return ("account", name) if isinstance(name, str) and name else None
+
+
+def _trusted_publisher(version_meta) -> str | None:
+    """The provider of an npm trusted-publishing release (`github`, `gitlab`),
+    or None for an account release.
+
+    The registry records this identity when the package's own maintainers
+    configured OIDC publishing for it; a stolen token cannot produce it."""
+    identity = _publisher_identity(version_meta)
+    if not identity or identity[0] != "trusted":
+        return None
+    return identity[1] or "oidc"
+
+
+def _known_publisher(evidence: dict, provenance) -> bool:
+    """The npm publisher criterion: a listed maintainer published the version,
+    or it carries a provenance attestation, or it came through trusted
+    publishing."""
+    publisher = evidence.get("publisher")
+    attested = isinstance(provenance, dict) and bool(provenance.get("attested"))
+    return bool(publisher) and (publisher in (evidence.get("maintainers") or [])
+                                or attested or bool(evidence.get("trusted_publisher")))
+
+
+def _trusted_publisher_record(version_meta) -> tuple | None:
+    """The trusted-publishing configuration that released a version, in full,
+    or None unless the record names both its provider and its configuration.
+
+    The registry writes `_npmUser.trustedPublisher` as `{"id": "github",
+    "oidcConfigId": "<uuid>"}`; older records prefix the configuration id with
+    `oidc:`, which is dropped. Any other key in the record is kept as given, so
+    two records match only when everything in them does. The configuration
+    is what the package's own maintainers set up: it binds publishing to one
+    repository and workflow. A stolen token publishes as an account, never
+    through it, even with a provenance attestation from a repository the
+    attacker controls. Stricter than `_publisher_identity`, which also reads
+    a record that names only one of the two: this is the comparison a fresh
+    release must pass.
+    """
+    user = version_meta.get("_npmUser") if isinstance(version_meta, dict) else None
+    record = user.get("trustedPublisher") if isinstance(user, dict) else None
+    if not isinstance(record, dict):
+        return None
+    provider, config = record.get("id"), record.get("oidcConfigId")
+    if not (isinstance(provider, str) and provider and isinstance(config, str)):
+        return None
+    config = config.removeprefix("oidc:")
+    if not config:
+        return None
+    rest = tuple(sorted((key, json.dumps(value, sort_keys=True)) for key, value in record.items()
+                        if key not in ("id", "oidcConfigId")))
+    return provider, config, rest
+
+
+def _repository_key(version_meta) -> str | None:
+    """The repository a version itself declares, normalised for comparison:
+    a GitHub repository as `github.com/owner/repo` in lower case (GitHub
+    ignores case) whatever shape it was declared in; any other URL without a
+    `git+` prefix, a `.git` suffix or a trailing slash. None when the version
+    declares none; the packument-level fallback is not read."""
+    value = _repository_from(version_meta.get("repository")) if isinstance(version_meta, dict) else None
+    if value is None:
+        return None
+    located = _github_repo(value, shorthand=True)
+    if located is not None:
+        return f"github.com/{located[0]}/{located[1]}".lower()
+    text = value.strip().removeprefix("git+").rstrip("/").removesuffix(".git")
+    return text or None
+
+
+# What npm runs when it installs a registry tarball. `prepare` joins them for
+# a package that builds native code (`gypfile`).
+_INSTALL_LIFECYCLE = ("preinstall", "install", "postinstall")
+
+
+def _install_scripts(version_meta) -> dict:
+    """{lifecycle key: command} npm runs for a registry tarball. A binding.gyp
+    with no install script is npm's implicit `node-gyp rebuild`."""
+    scripts = version_meta.get("scripts") if isinstance(version_meta.get("scripts"), dict) else {}
+    found = {key: scripts[key] for key in _INSTALL_LIFECYCLE if key in scripts}
+    if version_meta.get("gypfile"):
+        found.setdefault("install", "node-gyp rebuild")
+        if "prepare" in scripts:
+            found["prepare"] = scripts["prepare"]
+    return found
+
+
+def _changed_install_scripts(current, base) -> list:
+    """Lifecycle keys new in `current` or whose command changed, and `gypfile`
+    when the native build was switched on or off."""
+    mine, theirs = _install_scripts(current), _install_scripts(base)
+    changed = [key for key, command in mine.items() if key not in theirs or theirs[key] != command]
+    if bool(current.get("gypfile")) != bool(base.get("gypfile")):
+        changed.append("gypfile")
+    return sorted(changed)
+
+
+def _dependency_groups(version_meta) -> dict:
+    """{group: {name: spec}} for everything npm installs with a version.
+
+    `optionalDependencies` is read into `dependencies`, overriding an entry of
+    the same name, as npm reads them. `peerDependencies` is its own group (npm
+    7 and later install peers). The bundled names, under either spelling, are
+    a group whose spec is `bundled`; `true` bundles every dependency and reads
+    as `*`. A field of any other shape is kept whole under `(malformed)`, so
+    a change to it still counts.
+    """
+    def entries(value) -> dict:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return {name: spec for name, spec in value.items() if isinstance(name, str)}
+        return {"(malformed)": value}
+
+    dependencies = entries(version_meta.get("dependencies"))
+    dependencies.update(entries(version_meta.get("optionalDependencies")))
+    bundle = version_meta.get("bundleDependencies")
+    if bundle is None:
+        bundle = version_meta.get("bundledDependencies")
+    if bundle is True:
+        bundled = {"*": "bundled"}
+    elif isinstance(bundle, list):
+        bundled = {name: "bundled" for name in bundle if isinstance(name, str)}
+    else:
+        bundled = entries(bundle) if bundle not in (None, False) else {}
+    return {"dependencies": dependencies, "peerDependencies": entries(version_meta.get("peerDependencies")),
+            "bundleDependencies": bundled}
+
+
+# A version, a range or a dist-tag: what npm resolves from the registry under
+# the dependency's own name. Anything with `/`, `:`, `#`, `@` or `\` is a URL,
+# an `npm:` alias, git or a github shorthand, `file:`, `link:`,
+# `workspace:` or a path; a leading `.` or a tarball suffix is a path too.
+_REGISTRY_SPEC = re.compile(r"[A-Za-z0-9 .*^~<>=|+_-]*")
+_TARBALL_SPEC = re.compile(r"\.(?:tgz|tar\.gz|tar)$", re.IGNORECASE)
+
+
+def _registry_spec(spec) -> bool:
+    """True for a spec npm fetches from the registry under the same name."""
+    if not isinstance(spec, str):
+        return False
+    text = spec.strip()
+    return bool(_REGISTRY_SPEC.fullmatch(text)) and not text.startswith(".") \
+        and not _TARBALL_SPEC.search(text)
+
+
+def _dependency_changes(current, base) -> tuple:
+    """(new names, changed entries, kind) of a fresh release against its baseline.
+
+    A name is new when no install-time group of the baseline has it. An entry,
+    `group:name`, is changed when that group of the baseline lacks the name or
+    holds another spec string for it; every new name is a changed entry too.
+    A removed name is neither.
+
+    `kind` is `none` with no changed entry; `registry-bumps` when every change
+    swaps one registry spec for another under an existing name (`^4.1.0` to
+    `^4.2.0`, `4.63.5` to `4.63.6`, a name moved between groups with a
+    registry spec), which is the same package from the same registry; and
+    `new-or-nonregistry` for a new name, a newly bundled name, or a change
+    whose old or new spec is anything else (`_registry_spec`): a URL, an
+    `npm:` alias, git, a github shorthand, `file:`, `link:`, a tarball path,
+    `workspace:`.
+    """
+    mine, theirs = _dependency_groups(current), _dependency_groups(base)
+    known = {name for group in ("dependencies", "peerDependencies") for name in theirs[group]}
+    new = sorted({name for group in ("dependencies", "peerDependencies") for name in mine[group]} - known)
+    changed, other = [], False
+    for group, specs in mine.items():
+        for name, spec in specs.items():
+            before = theirs[group].get(name, theirs["dependencies"].get(name, theirs["peerDependencies"].get(name)))
+            if name in theirs[group] and theirs[group][name] == spec:
+                continue
+            changed.append(f"{group}:{name}")
+            if name in new or group == "bundleDependencies" or not (
+                    _registry_spec(spec) and _registry_spec(before)):
+                other = True
+    kind = "new-or-nonregistry" if other or new else "registry-bumps" if changed else "none"
+    return new, sorted(changed), kind
+
+
+def _release_continuity(versions: dict, version: str, baseline) -> dict:
+    """What changed between a fresh npm release and its settled baseline.
+
+    Every fact comes from the packument already in hand. With no baseline the
+    comparison fields are null: there is nothing to compare with.
+    """
+    current = versions.get(version) if isinstance(versions.get(version), dict) else {}
+    base = versions.get(baseline) if baseline is not None else None
+    if not isinstance(base, dict):
+        return {"baseline": None, "attested": _attested(current), "baseline_attested": None,
+                "same_publisher": None, "same_trusted_publisher": None, "same_repository": None,
+                "new_install_scripts": None, "new_dependencies": None, "changed_dependencies": None,
+                "dependency_changes_kind": None}
+    mine = _publisher_identity(current)
+    trusted = _trusted_publisher_record(current)
+    repository = _repository_key(current)
+    new, changed, kind = _dependency_changes(current, base)
+    return {
+        "baseline": baseline,
+        "attested": _attested(current),
+        "baseline_attested": _attested(base),
+        "same_publisher": mine is not None and mine == _publisher_identity(base),
+        "same_trusted_publisher": trusted is not None and trusted == _trusted_publisher_record(base),
+        "same_repository": repository is not None and repository == _repository_key(base),
+        "new_install_scripts": _changed_install_scripts(current, base),
+        "new_dependencies": new,
+        "changed_dependencies": changed,
+        "dependency_changes_kind": kind,
+    }
+
+
+def continuity_holds(continuity) -> bool:
+    """A fresh release that continues its settled baseline. Every one of:
+
+    - both it and the baseline came through the same trusted-publishing
+      configuration (`_trusted_publisher_record`); an account publish never
+      qualifies, whoever the account is;
+    - it carries a provenance attestation;
+    - it declares the same repository as the baseline;
+    - no dependency is new, newly bundled, or given a spec that is not a
+      registry version, range or tag (`_dependency_changes`); a registry
+      version bump of an existing dependency is allowed;
+    - no install-time script is new or changed, and the native build was not
+      switched on or off.
+
+    Its age is then not held against it; the cool-down and the OSV re-check
+    of an approved fresh version still apply. A record missing any of these
+    fields (one written before they existed) never holds."""
+    return (isinstance(continuity, dict) and continuity.get("baseline") is not None
+            and continuity.get("attested") is True
+            and continuity.get("same_publisher") is True
+            and continuity.get("same_trusted_publisher") is True
+            and continuity.get("same_repository") is True
+            and continuity.get("new_install_scripts") == []
+            and continuity.get("new_dependencies") == []
+            and isinstance(continuity.get("changed_dependencies"), list)
+            and continuity.get("dependency_changes_kind") in ("none", "registry-bumps"))
+
+
+# What a review of a package whose full packument is over MAX_BODY_BYTES
+# cannot know, said as a risk signal and as an unmet criterion.
+HISTORY_TOO_LARGE = ("registry history too large to read: package age, version age and "
+                     "release count unknown")
+
+
 def _vet_npm(request, mandatory):
+    """(version, evidence, provenance, risk, repository, continuity, history)
+    for one npm request. `history` is False when the review could not read
+    the package's release history (`_vet_npm_version_document`)."""
     encoded = urllib.parse.quote(request.display_name, safe="@")
-    meta = _request_json(f"{store_registry(request)}/{encoded}")
+    try:
+        meta = _mandatory_json(f"{store_registry(request)}/{encoded}")
+    except ResponseTooLarge:
+        return _vet_npm_version_document(request, mandatory, encoded)
     mandatory["registry"]["ok"] = True
     if meta is None:
         mandatory["registry"]["exists"] = False
@@ -269,19 +934,69 @@ def _vet_npm(request, mandatory):
                       if isinstance(m, dict) and not m.get("deprecated")}
         candidates[version] = times.get(version)
         version, cooldown = _cooled("npm", version, candidates, attested)
-    settled = None
-    if request.exact_version and isinstance(versions.get(version), dict):
-        dist = versions[version].get("dist")
-        attested = isinstance(dist, dict) and isinstance(dist.get("attestations"), dict) \
-            and bool(dist["attestations"])
-        candidates = {v: times.get(v) for v, m in versions.items()
-                      if isinstance(m, dict) and not m.get("deprecated")}
-        candidates[version] = times.get(version)
-        pick, record = _cooled("npm", version, candidates, attested)
-        settled = pick if record else None
     version_meta = versions.get(version)
     if version_meta is None:
         raise HardDeny(f"version {version} of '{request.display_name}' does not exist on registry.npmjs.org")
+    # A version under a week old, however it was chosen, is compared with the
+    # newest release at least a week old.
+    now = _utcnow()
+    age = _age_days(times.get(version), now)
+    settled, continuity = None, None
+    if age is not None and age < FRESH_VERSION_DAYS and isinstance(version_meta, dict):
+        candidates = {v: times.get(v) for v, m in versions.items()
+                      if isinstance(m, dict) and not m.get("deprecated")}
+        candidates[version] = times.get(version)
+        settled = _settled_release("npm", version, candidates, now=now)
+        continuity = _release_continuity(versions, version, settled)
+    evidence, provenance, risk, repository = _npm_evidence(
+        meta, version, version_meta, versions, times, cooldown, cooldown_unavailable, settled)
+    return version, evidence, provenance, risk, repository, continuity, True
+
+
+def _vet_npm_version_document(request, mandatory, encoded):
+    """The review of a package whose full packument is over MAX_BODY_BYTES
+    (@prisma/client's is 68.5 MB), from the one version's document.
+
+    The version is the one named, or for an unpinned request the `latest`
+    dist-tag. That document carries the publisher, the maintainers, the
+    repository, scripts, dependencies, the license and the attestation, but
+    no release history: package age, version age, release count, the settled
+    release and the cool-down are unknown, and a risk signal says so. The
+    caller never lets such a review be established.
+    """
+    registry = store_registry(request)
+    version = request.exact_version
+    cooldown_unavailable = None
+    if not version:
+        tags = _mandatory_json(f"{registry}/-/package/{encoded}/dist-tags")
+        if not isinstance(tags, dict):
+            raise ProviderError(f"{registry}/-/package/{encoded}/dist-tags: no dist-tags for a "
+                                "package whose packument exists")
+        version = tags.get("latest")
+        if not isinstance(version, str) or not version:
+            raise HardDeny(f"could not resolve a latest version for '{request.display_name}'")
+        cooldown_unavailable = "the registry history is too large to read"
+    url = f"{registry}/{encoded}/{urllib.parse.quote(version, safe='')}"
+    version_meta = _mandatory_json(url)
+    mandatory["registry"]["ok"] = True
+    mandatory["registry"]["exists"] = True
+    if version_meta is None:
+        raise HardDeny(f"version {version} of '{request.display_name}' does not exist on registry.npmjs.org")
+    if not isinstance(version_meta, dict) or version_meta.get("version") != version:
+        raise ProviderError(f"{url}: the registry answered with another version's document")
+    evidence, provenance, risk, repository = _npm_evidence(
+        version_meta, version, version_meta, None, {}, None, cooldown_unavailable, None)
+    risk.insert(0, HISTORY_TOO_LARGE)
+    return version, evidence, provenance, risk, repository, None, False
+
+
+def _npm_evidence(meta, version, version_meta, versions, times, cooldown, cooldown_unavailable,
+                  settled):
+    """(evidence, provenance, risk, repository) from one version's metadata.
+
+    `meta` is the packument (or, without one, the version document itself),
+    `versions` and `times` its history (None and {} when it could not be
+    read)."""
     scripts = version_meta.get("scripts") or {}
     # Only what npm runs when it installs a registry tarball. `prepare` and
     # `prepack` run on pack, publish, a git install or a local install in the
@@ -300,19 +1015,23 @@ def _vet_npm(request, mandatory):
     # request, so the review's call budget is untouched.
     dist = version_meta.get("dist") if isinstance(version_meta.get("dist"), dict) else {}
     attestations = dist.get("attestations")
-    published = [times.get(v) for v in versions if _parse_iso(times.get(v))]
+    published = [times.get(v) for v in versions or () if _parse_iso(times.get(v))]
+    license_display, license_class = _npm_license(version_meta)
     evidence = {
         "package_created_at": times.get("created"),
         "version_published_at": times.get(version),
         "last_published_at": max(published) if published else None,
-        "repository_url": _repository_from(version_meta.get("repository") or meta.get("repository")),
+        "repository_url": _repository_display(
+            _repository_from(version_meta.get("repository") or meta.get("repository")), shorthand=True),
         "maintainers": [
             m.get("name") for m in (meta.get("maintainers") or []) if isinstance(m, dict) and m.get("name")
         ],
         "publisher": _text(version_meta.get("_npmUser")),
+        "trusted_publisher": _trusted_publisher(version_meta),
         "install_scripts": lifecycle,
         "deprecated": _text(version_meta.get("deprecated")),
-        "license": _text(version_meta.get("license")),
+        "license": license_display,
+        "license_class": license_class,
         "dependency_count": _count(version_meta.get("dependencies") or {}),
         "release_count": _count(versions),
         "integrity": _text(dist.get("integrity")),
@@ -332,18 +1051,36 @@ def _vet_npm(request, mandatory):
     if lifecycle:
         risk.append("package declares npm lifecycle/install scripts")
     repository = version_meta.get("repository") or meta.get("repository")
-    return version, evidence, provenance, risk, repository
+    return evidence, provenance, risk, repository
 
 
 # ---------------------------------------------------------------------------
 # The reputation tier (npm)
 # ---------------------------------------------------------------------------
 
-def _github_repo(url) -> tuple | None:
-    """(owner, repo) for a repository URL on github.com, else None."""
+# First path segments on github.com that are pages, not an owner.
+_GITHUB_NOT_OWNERS = frozenset({
+    "sponsors", "orgs", "users", "settings", "marketplace", "topics", "features", "apps",
+    "collections", "about", "pricing", "login", "search",
+})
+_NPM_SHORTHAND = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+
+
+def _github_repo(url, shorthand: bool = False) -> tuple | None:
+    """(owner, repo) for a repository on github.com, else None.
+
+    Takes the shapes registries carry: `git+https://…/repo.git`,
+    `git@github.com:owner/repo`, `ssh://`, a `#branch` or `?query` suffix, a
+    deeper path such as `/issues` or `/tree/main/pkg`, and npm's
+    `github:owner/repo`. With `shorthand`, npm's bare `owner/repo` too.
+    """
     if not isinstance(url, str):
         return None
-    text = url.strip()
+    text = url.strip().split("#", 1)[0].split("?", 1)[0]
+    if text.startswith("github:"):
+        text = "github.com/" + text[len("github:"):]
+    elif shorthand and _NPM_SHORTHAND.fullmatch(text):
+        text = "github.com/" + text
     for prefix in ("git+", "git://", "ssh://", "https://", "http://", "git@"):
         if text.startswith(prefix):
             text = text[len(prefix):]
@@ -360,39 +1097,89 @@ def _github_repo(url) -> tuple | None:
         repo = repo[:-4]
     if not (owner and repo and _SAFE_SEGMENT.fullmatch(owner) and _SAFE_SEGMENT.fullmatch(repo)):
         return None
-    if owner in (".", "..") or repo in (".", ".."):
+    if owner in (".", "..") or repo in (".", "..") or owner.lower() in _GITHUB_NOT_OWNERS:
         return None
     return owner, repo
 
 
-def _manifest_names_package(name: str, repository) -> dict:
-    """Does the declared repository's package.json name this package?
+def _repository_display(value, shorthand: bool = False) -> str | None:
+    """The declared repository as the report records it: a GitHub repository
+    as `https://github.com/owner/repo` whatever shape it was declared in, so
+    the catalog comparison and the prompt read the same thing; any other
+    value unchanged."""
+    located = _github_repo(value, shorthand=shorthand)
+    if located is not None:
+        return f"https://github.com/{located[0]}/{located[1]}"
+    return value if isinstance(value, str) and value else None
 
-    `{"url", "names_package"}`: True / False, or None when the check could
-    not run (no GitHub repository declared, or the fetch failed). At most two
-    fetches: the manifest at the declared `repository.directory`, else the
-    root manifest and then the monorepo convention `packages/<name>`.
+
+def _safe_directory(value) -> str | None:
+    """A repository-relative directory that is safe to put in a raw URL."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip().removeprefix("./").strip("/")
+    if value and _SAFE_PATH.fullmatch(value) and ".." not in value.split("/"):
+        return value
+    return None
+
+
+def _workspace_path(root_manifest, name: str) -> str | None:
+    """`<dir>/<name>/package.json` from the first `<dir>/*` workspaces pattern."""
+    workspaces = root_manifest.get("workspaces") if isinstance(root_manifest, dict) else None
+    if isinstance(workspaces, dict):
+        workspaces = workspaces.get("packages")
+    for pattern in workspaces if isinstance(workspaces, list) else []:
+        if isinstance(pattern, str) and pattern.strip().endswith("/*"):
+            parent = _safe_directory(pattern.strip()[:-2])
+            if parent:
+                return f"{parent}/{name.split('/')[-1]}/package.json"
+    return None
+
+
+def _manifest_names_package(name: str, repository) -> dict:
+    """Does a package.json in the declared repository name this package?
+
+    `{"url", "names_package"}`. True when a manifest names it. False only when
+    a published manifest the review reached names a DIFFERENT package. None
+    when no manifest for it could be read: no GitHub repository, nothing at
+    the paths tried, or a failed fetch. A `private` manifest is a workspace
+    root or an unpublished build package, so its name says nothing either way.
+
+    At most two fetches. With a `repository.directory`, that manifest, then
+    the root. Without one, the root, then the one place the root points to:
+    its `workspaces` pattern, else `packages/<name>`; and when the repository
+    has no root manifest at all, `npm/<name>`, the layout of packages that
+    publish per-platform builds from one repository.
     """
-    located = _github_repo(_repository_from(repository))
+    located = _github_repo(_repository_from(repository), shorthand=True)
     if located is None:
         return {"url": None, "names_package": None}
     owner, repo = located
-    directory = repository.get("directory") if isinstance(repository, dict) else None
-    if isinstance(directory, str) and directory.strip("/") and _SAFE_PATH.fullmatch(directory) \
-            and ".." not in directory:
-        candidates = [directory.strip("/") + "/package.json"]
-    else:
-        candidates = ["package.json", f"packages/{name.split('/')[-1]}/package.json"]
-    url = None
-    for path in candidates:
+    base = name.split("/")[-1]
+    directory = _safe_directory(repository.get("directory") if isinstance(repository, dict) else None)
+    path = f"{directory}/package.json" if directory else "package.json"
+    tried, url, other = [], None, None
+    while path and path not in tried and len(tried) < 2:
         url = f"{GITHUB_RAW_URL}/{owner}/{repo}/HEAD/{path}"
         try:
             manifest = _request_json(url)
         except ProviderError:
             return {"url": url, "names_package": None}
+        tried.append(path)
         if isinstance(manifest, dict) and manifest.get("name") == name:
             return {"url": url, "names_package": True}
-    return {"url": url, "names_package": False}
+        if (isinstance(manifest, dict) and isinstance(manifest.get("name"), str)
+                and manifest.get("private") is not True and other is None):
+            other = url
+        if directory:
+            path = "package.json"
+        elif manifest is None:
+            path = f"npm/{name}/package.json"
+        else:
+            path = _workspace_path(manifest, name) or f"packages/{base}/package.json"
+    if other is not None:
+        return {"url": other, "names_package": False}
+    return {"url": url, "names_package": None}
 
 
 def _edit_distance_le_one(a: str, b: str) -> bool:
@@ -550,8 +1337,16 @@ def _empty_reputation() -> dict:
     }
 
 
-def _shared_unmet(evidence: dict, osv_ids: list) -> list:
-    """The criteria both ecosystems read from the report already in hand."""
+def _shared_unmet(evidence: dict, osv_ids: list, continuity=None) -> list:
+    """The criteria both ecosystems read from the report already in hand.
+
+    A version under FRESH_VERSION_DAYS old is a criterion unless `continuity`
+    holds (`continuity_holds`): an attested npm release through the same
+    trusted-publishing configuration as its settled baseline, from the same
+    repository, with no new dependency, no dependency spec that left the
+    registry, and no install script new or changed. The license is not a
+    criterion; the report shows it as a class instead.
+    """
     unmet = []
     package_age = evidence.get("package_age_days")
     if package_age is None or package_age < ESTABLISHED_MIN_AGE_DAYS:
@@ -562,15 +1357,14 @@ def _shared_unmet(evidence: dict, osv_ids: list) -> list:
         unmet.append(f"{releases if releases is not None else 'unknown'} release(s), "
                      f"under {ESTABLISHED_MIN_RELEASES}")
     version_age = evidence.get("version_age_days")
-    if version_age is None or version_age < FRESH_VERSION_DAYS:
+    if (version_age is None or version_age < FRESH_VERSION_DAYS) and not (
+            version_age is not None and continuity_holds(continuity)):
         unmet.append(f"version age {version_age if version_age is not None else 'unknown'} day(s), "
                      f"under {FRESH_VERSION_DAYS}")
     if evidence.get("deprecated"):
         unmet.append("deprecated on the registry")
     if osv_ids:
         unmet.append(f"{len(osv_ids)} OSV record(s) for this version")
-    if evidence.get("license") not in ALLOWED_LICENSES:
-        unmet.append(f"license {evidence.get('license') or 'none declared'} not in the allowed set")
     return unmet
 
 
@@ -584,20 +1378,30 @@ def _downloads_floor(result: dict, unmet: list, downloads, source: str) -> None:
 
 
 def _manifest_unmet(result: dict, unmet: list, manifest: dict) -> None:
+    """Unknown is never a mismatch: only a manifest that names a different
+    package says so; one that could not be read says that instead."""
     result["manifest"] = manifest
     if manifest["names_package"] is None:
-        unmet.append("repository manifest not checked (no GitHub repository declared, or unreachable)")
+        if manifest["url"] is None:
+            unmet.append("repository manifest could not be read (no GitHub repository declared)")
+        else:
+            unmet.append("repository manifest could not be read (none found for this package, "
+                         "or the fetch failed)")
     elif not manifest["names_package"]:
-        unmet.append("repository manifest does not name this package")
+        unmet.append("repository manifest names a different package")
 
 
-def _reputation_npm(name: str, evidence: dict, provenance, osv_ids: list, repository) -> dict:
+def _reputation_npm(name: str, evidence: dict, provenance, osv_ids: list, repository,
+                    continuity=None, read_manifest: bool = True) -> dict:
     """The deterministic reputation block for one npm identity.
 
     `tier` is `established` only when every criterion below holds; otherwise
     `unresolved`, with `unmet` naming each failed or unavailable check. A
     provider failure here is never a hard finding -- it only leaves the tier
-    unresolved, which sends the review to the vetter.
+    unresolved, which sends the review to the vetter. Without `read_manifest`
+    (a review whose registry history was too large to read, which already
+    spent two extra registry calls and can never be established) the
+    repository manifest is not fetched; the near-name check still runs.
     """
     result = _empty_reputation()
     unmet = result["unmet"]
@@ -608,7 +1412,8 @@ def _reputation_npm(name: str, evidence: dict, provenance, osv_ids: list, reposi
         unmet.append(f"weekly downloads unavailable ({exc})")
     evidence["npm_weekly_downloads"] = downloads
     _downloads_floor(result, unmet, downloads, "the registry")
-    _manifest_unmet(result, unmet, _manifest_names_package(name, repository))
+    if read_manifest:
+        _manifest_unmet(result, unmet, _manifest_names_package(name, repository))
     try:
         near, lookalike = _near_names(name, downloads)
         result["near_names"], result["lookalike_of"] = near, lookalike
@@ -619,16 +1424,15 @@ def _reputation_npm(name: str, evidence: dict, provenance, osv_ids: list, reposi
             )
     except ProviderError as exc:
         unmet.append(f"near-name check unavailable ({exc})")
-    unmet.extend(_shared_unmet(evidence, osv_ids))
+    unmet.extend(_shared_unmet(evidence, osv_ids, continuity))
     if evidence.get("install_scripts"):
         unmet.append("declares install scripts")
     publisher = evidence.get("publisher")
-    maintainers = evidence.get("maintainers") or []
-    attested = isinstance(provenance, dict) and bool(provenance.get("attested"))
     if not publisher:
         unmet.append("publisher not recorded")
-    elif publisher not in maintainers and not attested:
-        unmet.append(f"published by '{publisher}', not a listed maintainer, without provenance")
+    elif not _known_publisher(evidence, provenance):
+        unmet.append(f"published by '{publisher}', not a listed maintainer, without provenance "
+                     "or trusted publishing")
     if not unmet:
         result["tier"] = "established"
     return result
@@ -694,37 +1498,131 @@ def _pypi_monthly(name: str) -> tuple:
     return top.get(_pypi_normalise(name)), _TOP_CACHE["cutoff"]
 
 
-def _pyproject_names_package(name: str, repository) -> dict:
-    """Does the declared repository's pyproject.toml name this package?
+# setup.py is parsed, never run, and only up to this size.
+_SETUP_PY_MAX_CHARS = 512 * 1024
+_PROJECT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
-    Same shape as `_manifest_names_package`: root `pyproject.toml`, then
-    `<name>/pyproject.toml`; `[project].name` or `[tool.poetry].name`,
-    compared after PEP 503 normalisation. A repository that builds from
-    setup.py alone comes back unchecked (None), never confirmed.
+
+def _pyproject_name(text) -> tuple:
+    """(project name or None, is a uv workspace root) from pyproject.toml text."""
+    if not isinstance(text, str):
+        return None, False
+    try:
+        document = tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError, RecursionError):
+        return None, False
+    project = document.get("project") if isinstance(document.get("project"), dict) else {}
+    tool = document.get("tool") if isinstance(document.get("tool"), dict) else {}
+    poetry = tool.get("poetry") if isinstance(tool.get("poetry"), dict) else {}
+    uv = tool.get("uv") if isinstance(tool.get("uv"), dict) else {}
+    declared = project.get("name") or poetry.get("name")
+    named = declared.strip() if isinstance(declared, str) and declared.strip() else None
+    return named, isinstance(uv.get("workspace"), dict)
+
+
+def _setup_cfg_name(text) -> str | None:
+    """`[metadata] name` from setup.cfg text, when it is a plain name."""
+    if not isinstance(text, str):
+        return None
+    config = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        config.read_string(text)
+        value = config.get("metadata", "name", fallback=None)
+    except (configparser.Error, ValueError):
+        return None
+    value = value.strip() if isinstance(value, str) else None
+    return value if value and _PROJECT_NAME.fullmatch(value) else None
+
+
+def _setup_py_name(text) -> str | None:
+    """The `name=` of the `setup()` call in setup.py text, read and never run.
+
+    A string literal, or a module-level constant the keyword names
+    (`NAME = "PyYAML"` ... `setup(name=NAME)`). Anything computed is None.
+    """
+    if not isinstance(text, str) or len(text) > _SETUP_PY_MAX_CHARS:
+        return None
+    try:
+        tree = ast.parse(text)
+        constants = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) \
+                    and isinstance(node.value.value, str):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        constants[target.id] = node.value.value
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not ((isinstance(func, ast.Name) and func.id == "setup")
+                    or (isinstance(func, ast.Attribute) and func.attr == "setup")):
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "name":
+                    continue
+                value = keyword.value
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    found = value.value
+                elif isinstance(value, ast.Name):
+                    found = constants.get(value.id)
+                else:
+                    found = None
+                return found if found and _PROJECT_NAME.fullmatch(found) else None
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return None
+    return None
+
+
+def _pyproject_names_package(name: str, repository) -> dict:
+    """Does the declared repository's Python build configuration name this package?
+
+    `{"url", "names_package"}`, both names PEP 503-normalised. At most three
+    fetches, in order:
+    - `pyproject.toml`, by `[project].name` or `[tool.poetry].name`; when it
+      names another project, `<name>/pyproject.toml` for a repository that
+      holds several;
+    - when it names none (a setuptools build, or no file), `setup.cfg`
+      `[metadata] name`, then the `setup()` call of `setup.py`.
+
+    False only when pyproject.toml or setup.cfg names a different project. A
+    uv workspace root names the workspace, not a package, and a setup.py name
+    is read without running the file, so neither can contradict: both leave
+    the answer unknown. None when nothing that names a project could be read.
     """
     located = _github_repo(_repository_from(repository))
     if located is None:
         return {"url": None, "names_package": None}
     owner, repo = located
     wanted = _pypi_normalise(name)
-    url = None
-    for path in ("pyproject.toml", f"{name}/pyproject.toml"):
-        url = f"{GITHUB_RAW_URL}/{owner}/{repo}/HEAD/{path}"
-        try:
-            text = _request_json(url)
-        except ProviderError:
-            return {"url": url, "names_package": None}
-        if not isinstance(text, str):
-            continue
-        try:
-            document = tomllib.loads(text)
-        except (tomllib.TOMLDecodeError, ValueError):
-            continue
-        declared = ((document.get("project") or {}).get("name")
-                    or ((document.get("tool") or {}).get("poetry") or {}).get("name"))
-        if isinstance(declared, str) and _pypi_normalise(declared) == wanted:
+    last = {"url": None}
+
+    def fetch(path):
+        last["url"] = f"{GITHUB_RAW_URL}/{owner}/{repo}/HEAD/{path}"
+        return last["url"], _request_json(last["url"])
+
+    try:
+        url, text = fetch("pyproject.toml")
+        declared, workspace = _pyproject_name(text)
+        if declared is not None:
+            if _pypi_normalise(declared) == wanted:
+                return {"url": url, "names_package": True}
+            nested_url, nested = fetch(f"{name}/pyproject.toml")
+            nested_name, _ = _pyproject_name(nested)
+            if nested_name is not None and _pypi_normalise(nested_name) == wanted:
+                return {"url": nested_url, "names_package": True}
+            return {"url": url, "names_package": None if workspace else False}
+        url, text = fetch("setup.cfg")
+        declared = _setup_cfg_name(text)
+        if declared is not None:
+            return {"url": url, "names_package": _pypi_normalise(declared) == wanted}
+        url, text = fetch("setup.py")
+        declared = _setup_py_name(text)
+        if declared is not None and _pypi_normalise(declared) == wanted:
             return {"url": url, "names_package": True}
-    return {"url": url, "names_package": False}
+        return {"url": url, "names_package": None}
+    except ProviderError:
+        return {"url": last["url"], "names_package": None}
 
 
 def _pypi_near_names(name: str, own_monthly) -> tuple:
@@ -825,21 +1723,20 @@ def _apply_trust(reputation: dict, trust: dict, evidence: dict, risk_signals: li
 
 
 def _catalog_reputation(trust: dict, request, evidence: dict, provenance, ids: list,
-                        pypi_extra) -> dict:
+                        pypi_extra, continuity=None) -> dict:
     """Trusted identity replaces popularity research, never release checks."""
     result = _empty_reputation()
     result["trust"] = trust
     unmet = result["unmet"]
-    unmet.extend(_shared_unmet(evidence, ids))
+    unmet.extend(_shared_unmet(evidence, ids, continuity))
     if request.ecosystem == "npm":
         if evidence.get("install_scripts"):
             unmet.append("declares install scripts")
-        publisher = evidence.get("publisher")
-        attested = isinstance(provenance, dict) and bool(provenance.get("attested"))
-        if not publisher:
+        if not evidence.get("publisher"):
             unmet.append("publisher not recorded")
-        elif publisher not in (evidence.get("maintainers") or []) and not attested:
-            unmet.append("publisher is not a listed maintainer and has no provenance")
+        elif not _known_publisher(evidence, provenance):
+            unmet.append("publisher is not a listed maintainer and has no provenance "
+                         "or trusted publishing")
     else:
         if evidence.get("distribution") != "wheel":
             unmet.append("no wheel for this version (setup.py may run on install)")
@@ -850,14 +1747,54 @@ def _catalog_reputation(trust: dict, request, evidence: dict, provenance, ids: l
     return result
 
 
-def _pypi_license(info: dict) -> str | None:
-    declared = _text(info.get("license_expression")) or _text(info.get("license"))
-    if declared and len(declared) <= 80:
-        return declared
-    for classifier in info.get("classifiers") or []:
-        if isinstance(classifier, str) and classifier.startswith("License ::"):
-            return classifier.split("::")[-1].strip()
-    return declared[:80] if declared else None
+# project_urls labels that name the source repository, compared after
+# lower-casing and dropping everything but letters and digits, in the order
+# they are preferred.
+_SOURCE_LABELS = ("source", "sourcecode", "sourcerepository", "repository", "repo", "code", "git",
+                  "github", "githubrepository")
+_HOME_LABELS = ("homepage", "home")
+
+
+def _pypi_repository(info: dict) -> str | None:
+    """The source repository a PyPI project declares, as the report records it.
+
+    project_urls labels are free text (`Source`, `source`, `Source code`,
+    `Code`, `GitHub`, `Repository`...), so they are matched case-insensitively.
+    Order:
+    1. a source label, whatever its host, by the order of `_SOURCE_LABELS`
+       and then as listed. A repository the project says moved off GitHub is
+       what the catalog and the manifest check read, never a GitHub link
+       left elsewhere on the page;
+    2. with no source label, a home page (label or `home_page`) naming a
+       GitHub repository;
+    3. any other project URL on a GitHub repository (`…/issues`,
+       `…/blob/main/CHANGES`), cut to the repository;
+    4. the first home page, as given.
+    """
+    urls = info.get("project_urls") if isinstance(info.get("project_urls"), dict) else {}
+    labelled = [(re.sub(r"[^a-z0-9]", "", str(k).lower()), v) for k, v in urls.items()
+                if isinstance(v, str) and v.strip()]
+    sources = [v for k, v in sorted(((k, v) for k, v in labelled if k in _SOURCE_LABELS),
+                                    key=lambda item: _SOURCE_LABELS.index(item[0]))]
+    if sources:
+        return _repository_display(sources[0]) if _github_repo(sources[0]) else sources[0].strip()
+    homes = [v for k, v in labelled if k in _HOME_LABELS]
+    home_page = _text(info.get("home_page"))
+    if home_page:
+        homes.append(home_page)
+    for value in homes + [v for _k, v in labelled]:
+        if _github_repo(value) is not None:
+            return _repository_display(value)
+    return homes[0].strip() if homes else None
+
+
+def _requirement_count(requires_dist) -> int:
+    """Requirements an install of the package itself pulls: lines guarded by
+    an `extra == ...` marker belong to an optional extra and are not counted."""
+    if not isinstance(requires_dist, list):
+        return 0
+    return sum(1 for line in requires_dist
+               if isinstance(line, str) and not re.search(r"\bextra\s*==", line.partition(";")[2]))
 
 
 def _pypi_candidates(releases: dict) -> dict:
@@ -874,8 +1811,97 @@ def _pypi_candidates(releases: dict) -> dict:
     return candidates
 
 
-def _vet_pypi(request, mandatory, python=None):
-    meta = _request_json(f"{request.registry}/pypi/{request.name}/json")
+# ---------------------------------------------------------------------------
+# The exact pin a build requirement denial suggests
+# ---------------------------------------------------------------------------
+
+# Advice only. The gate never trusts a range (it reviews the exact pin the
+# project then declares, and the installer installs exactly that), so a
+# suggestion that differed from what a resolver would pick can only cost a
+# second look, never install an unreviewed version. Anything this cannot read
+# exactly (markers, URLs, pre-release or epoch versions, `===`) gets no
+# suggestion.
+_BUILD_REQUIREMENT = re.compile(
+    r"^\s*(?P<name>[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(?P<extras>\[[A-Za-z0-9._,\s-]*\])?"
+    r"\s*\(?(?P<specs>[^;@()]*?)\)?\s*$")
+_SPECIFIER = re.compile(r"^\s*(?P<op>~=|==|!=|<=|>=|<|>)\s*(?P<version>\d+(?:\.\d+)*(?:\.\*|\.post\d+)?)\s*$")
+
+
+def _release_parts(version: str) -> tuple:
+    return tuple(int(part) for part in version.partition(".post")[0].split("."))
+
+
+def _specifier_allows(version: str, op: str, bound: str) -> bool:
+    """A final release against one PEP 440 specifier."""
+    key, bound_key = _stable_key("pypi", version), None
+    if bound.endswith(".*"):
+        prefix = _release_parts(bound[:-2])
+        parts = _release_parts(version)
+        parts += (0,) * max(0, len(prefix) - len(parts))
+        matches = parts[:len(prefix)] == prefix
+        return matches if op == "==" else not matches if op == "!=" else False
+    bound_key = _stable_key("pypi", bound)
+    if key is None or bound_key is None:
+        return False
+    if op == "~=":
+        prefix = _release_parts(bound)[:-1]
+        return len(_release_parts(bound)) >= 2 and key >= bound_key and \
+            _specifier_allows(version, "==", ".".join(map(str, prefix)) + ".*")
+    if op == ">":
+        # A post-release of the bound itself is not "greater" (PEP 440).
+        if key[0] == bound_key[0] and bound_key[1] < 0 <= key[1]:
+            return False
+        return key > bound_key
+    return {"==": key == bound_key, "!=": key != bound_key, ">=": key >= bound_key,
+            "<=": key <= bound_key, "<": key < bound_key}[op]
+
+
+def suggest_build_pin(requirement: str, registry: str = "https://pypi.org"):
+    """(name with extras, version) the denial of an unpinned build requirement
+    names, or None.
+
+    The newest final release the requirement's range admits, then the
+    cool-down of an unpinned request (`_cooled`): a release under
+    FRESH_VERSION_DAYS old gives way to the newest settled one in the range.
+    One PyPI call, never retried; any failure is None and the denial says to
+    pin by hand.
+    """
+    if not isinstance(requirement, str):
+        return None
+    match = _BUILD_REQUIREMENT.match(requirement)
+    if not match:
+        return None
+    specifiers = []
+    for part in [p for p in match.group("specs").split(",") if p.strip()]:
+        found = _SPECIFIER.match(part)
+        if not found or (found.group("version").endswith(".*") and found.group("op") not in ("==", "!=")):
+            return None
+        specifiers.append((found.group("op"), found.group("version")))
+    name = match.group("name")
+    try:
+        meta = _request_json(f"{registry}/pypi/{_pypi_normalise(name)}/json")
+        releases = meta.get("releases") if isinstance(meta, dict) else None
+        if not isinstance(releases, dict):
+            return None
+        candidates = {version: stamp for version, stamp in _pypi_candidates(releases).items()
+                      if _stable_key("pypi", version) is not None
+                      and all(_specifier_allows(version, op, bound) for op, bound in specifiers)}
+    except (ProviderError, *_SHAPE_ERRORS):
+        return None
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda version: _stable_key("pypi", version))
+    pick, _record = _cooled("pypi", latest, candidates, False)
+    return name + re.sub(r"\s+", "", match.group("extras") or ""), pick
+
+
+def _vet_pypi(request, mandatory, python=None, source=None, assume=None):
+    """The PyPI review. `python` and `source` are the interpreter the wheels
+    are judged against and where it came from (`PYTHON_SOURCES`). When it is
+    unknown and the release has only interpreter-specific wheels, `assume`
+    (if given) is asked for ((major, minor), source) of the interpreter the
+    installer most likely runs."""
+    meta = _mandatory_json(f"{request.registry}/pypi/{request.name}/json")
     mandatory["registry"]["ok"] = True
     if meta is None:
         mandatory["registry"]["exists"] = False
@@ -904,7 +1930,7 @@ def _vet_pypi(request, mandatory, python=None):
         if version in candidates:
             pick, record = _cooled("pypi", version, candidates, False)
             settled = pick if record else None
-    version_meta = _request_json(f"{request.registry}/pypi/{request.name}/{version}/json")
+    version_meta = _mandatory_json(f"{request.registry}/pypi/{request.name}/{version}/json")
     if version_meta is None:
         raise HardDeny(f"version {version} of '{request.display_name}' does not exist on pypi.org")
     info = version_meta.get("info") or {}
@@ -913,12 +1939,7 @@ def _vet_pypi(request, mandatory, python=None):
     # two-year-old version is a new artifact and must read as fresh.
     file_times = [u.get("upload_time_iso_8601") for u in urls if _parse_iso(u.get("upload_time_iso_8601"))]
     uploaded = max(file_times) if file_times else None
-    project_urls = info.get("project_urls") or {}
-    repository = None
-    for key in ("Source", "Source Code", "Repository", "Homepage", "Home"):
-        if _repository_from(project_urls.get(key)):
-            repository = project_urls[key]
-            break
+    repository = _pypi_repository(info)
     # The project document lists every release with its files, so
     # first-upload and release count come for free; the version document's
     # `urls` say whether a wheel exists (an sdist runs setup.py on install).
@@ -930,8 +1951,14 @@ def _vet_pypi(request, mandatory, python=None):
     ]
     live = [u for u in urls if not u.get("yanked")]
     kinds = {u.get("packagetype") for u in live}
-    if any(u.get("packagetype") == "bdist_wheel" and wheel_compatible(u.get("filename"), python=python)
-           for u in live):
+    wheels = [u.get("filename") for u in live if u.get("packagetype") == "bdist_wheel"]
+    if python is None and assume is not None and wheels \
+            and not any(wheel_compatible(name) for name in wheels):
+        # Only interpreter-specific wheels, and the project names no Python:
+        # judge them against the interpreter the installer here most likely runs.
+        python, source = assume()
+    source = source if python is not None else None
+    if any(wheel_compatible(name, python=python) for name in wheels):
         distribution = "wheel"
     elif "sdist" in kinds and "bdist_wheel" in kinds:
         # Wheels exist, none for this machine -- pip builds the sdist.
@@ -944,6 +1971,7 @@ def _vet_pypi(request, mandatory, python=None):
                         if isinstance(u.get("digests"), dict)
                         and isinstance(u["digests"].get("sha256"), str)})
     classifiers = [c for c in (info.get("classifiers") or []) if isinstance(c, str)]
+    license_display, license_class = _pypi_license(info)
     evidence = {
         "package_created_at": min(uploads) if uploads else None,
         "version_published_at": uploaded,
@@ -953,8 +1981,9 @@ def _vet_pypi(request, mandatory, python=None):
         "publisher": None,
         "install_scripts": [],
         "deprecated": _PYPI_INACTIVE if _PYPI_INACTIVE in classifiers else None,
-        "license": _pypi_license(info),
-        "dependency_count": _count(info.get("requires_dist")) if info.get("requires_dist") is not None else 0,
+        "license": license_display,
+        "license_class": license_class,
+        "dependency_count": _requirement_count(info.get("requires_dist")),
         "release_count": _count(releases) if releases else None,
         "integrity": None,
         "distribution": distribution,
@@ -964,6 +1993,7 @@ def _vet_pypi(request, mandatory, python=None):
         "cooldown_unavailable": cooldown_unavailable,
         "settled_release": settled,
         "target_python": f"{python[0]}.{python[1]}" if python else None,
+        "target_python_source": source,
     }
     risk = []
     if info.get("yanked"):
@@ -975,8 +2005,15 @@ def _vet_pypi(request, mandatory, python=None):
         risk.append(_cooldown_unavailable_signal(cooldown_unavailable, version))
     if distribution == "sdist-only":
         risk.append("sdist only: setup.py may execute on install")
+    elif distribution == "sdist-build" and python is None:
+        risk.append("no wheel for this platform known to match this project's Python (unknown); "
+                    "a source build may run")
     elif distribution == "sdist-build":
-        target = f"Python {python[0]}.{python[1]}" if python else "an unknown project Python"
+        target = f"Python {python[0]}.{python[1]}"
+        if source == "path-python3":
+            target += " (python3 on PATH; the project names no Python)"
+        elif source == "uv-python-find":
+            target += " (the interpreter uv finds; the project names no Python)"
         risk.append(f"no wheel for this platform and {target}: pip builds the sdist, "
                     "so setup.py may execute on install")
     if distribution in ("sdist-only", "sdist-build"):
@@ -1044,39 +2081,101 @@ def _platform_tags() -> tuple:
     return family, arch, version
 
 
-def project_python(root) -> tuple | None:
-    """(major, minor) of the CPython the project installs into, or None.
+_PROJECT_MARKERS = ("pyproject.toml", ".python-version", ".venv")
 
-    The hook runs under its own `uv run --no-project`
-    interpreter, so its `sys.version_info` says nothing about the project.
-    Read in order: `.venv/pyvenv.cfg` (a non-CPython venv falls through),
-    uv's `.python-version` pin, then a `requires-python` that names exactly
-    one minor (`==3.12.*`, `~=3.12.0`). A floor such as `>=3.11` names no
-    single interpreter and reads as unknown.
-    """
-    if root is None:
-        return None
-    base = Path(root)
+
+def _project_dir(directory, stop=None) -> Path:
+    """The Python project a command in `directory` acts on: the nearest
+    directory at or above it holding a pyproject.toml, a .python-version or
+    a .venv, as uv finds it, climbing no higher than `stop` (the guarded
+    project). With no `stop`, or a `directory` outside it, only `directory`
+    itself is read: a user-wide pin above the project is not the project's.
+    `directory` itself when nothing is found."""
+    start = Path(directory)
+    limit = Path(stop) if stop is not None else start
     try:
-        cfg = (base / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+        start.relative_to(limit)
+    except ValueError:
+        limit = start
+    current = start
+    while True:
+        try:
+            if any((current / marker).exists() for marker in _PROJECT_MARKERS):
+                return current
+        except OSError:
+            return start
+        if current == limit or current.parent == current:
+            return start
+        current = current.parent
+
+
+def _venv_python(environment) -> tuple | None:
+    """(major, minor) from an environment's pyvenv.cfg; None when it cannot be
+    read or is not CPython."""
+    try:
+        cfg = (Path(environment) / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
     except OSError:
-        cfg = ""
+        return None
     fields = {}
     for line in cfg.splitlines():
         key, sep, value = line.partition("=")
         if sep:
             fields[key.strip().lower()] = value.strip()
-    if fields.get("implementation", "cpython").lower() == "cpython":
-        found = _version_pair(fields.get("version_info") or fields.get("version"))
+    if fields.get("implementation", "cpython").lower() != "cpython":
+        return None
+    return _version_pair(fields.get("version_info") or fields.get("version"))
+
+
+# Where `evidence.target_python` came from. The first five are the project
+# naming its Python; the last two are an interpreter the review assumed the
+# installer runs, because the project names none.
+PYTHON_SOURCES = ("command-environment", "project-venv", "recorded-environment", "python-version",
+                  "requires-python", "uv-python-find", "path-python3")
+ASSUMED_PYTHON_SOURCES = ("uv-python-find", "path-python3")
+
+
+def project_interpreter(root, stop=None, environments=()) -> tuple:
+    """((major, minor), source) of the CPython the project installs into, or
+    (None, None).
+
+    `root` is the directory the command runs in (the guarded project when no
+    command names one); the project is found from there (`_project_dir`), so
+    an app in a subdirectory is judged by its own interpreter. The hook runs
+    under its own `uv run --no-project` interpreter, so its
+    `sys.version_info` says nothing about the project.
+    Read in order: the `pyvenv.cfg` of an environment the command names
+    (`environments`: a literal UV_PROJECT_ENVIRONMENT, or VIRTUAL_ENV with
+    `--active`), the project's `.venv/pyvenv.cfg`, the `pyvenv.cfg` of an
+    environment outside the tree that an earlier command in this directory
+    installed into (recorded under `stop`, the guarded project), uv's
+    `.python-version` pin, then a `requires-python` that names exactly one
+    minor (`==3.12.*`, `~=3.12.0`). A non-CPython environment falls through. A
+    floor such as `>=3.11` names no single interpreter and reads as unknown.
+    The source is one of the first five `PYTHON_SOURCES`.
+    """
+    if root is None:
+        return None, None
+    base = _project_dir(root, stop)
+    recorded = []
+    if stop is not None:
+        try:
+            recorded = store.recorded_environments(stop, root)
+        except Exception:  # noqa: BLE001 - the record fails soft; the pin is still read
+            recorded = []
+    candidates = [(environment, "command-environment") for environment in environments]
+    candidates.append((base / ".venv", "project-venv"))
+    candidates += [(environment, "recorded-environment") for environment in recorded]
+    for environment, source in candidates:
+        found = _venv_python(environment)
         if found:
-            return found
+            return found, source
     try:
         pin = (base / ".python-version").read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         pin = ""
     match = re.match(r"(?:cpython[-@])?(\d+)\.(\d+)(?:[.\-]|$)", pin.splitlines()[0] if pin else "")
     if match:
-        return int(match.group(1)), int(match.group(2))
+        return (int(match.group(1)), int(match.group(2))), "python-version"
     try:
         with (base / "pyproject.toml").open("rb") as handle:
             declared = (tomllib.load(handle).get("project") or {}).get("requires-python")
@@ -1086,8 +2185,134 @@ def project_python(root) -> tuple | None:
         match = re.fullmatch(r"\s*(?:==\s*(\d+)\.(\d+)(?:\.\*|\.\d+)?|~=\s*(\d+)\.(\d+)\.\d+)\s*", declared)
         if match:
             major, minor = match.group(1, 2) if match.group(1) else match.group(3, 4)
-            return int(major), int(minor)
-    return None
+            return (int(major), int(minor)), "requires-python"
+    return None, None
+
+
+def project_python(root, stop=None, environments=()) -> tuple | None:
+    """(major, minor) of the CPython the project installs into, or None
+    (`project_interpreter` without its source)."""
+    return project_interpreter(root, stop, environments)[0]
+
+
+# When the project names no Python, the interpreter a bare `pip` or `uv`
+# most likely runs is the `python3` on PATH. It is asked once per process,
+# with `-I` so nothing in the environment or the working directory loads
+# into it, and given a short deadline.
+_PATH_PYTHON_NAME = "python3"
+_PATH_PYTHON_TIMEOUT_SECONDS = 2.0
+_PATH_PYTHON_CODE = ("import sys, sysconfig; print(sys.implementation.name, sys.version_info[0], "
+                     "sys.version_info[1], 1 if sysconfig.get_config_var('Py_GIL_DISABLED') else 0)")
+_PATH_PYTHON = {"probed": False, "value": None}
+_PATH_PYTHON_LOCK = threading.Lock()
+
+
+def _probe_interpreter(found) -> tuple | None:
+    """(major, minor) of the interpreter at `found`, run with `-I`, or None:
+    not an absolute path, not CPython, a free-threaded build, slow, or a
+    failure of any kind."""
+    import os
+    import subprocess
+    if not found or not os.path.isabs(found):
+        return None
+    try:
+        done = subprocess.run([found, "-I", "-c", _PATH_PYTHON_CODE], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=_PATH_PYTHON_TIMEOUT_SECONDS, check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    match = re.fullmatch(r"(\w+) (\d+) (\d+) ([01])", (done.stdout or "").strip())
+    if done.returncode != 0 or not match or match.group(1) != "cpython" or match.group(4) != "0":
+        return None
+    return int(match.group(2)), int(match.group(3))
+
+
+def _probe_path_python() -> tuple | None:
+    """(major, minor) of the `python3` on PATH, or None: not found, or
+    `_probe_interpreter` refused it."""
+    import shutil
+    return _probe_interpreter(shutil.which(_PATH_PYTHON_NAME))
+
+
+def path_python() -> tuple | None:
+    """(major, minor) of the CPython `python3` on PATH, probed once per
+    process and then cached; None when the probe failed. Only read when the
+    project's own Python is unknown and only CPython-specific wheels exist."""
+    with _PATH_PYTHON_LOCK:
+        if not _PATH_PYTHON["probed"]:
+            _PATH_PYTHON["value"] = _probe_path_python()
+            _PATH_PYTHON["probed"] = True
+        return _PATH_PYTHON["value"]
+
+
+# uv does not take the `python3` on PATH: by default it prefers an
+# interpreter it manages, and reads a global pin and the project's
+# configuration. For a uv command, uv itself is asked which interpreter it
+# would use, from the project's directory, once per directory per process.
+# An active environment is left out of the child's environment: `uv sync`,
+# `uv add` and `uvx` ignore it, and the hook's own runner may have set it.
+# Nothing is downloaded.
+_UV_NAME = "uv"
+_UV_FIND_TIMEOUT_SECONDS = 3.0
+_UV_FIND_ARGS = ("python", "find", "--no-python-downloads")
+_UV_FIND_UNSET = ("VIRTUAL_ENV", "CONDA_PREFIX")
+_UV_PYTHON = {}
+_UV_PYTHON_LOCK = threading.Lock()
+
+
+def _probe_uv_python(directory) -> tuple | None:
+    """(major, minor) of the interpreter `uv python find` names when run in
+    `directory`, or None: uv not found, not an absolute path, a non-zero
+    exit, slow, an answer that is not an absolute path to a file, or an
+    interpreter `_probe_interpreter` refuses."""
+    import os
+    import shutil
+    import subprocess
+    uv = shutil.which(_UV_NAME)
+    if not uv or not os.path.isabs(uv):
+        return None
+    env = {key: value for key, value in os.environ.items() if key not in _UV_FIND_UNSET}
+    try:
+        done = subprocess.run([uv, *_UV_FIND_ARGS], cwd=str(directory), env=env, capture_output=True,
+                              text=True, stdin=subprocess.DEVNULL, timeout=_UV_FIND_TIMEOUT_SECONDS,
+                              check=False)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    lines = (done.stdout or "").strip().splitlines()
+    found = lines[-1].strip() if lines else ""
+    if done.returncode != 0 or not os.path.isabs(found) or not os.path.isfile(found):
+        return None
+    return _probe_interpreter(found)
+
+
+def uv_python(directory) -> tuple | None:
+    """(major, minor) of the CPython uv would use in `directory`, asked once
+    per directory per process and then cached; None when the probe failed.
+    Only read for a uv command when the project's own Python is unknown and
+    only CPython-specific wheels exist."""
+    import os
+    if directory is None:
+        return None
+    key = os.path.realpath(directory)
+    with _UV_PYTHON_LOCK:
+        if key not in _UV_PYTHON:
+            _UV_PYTHON[key] = _probe_uv_python(key)
+        return _UV_PYTHON[key]
+
+
+def assumed_wheel(evidence) -> str | None:
+    """The install-time line for a release judged `wheel` against an
+    interpreter the review assumed, or None. Only CPython-specific wheels
+    sent the review to an assumed interpreter, so that wheel holds only if
+    the installer runs it; the line says so instead of "no install-time
+    code"."""
+    if not isinstance(evidence, dict) or evidence.get("distribution") != "wheel":
+        return None
+    if evidence.get("target_python_source") not in ASSUMED_PYTHON_SOURCES:
+        return None
+    python = _version_pair(evidence.get("target_python"))
+    if python is None:
+        return None
+    return f"wheel for CPython {python[0]}.{python[1]} (assumed interpreter)"
 
 
 def _default_root():
@@ -1105,7 +2330,9 @@ _CP = re.compile(r"cp3(\d+)")
 def _python_tag_ok(py: str, abi: str, python) -> bool:
     """One (python tag, ABI tag) pair against the project's CPython, as pip's
     own tag list ranks them. Unknown Python accepts only `py3-none` and
-    `abi3`; PyPy and free-threaded tags never match a CPython project."""
+    `abi3`: a `cp3x` wheel fits one interpreter, and nothing says the
+    installer runs that one. PyPy and free-threaded tags never match a
+    CPython project."""
     cp = _CP.fullmatch(py)
     if abi == "none":
         if py == "py3":
@@ -1151,12 +2378,14 @@ def wheel_compatible(filename, tags=None, python=None) -> bool:
     project rather than build the sdist.
 
     `tags` is (os family, arch, os version) and defaults to this machine;
-    `python` is the project's (major, minor) from `project_python`, never the
-    hook's own. A wheel counts only when one of its (python, ABI) pairs fits
-    that Python and one platform tag fits this machine, including the macOS
-    or glibc minimum the tag sets. Anything unknown -- the project's Python,
-    the host's OS version, a musllinux or PyPy tag, an unparseable name --
-    reads as incompatible, which only ever makes the release `sdist-build`.
+    `python` is the project's (major, minor) from `project_python` (or an
+    assumed interpreter, `uv_python` or `path_python`), never the hook's own, and None when it
+    is unknown, which accepts only `py3-none` and `abi3` wheels. A
+    wheel counts only when one of its (python, ABI) pairs fits that Python and
+    one platform tag fits this machine, including the macOS or glibc minimum
+    the tag sets. Anything else unknown -- the host's OS version, a musllinux
+    or PyPy tag, an unparseable name -- reads as incompatible, which only ever
+    makes the release `sdist-build`.
     """
     match = _WHEEL.match(filename or "")
     if not match:
@@ -1199,11 +2428,10 @@ def _metadata_signals(evidence: dict, provenance, now: datetime | None = None) -
         signals.append(f"deprecated on the registry: {evidence['deprecated']}")
     publisher = evidence.get("publisher")
     maintainers = evidence.get("maintainers") or []
-    attested = isinstance(provenance, dict) and bool(provenance.get("attested"))
     # A trusted-publisher release names the CI identity ("GitHub Actions") as
-    # publisher and carries an attestation; that is the expected shape, not a
-    # takeover.
-    if publisher and maintainers and publisher not in maintainers and not attested:
+    # publisher, usually with an attestation; that is the expected shape, not
+    # a takeover, and the same test as the tier's publisher criterion.
+    if publisher and maintainers and not _known_publisher(evidence, provenance):
         signals.append(f"version published by '{publisher}', who is not a listed maintainer")
     if evidence.get("license") is None:
         signals.append("no license declared")
@@ -1236,7 +2464,7 @@ def _query_osv(ecosystem: str, name: str, version: str):
         "package": {"name": name, "ecosystem": _OSV_ECOSYSTEM[ecosystem]},
         "version": version,
     }
-    result = _request_json(OSV_QUERY_URL, data=payload)
+    result = _mandatory_json(OSV_QUERY_URL, data=payload)
     if result is None:
         raise ProviderError("OSV query returned no response")
     vulns = _osv_vulns(result)
@@ -1261,7 +2489,7 @@ def query_osv_batch(ecosystem: str, pairs) -> dict:
         {"package": {"name": name, "ecosystem": _OSV_ECOSYSTEM[ecosystem]}, "version": version}
         for name, version in pairs
     ]}
-    result = _request_json(OSV_BATCH_URL, data=payload)
+    result = _mandatory_json(OSV_BATCH_URL, data=payload)
     results = (result or {}).get("results")
     if not isinstance(results, list) or len(results) != len(pairs):
         raise ProviderError("OSV batch query returned a malformed response")
@@ -1342,18 +2570,50 @@ def _retry_command(request, version: str) -> str:
     return f"pip install {name}=={version}"
 
 
-def gather(request, root=None) -> dict:
+_FROM_PROJECT = object()
+
+
+def reviewed_python(report: dict) -> tuple | None:
+    """The Python a stored report judged the wheels against (the project's,
+    or an interpreter assumed when the project names none), or None."""
+    return _version_pair((report.get("evidence") or {}).get("target_python"))
+
+
+def reviewed_python_source(report: dict) -> str | None:
+    """Where that Python came from (`PYTHON_SOURCES`), or None."""
+    source = (report.get("evidence") or {}).get("target_python_source")
+    return source if source in PYTHON_SOURCES and reviewed_python(report) is not None else None
+
+
+def gather(request, root=None, project=None, python=_FROM_PROJECT, environments=(),
+           python_source=None, uv_project=False) -> dict:
     """The whole review in one pass: registry, then OSV, for one request.
 
     Returns the evidence the report carries -- `version`, `mandatory`,
-    `evidence`, `provenance`, `hard_findings`, `risk_signals` -- without
-    writing anything. `create_review` wraps it into an immutable report; the
-    approve gate calls it again for a fresh view, because a report is a
-    record of what was true at review time, not now.
+    `evidence`, `provenance`, `reputation`, `release_continuity`,
+    `hard_findings`, `risk_signals` -- without writing anything.
+    `create_review` wraps it into an immutable report; the approve gate calls
+    it again for a fresh view, because a report is a record of what was true
+    at review time, not now.
 
-    `root` is the project: a wheel is judged against its
-    interpreter. The approve-time refresh names none and gets the guarded
-    project, so the prompt judges the same interpreter the review did.
+    A wheel is judged against the interpreter of the project the command
+    acts on: `project` is the command's directory, `root` the guarded
+    project, which bounds the search for it and stands in when no directory
+    is named. `environments` are the Python environments the command names
+    outside the tree (`project_interpreter`). `python` overrides all three:
+    the approve-time refresh passes the interpreter the review used and
+    where it came from (`reviewed_python`, `reviewed_python_source`), so the
+    prompt judges what the review judged, and nothing is probed again.
+
+    With no Python known either way, a release that has only
+    interpreter-specific wheels is judged against the interpreter the
+    installer most likely runs. For a uv command (a request whose manager is
+    uv's, or `uv_project`: a dependency of the uv project the command syncs)
+    that is the one `uv python find` names in the project (`uv_python`);
+    otherwise, or when uv does not answer, the `python3` on PATH
+    (`path_python`). The report records the interpreter and its source in
+    `target_python` and `target_python_source`; with neither probe answering,
+    the Python stays unknown.
     """
     mandatory = {
         "registry": {"ok": False},
@@ -1366,9 +2626,11 @@ def gather(request, root=None) -> dict:
         "repository_url": None,
         "maintainers": [],
         "publisher": None,
+        "trusted_publisher": None,
         "install_scripts": [],
         "deprecated": None,
         "license": None,
+        "license_class": None,
         "dependency_count": None,
         "release_count": None,
         "package_age_days": None,
@@ -1381,20 +2643,37 @@ def gather(request, root=None) -> dict:
         "cooldown_unavailable": None,
         "settled_release": None,
         "target_python": None,
+        "target_python_source": None,
     }
     provenance = None
     reputation = None
+    continuity = None
     hard_findings = []
     risk_signals = []
     version = None
     try:
         if request.ecosystem == "npm":
-            version, found, provenance, risk, repository = _vet_npm(request, mandatory)
+            version, found, provenance, risk, repository, continuity, history = _vet_npm(request, mandatory)
             pypi_extra = None
         else:
-            python = project_python(root if root is not None else _default_root())
-            version, found, provenance, risk, pypi_extra = _vet_pypi(request, mandatory, python)
+            assume = None
+            if python is _FROM_PROJECT:
+                guarded = root if root is not None else _default_root()
+                directory = project if project is not None else guarded
+                python, python_source = project_interpreter(directory, stop=guarded,
+                                                            environments=tuple(environments))
+                uv = uv_project or str(getattr(request, "manager", "") or "").startswith("uv")
+
+                def assume():
+                    found = uv_python(directory) if uv else None
+                    if found is not None:
+                        return found, "uv-python-find"
+                    found = path_python()
+                    return (found, "path-python3") if found is not None else (None, None)
+            version, found, provenance, risk, pypi_extra = _vet_pypi(request, mandatory, python,
+                                                                     python_source, assume)
             repository = pypi_extra["repository"]
+            history = True
         evidence.update(found)
         risk_signals.extend(risk)
         risk_signals.extend(_metadata_signals(evidence, provenance))
@@ -1418,9 +2697,11 @@ def gather(request, root=None) -> dict:
             period = "weekly" if request.ecosystem == "npm" else "monthly"
             try:
                 if trust["status"] == "trusted":
-                    reputation = _catalog_reputation(trust, request, evidence, provenance, ids, pypi_extra)
+                    reputation = _catalog_reputation(trust, request, evidence, provenance, ids, pypi_extra,
+                                                     continuity)
                 elif request.ecosystem == "npm":
-                    reputation = _reputation_npm(request.display_name, evidence, provenance, ids, repository)
+                    reputation = _reputation_npm(request.display_name, evidence, provenance, ids, repository,
+                                                 continuity, read_manifest=history)
                 else:
                     reputation = _reputation_pypi(request.name, evidence, ids, repository, pypi_extra["yanked"])
             except _SHAPE_ERRORS as exc:
@@ -1430,6 +2711,11 @@ def gather(request, root=None) -> dict:
                 reputation = _empty_reputation()
                 reputation["unmet"] = [f"reputation evidence was malformed ({type(exc).__name__})"]
             _apply_trust(reputation, trust, evidence, risk_signals)
+            if not history:
+                # Never established: the ages, the release count and the
+                # settled release the tier reads are unknown.
+                reputation["tier"] = "unresolved"
+                reputation["unmet"].insert(0, HISTORY_TOO_LARGE)
             if reputation.get("lookalike_of"):
                 risk_signals.append(
                     f"name is one edit from '{reputation['lookalike_of']}', which has at least "
@@ -1449,19 +2735,25 @@ def gather(request, root=None) -> dict:
         "evidence": evidence,
         "provenance": provenance,
         "reputation": reputation,
+        "release_continuity": continuity,
         "hard_findings": hard_findings,
         "risk_signals": risk_signals,
     }
 
 
-def create_review(request, root, session_id: str | None = None) -> dict:
+def create_review(request, root, session_id: str | None = None, project=None,
+                  environments=(), uv_project=False) -> dict:
     """Vet one package request, write the review report, return it.
 
     `session_id` (from the hook event) lets the Stop hook find reviews that
-    were opened in the current session and are still unresolved.
+    were opened in the current session and are still unresolved. `project`
+    is the directory the command runs in, `environments` the outside
+    environments it names and `uv_project` whether the request is a
+    dependency of the uv project it syncs (see `gather`); the report is
+    written under `root`.
     """
     review_id = store.new_review_id()
-    found = gather(request, root)
+    found = gather(request, root, project=project, environments=environments, uv_project=uv_project)
     version = found["version"]
     mandatory, evidence, provenance = found["mandatory"], found["evidence"], found["provenance"]
     hard_findings, risk_signals = found["hard_findings"], found["risk_signals"]
@@ -1491,6 +2783,7 @@ def create_review(request, root, session_id: str | None = None) -> dict:
             "openssf_scorecard": None,
             "provenance": provenance,
             "reputation": found["reputation"],
+            "release_continuity": found["release_continuity"],
         },
         "hard_findings": hard_findings,
         "risk_signals": risk_signals,

@@ -116,14 +116,45 @@ the `installed vX` line that `--check` prints.
 2. The guard stops it and lists each package as `established` (it passed the
    guard's own checks: age, release history, downloads, a matching source
    repository, no lookalike of a far more popular name, no install script, no
-   known advisory, an allowed license) or `unresolved`.
+   known advisory, a known publisher) or `unresolved`. The license is shown,
+   never a reason to hold a package back.
 3. For unresolved packages Claude starts the `package-vetter` subagent, which
    researches them and returns `RECOMMEND`, `NEEDS_HUMAN_REVIEW` or
    `DO_NOT_RECOMMEND` with its reasons.
-4. **You get one permission prompt** listing every package with its evidence
-   and, where it ran, the vetter's verdict.
-5. Yes records those exact versions in `.claude/package-guard/vetted.json`,
-   and Claude installs them. No installs nothing.
+4. **You get one permission prompt for the recommended packages**, one
+   line per package and a plain "Why" line:
+
+   ```
+   Package Guard — approve 2 recommended packages for this project
+     pypi:pandas@3.0.6
+     pypi:numpy@2.5.3
+
+   Why: from the official PyPI registry, first published over a year ago, widely used (10,000+
+   downloads a week), no known vulnerabilities or malware reports for these versions (checked today),
+   nothing runs while installing, published from its own source repository.
+   Approve these exact versions? To skip one or see details, reject and tell Claude.
+   ```
+
+   A package gets more lines only when there is something to weigh, such as
+   a fresh release, few users or a license that is not permissive.
+5. **Then one prompt for the packages the vetter left to you.** Claude
+   first tells you in one line per package what it suggests:
+
+   ```
+   Package Guard — 1 package needs your decision
+     pypi:django@6.1.2
+       published 2 days ago
+       Claude suggests: use pypi:django@6.1.1 instead
+   Approve this exact version anyway? Rejecting installs nothing and declines nothing.
+   ```
+
+   The two kinds are never on one prompt. A package the vetter advises
+   against, or whose name is one letter from a far more popular one, stays
+   out of both: Claude tells you why and offers the alternative.
+6. Yes records those exact versions in `.claude/package-guard/vetted.json`,
+   and Claude installs them. No installs nothing. To skip one package, say no
+   and tell Claude; it asks again for the rest. `cli.py show <review-id>`
+   prints everything the prompt left out.
 
 Packages you already approved install with no prompt and no network call.
 
@@ -134,8 +165,9 @@ Packages you already approved install with no prompt and no network call.
 | Claude will not run `git pull`, or a checkout that touches the guard's files | Incoming commits could change the guard or its approvals | Run it yourself: `! git pull` in Claude Code, or your terminal |
 | Claude will not edit `.claude/settings.json` or the guard's files | So Claude cannot switch the guard off | Edit them yourself |
 | An install whose `postinstall` runs a script file is refused | The guard cannot see what that file installs | Let Claude add `--ignore-scripts`, or run it yourself |
-| `uv sync` refuses a sub-package with no `[build-system]` | Its default build backend would run unreviewed | Pin the build backend in that `pyproject.toml` |
-| A version range in `package.json` or a requirements file is refused | The guard approves exact versions only | Pin with `npm install --package-lock-only`, `uv lock` or `uv pip compile`; the message names the command |
+| `uv add`, `uv sync` or `uv build` refuses a build backend range, such as `uv_build>=0.9,<0.10` | The build backend runs unreviewed unless it is pinned | Let Claude change that line to the exact version the message names. This is allowed and adds no dependency. An app created with `uv init --app --no-package` has no build backend |
+| A version range in `package.json` or a requirements file is refused | The guard approves exact versions only | Pin with `npm install --package-lock-only --ignore-scripts`, `uv lock` or `uv pip compile`; the message names the command |
+| `uv` cannot create `.venv` on a mount that refuses symlinks | The filesystem, not the guard | Put the environment elsewhere: `UV_PROJECT_ENVIRONMENT=/absolute/path uv sync --locked`. The guard checks that environment like `.venv` |
 
 Claude installs packages with `npm`, `npx`, `pip` and `uv` only. `pnpm`, `yarn`,
 `bun`, `pipx`, `poetry` and `conda` are refused.

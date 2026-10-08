@@ -37,8 +37,21 @@ permissions:
       - api.npmjs.org
       - pypi.org
       - api.osv.dev
+      # the PyPI top-packages list moved to hugovk.dev; the old host
+      # answers with a redirect there, so both are listed
+      - hugovk.dev
       - hugovk.github.io
       - raw.githubusercontent.com
+      # PyPI wheels and source archives, which pip and uv download
+      - files.pythonhosted.org
+      # the package-vetter's research: repository facts, PyPI downloads,
+      # dependency and license data, and release diffs for npm and PyPI.
+      # github.com does not cover api.github.com.
+      - api.github.com
+      - pypistats.org
+      - api.deps.dev
+      - data.jsdelivr.com
+      - inspector.pypi.io
       # the installer: uv (and a managed CPython if the image has no 3.11+);
       # github.com covers the Package Guard repository and uv's release
       # assets on objects.githubusercontent.com

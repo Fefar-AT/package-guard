@@ -534,6 +534,99 @@ def save_disk_state(root: Path, seeded_at: str, entries: dict) -> None:
     )
 
 
+# .environments.json: Python environments outside the project tree that an
+# allowed command installed into (a literal UV_PROJECT_ENVIRONMENT, or
+# VIRTUAL_ENV with `uv --active` / `uv pip`), keyed by the directory the
+# command ran in. The PreToolUse hook writes it when it allows such a command;
+# every reconciliation reads it, because disk_guard never looks at a command
+# and the next command may not repeat the variable. FAILS SOFT, like the
+# watermark: unreadable reads as empty, and `<dir>/.venv` is still read.
+#
+# At most MAX_RECORDED_ENVIRONMENTS per directory, and a full record is never
+# evicted from: forgetting an environment would stop reconciliation reading
+# it, so eight harmless commands could hide a real one. A command that would
+# record one more is refused instead: `record_environments` returns the reason.
+
+MAX_RECORDED_ENVIRONMENTS = 8
+
+
+def environments_path(root: Path) -> Path:
+    return guard_dir(root) / ".environments.json"
+
+
+def _directory_key(directory) -> str:
+    return os.path.realpath(str(directory))
+
+
+def load_environments(root: Path) -> dict:
+    """{directory: [environment path, ...]}, newest first. Fails soft."""
+    try:
+        data = json.loads(environments_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        return {}
+    table = data.get("environments")
+    if not isinstance(table, dict):
+        return {}
+    return {key: [p for p in value if isinstance(p, str) and p]
+            for key, value in table.items() if isinstance(key, str) and isinstance(value, list)}
+
+
+def recorded_environments(root: Path, directory) -> list:
+    """The environments recorded for commands run in `directory`."""
+    return load_environments(root).get(_directory_key(directory), [])
+
+
+def _merged_environments(root: Path, directory, paths):
+    """(table, key, current, merged): the record with `paths` added, newest first."""
+    paths = [p for p in paths if isinstance(p, str) and p]
+    table = load_environments(root)
+    key = _directory_key(directory)
+    current = table.get(key, [])
+    return table, key, current, list(dict.fromkeys(paths + current))
+
+
+def environments_refusal(root: Path, directory, paths) -> str | None:
+    """Why a command naming `paths` must be refused, or None. Reads only.
+
+    Not None exactly when recording `paths` for `directory` would take the
+    record past MAX_RECORDED_ENVIRONMENTS, which is never done by evicting an
+    older entry. The hook prints it after `PACKAGE_GUARD_UNSUPPORTED: `.
+    """
+    _table, _key, current, merged = _merged_environments(root, directory, paths)
+    if len(merged) <= MAX_RECORDED_ENVIRONMENTS:
+        return None
+    new = [p for p in merged if p not in current]
+    return (
+        f"Package Guard already reads {len(current)} Python environments outside the project "
+        f"for {_directory_key(directory)}, the most it records, and this command names "
+        f"another ({', '.join(new)}). It does not forget one to make room: an install there "
+        "would no longer be reconciled. Install into one of the recorded environments "
+        f"({', '.join(current)}) or the project's .venv instead. Only the user can remove an "
+        f"entry, from {environments_path(root)}."
+    )
+
+
+def record_environments(root: Path, directory, paths):
+    """Remember `paths` for `directory`.
+
+    True when the file changed, False when it already held them. When the
+    record is full it records nothing, never evicting an older entry, and
+    returns the refusal reason (`environments_refusal`), a string the hook
+    denies the command with."""
+    refusal = environments_refusal(root, directory, paths)
+    if refusal:
+        return refusal
+    table, key, current, merged = _merged_environments(root, directory, paths)
+    if merged == current:
+        return False
+    table[key] = merged
+    _atomic_write_json(environments_path(root),
+                       {"schema_version": SCHEMA_VERSION, "environments": table})
+    return True
+
+
 def load_disk_findings(root: Path) -> dict:
     """Open findings. Fails closed on malformed content."""
     path = disk_findings_path(root)

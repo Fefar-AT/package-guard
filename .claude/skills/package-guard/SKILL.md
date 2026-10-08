@@ -47,7 +47,8 @@ acquires a package is blocked unless the **exact version** is already vetted in
    - `reputation: established` — either a current user catalog identity and
      the live release checks held, or the hook's full research checks held (age, releases,
      weekly downloads, repository manifest, no near-name giant, no install
-     script, no advisory, allowed license, not fresh). The id needs no vetter.
+     script, no advisory, not fresh unless an attested release continues its
+     publisher). The license is shown, never a criterion. The id needs no vetter.
      State in one line per package whether it is the mainstream choice for its
      purpose and name a successor if you know one, then run the approve
      command the denial gives for exactly those ids (rules in step 3).
@@ -67,29 +68,53 @@ acquires a package is blocked unless the **exact version** is already vetted in
    established id without one.
 
 3. **Act on the subagent's verdicts.** Present them to the user concisely:
-   paste each package's human block **verbatim** — the `VERDICT` line, the
-   `Why` facts, the `Red flags` block and the `Alternative` line. Never
-   summarise it, never soften it, never drop a red flag.
-   - For every package with `RECOMMEND`, run the approve command with all of
-     those review ids in one call. Copy it **verbatim from the denial message**
-     — it gives an absolute path to `cli.py`, so it works from any directory:
+   one line per package — its `VERDICT`, confidence, every red-flag code and
+   its `Alternative`. Never soften it, never drop a red flag. Paste a
+   package's full human block only when the user asks for it. For a
+   `NEEDS_HUMAN_REVIEW` package, end that line with your suggestion: approve
+   it, or use the alternative the subagent named.
+   - **Approve the recommended ids first.** Run ONE approve command with every
+     `RECOMMEND` id together (the established ids were approved in step 2).
+     Copy it **verbatim from the denial message** — it gives an absolute path
+     to `cli.py`, so it works from any directory — with the ids filled in:
      `uv run --no-project --no-config --no-python-downloads <ABSOLUTE>/.claude/hooks/package_guard/cli.py approve <id> <id> ...`
      Run it as a **simple standalone command**. Never prefix it with `cd`,
      never join it with `&&` or `;`, never wrap it in a subshell — the hook
      refuses any compound form, because a wrapped approve would skip the
-     human prompt. Claude Code will show the user a permission prompt, and
-     that prompt now carries the vetter's verdict, confidence and red flags.
+     human prompt. Claude Code will show the user a permission prompt that
+     lists the packages and says in plain words why they are recommended.
      Never bypass it.
-   - For `DO_NOT_RECOMMEND` or `NEEDS_HUMAN_REVIEW`, do not approve, and keep
-     the id out of the batch. Ask the user one direct question per package
-     with exactly these options: **use the alternative** — the established
-     alternative the subagent named, installed unpinned so it gets its own
-     review — **approve anyway** (then run a separate approve for that id),
-     or **not now** (leave the review open). Choosing the alternative settles
-     the original review once the alternative is approved: it stops counting
-     as open and needs no decline, and the same holds for a review of another
-     version of a package the user has since approved. If the user says never
-     to install it, run `decline` (step 4).
+     One approve takes at most 12 ids. With more, run one approve per group
+     of 12, one after another, each as its own command.
+   - **Then the `NEEDS_HUMAN_REVIEW` ids, in a separate approve.** After the
+     one-line-per-package message above, run ONE approve command with every
+     `NEEDS_HUMAN_REVIEW` id together, the same way. Do not wait for a reply
+     in chat: for a `NEEDS_HUMAN_REVIEW` package the permission prompt IS the
+     question. It shows each reason in plain words and your suggestion. The
+     hook refuses an approve that names recommended and `NEEDS_HUMAN_REVIEW`
+     ids together (`PACKAGE_GUARD_CLI_REFUSED: cannot approve — this approve
+     mixes …`), approves nothing, and names the two commands to run instead,
+     recommended first.
+   - For `DO_NOT_RECOMMEND`, or a `TYPO_SQUAT` red flag (a lookalike), do not
+     approve, and keep the id out of the batch. The same goes for an id the
+     denial lists under `LOOKALIKE ids`, whose name the hook itself found one
+     edit from a far more downloaded package. The hook enforces this: an
+     approve naming such an id together with any other id is refused
+     (`approve flagged packages alone`), and nothing in it is approved.
+     Tell the user in one short message and offer the alternative — the
+     established alternative the subagent named, installed unpinned so it
+     gets its own review. Run a separate approve for that id, alone, only if
+     the user explicitly asks to approve it anyway. Choosing the alternative
+     settles the original review once the alternative is approved: it stops
+     counting as open and needs no decline, and the same holds for a review
+     of another version of a package the user has since approved. If the
+     user says never to install it, run `decline` (step 4).
+   - Never run the vetter again to get a different verdict. A later report
+     cannot soften a `DO_NOT_RECOMMEND`, a `NEEDS_HUMAN_REVIEW` or a
+     `TYPO_SQUAT` given on complete evidence: the hook keeps the stricter
+     verdict for the prompt and for the one-package rule. A rerun replaces
+     only a verdict given on partial evidence, such as one marked
+     `PROVIDER_UNREACHABLE`.
 
 4. **If the user rejects the prompt or asks to drop a package**, record it and
    say so in your reply. A rejected prompt ends your turn as "Interrupted" —
@@ -107,6 +132,19 @@ acquires a package is blocked unless the **exact version** is already vetted in
    was blocked and stop; never re-run the vetter for an id that was already
    established, and never retry the approve hoping for a different answer.
 
+   **Every approve the guard refuses starts with a `PACKAGE_GUARD_` code.**
+   The refusals for a missing vetter verdict, a lapsed established reputation,
+   recommended and `NEEDS_HUMAN_REVIEW` ids in one approve, and an id that
+   approve, decline, undecline or revoke cannot use start with
+   `PACKAGE_GUARD_CLI_REFUSED`. They are the guard's own messages, and each says
+   what to do: *no package-vetter verdict* means wait for the vetter's
+   notification, or ask the same vetter to resend its report; *the established
+   reputation did not hold* means launch the vetter for those ids; *nothing was
+   vetted* names the ids to leave out before you re-run approve with the rest;
+   *mixes recommended packages* names the two approves to run instead, the
+   recommended one first.
+   Act on them; do not treat them as a harness block.
+
 5. **After approval, retry with the exact versions** given in the report's
    `retry` line (for example `npm install react@19.1.0 vite@6.3.5`). The hook
    allows exact vetted versions without further prompts. The pinned retry is
@@ -121,8 +159,9 @@ acquires a package is blocked unless the **exact version** is already vetted in
    vetted the same way as one that names packages, so an install can be
    blocked over packages you did not name:
    - every `npm install` (bare, `npm ci`, or naming a package) installs the
-     `package.json` of its working directory; so do `npm update`, `npm dedupe`
-     and `npm audit fix`, which re-resolve from the registry;
+     `package.json` of its project — the nearest one at or above the working
+     directory, because npm walks up; so do `npm update`, `npm dedupe` and
+     `npm audit fix`, which re-resolve from the registry;
    - `pip install -r <file>` (also `python -m pip`, `uv pip install`,
      `uv pip sync`) installs everything that file lists;
    - `uv sync` installs the locked project, and so does `uv run` in a project
@@ -130,7 +169,18 @@ acquires a package is blocked unless the **exact version** is already vetted in
      `uv add` re-syncs it too. In a uv project, always run `uv sync --locked`
      / `uv run --locked …` — without `--locked` uv re-resolves pyproject.toml
      and installs versions nobody reviewed, so the plain form is refused.
-     `--extra` / `--all-extras` put the extras up for review as well.
+     `--extra` / `--all-extras` put the extras up for review as well. From a
+     subdirectory uv acts on the nearest `pyproject.toml` above it, or on its
+     workspace root, and that project is what gets reviewed.
+
+   npm and uv do not stop at this project's folder. When the project has no
+   `package.json` (npm) or `pyproject.toml` (uv) of its own, they climb into
+   the folders above it and install whatever project they find there; a
+   workspace above the project that lists it does the same. The hook refuses
+   that install and names the outside folder. Do not edit or move anything
+   outside the project to get past it. To make this folder the project, run
+   `npm init -y` or `uv init --no-workspace` as its own command first, then
+   the install; otherwise tell the user which project the install would use.
 
    **Decoration does not change any of this.** A pipe, a redirect, a `;`, a
    `&&`, a leading `VAR=value`, `sudo`, or `sh -c "..."` are all parsed through
@@ -154,6 +204,16 @@ acquires a package is blocked unless the **exact version** is already vetted in
 
    Pinning the specs by hand to exact versions works too. Run the pinning
    command in the manifest's own directory; the denial names it.
+
+   A build backend (`[build-system] requires` in `pyproject.toml`, fetched by
+   `uv build`, `pip install --no-deps .`, and `uv sync` / `uv add` in a
+   packaged project) has no resolver to pin it. The denial names the exact
+   line to write, e.g. change `uv_build>=0.9.7,<0.10.0` to
+   `uv_build==0.9.29`. **Pinning an existing `[build-system]` requirement as
+   the denial instructs is allowed and is not adding a dependency.** Edit only
+   that requirement, then re-run the same command; the pinned version is
+   reviewed like any package. An application needs no build backend: create
+   it with `uv init --app --no-package`.
 
    One run reviews at most 20 new packages — named on the command line or
    declared by the manifest — within a time budget, and says how many it
@@ -183,10 +243,11 @@ own reputation facts instead.
 - run `approve` for an unresolved id before the vetter's notification has
   arrived, or for an unresolved id the vetter did not return a verdict for;
 - state a verdict the vetter did not return, or a confidence it did not give —
-  if the report has no verdict for an id, say so, then ask the same vetter
-  (SendMessage to its agent id) to resend its full report with the machine
-  blocks; launch a new vetter only if it cannot be reached. An id no vetter
-  was ever given needs a new package-vetter launch, not a SendMessage;
+  if the report has no verdict for an id, say so, then load the SendMessage
+  tool (it is deferred: ToolSearch with query `select:SendMessage`) and ask
+  the same vetter (SendMessage to its agent id) to resend its full report
+  with the machine blocks; launch a new vetter only if that fails. An id no
+  vetter was ever given needs a new package-vetter launch, not a SendMessage;
 - run `decline` for a rejected prompt, an interruption, or your own
   preference; only after the user says never to install it;
 - install the alternative without its own review — it goes through the same

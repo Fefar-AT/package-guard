@@ -12,6 +12,7 @@ Standard library only.
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import re
 from pathlib import Path
@@ -22,9 +23,49 @@ TABLE = json.loads(TABLE_PATH.read_text(encoding="utf-8"))
 METACHARS = set(TABLE["metacharacters"])
 PEEL_WRAPPERS = set(TABLE["peel_wrappers"])
 RECURSIVE_WRAPPERS = set(TABLE["recursive_wrappers"])
+WRAPPER_GRAMMAR = TABLE.get("wrapper_grammar") or {}
+INERT_HEADS = set(TABLE.get("inert_heads") or ())
+STRING_RUNNERS = set(TABLE.get("string_runners") or ())
+STDIN_SHELLS = TABLE.get("stdin_shells") or {}
 CD_COMMANDS = set(TABLE["cd_commands"])
 FOREIGN = TABLE["foreign"]["managers"]
 FOREIGN_SAFE = set(TABLE["foreign"]["safe_verbs"])
+
+ENV_REASONS = TABLE.get("env_reasons") or {}
+ENVIRONMENT = TABLE.get("environment") or {}
+ENV_SHARED_REFUSE = TABLE.get("env_shared_refuse") or {}
+ENV_REACH = TABLE.get("env_reach") or {}
+
+_FILES = TABLE.get("installer_files") or {}
+_FILE_NAMES = {name.casefold() for name in _FILES.get("names", ())}
+_FILE_PATTERNS = [re.compile(fnmatch.translate(p.casefold())) for p in _FILES.get("patterns", ())]
+
+
+def installer_file(path):
+    """True when the last component of `path` is a file an installer reads."""
+    name = re.split(r"[\\/]", path)[-1].casefold()
+    return name in _FILE_NAMES or any(p.match(name) for p in _FILE_PATTERNS)
+
+
+# The same names as they appear inside code (`python -c "open('uv.lock')"`):
+# not part of a longer name.
+INSTALLER_FILE_IN_TEXT = re.compile(
+    r"(?<![\w.-])(?:%s)(?![\w-]|\.\w)" % "|".join(
+        [re.escape(n) for n in sorted(_FILES.get("names", ()), key=len, reverse=True)]
+        + [re.escape(p).replace(r"\*", r"[\w.-]*") for p in _FILES.get("patterns", ())]),
+    re.IGNORECASE,
+)
+
+
+def installer_reads(name):
+    """True when an installer reads the variable `name`: its family's prefix,
+    a shared refusal, or one of the table's `env_reach` names."""
+    upper = name.upper()
+    if any(upper in names for names in ENV_SHARED_REFUSE.values()):
+        return True
+    if upper in ENV_REACH.get("names", ()) or upper.startswith(tuple(ENV_REACH.get("prefixes", ()))):
+        return True
+    return any(upper.startswith(table["prefix"].upper()) for table in ENVIRONMENT.values())
 
 INSTALLERS = TABLE["installers"]
 _BY_HEAD = {}
@@ -85,6 +126,72 @@ def lookup(head):
     return _BY_HEAD.get(head)
 
 
+def wrapper_grammar(head):
+    """A wrapper's own options and positionals, as the table states them."""
+    return WRAPPER_GRAMMAR.get(head) or {}
+
+
+# --------------------------------------------------------------------------
+# Environment variables an installer reads
+# --------------------------------------------------------------------------
+
+def env_key(family, name):
+    """`name` as the family's installer reads it, or None when it reads no such variable.
+
+    Matched case-insensitively, as Windows reads the environment. npm keys
+    take npm's own form: `npm_config_bin_links` is the `bin-links` setting.
+    """
+    table = ENVIRONMENT.get(family)
+    if not table or not name.upper().startswith(table["prefix"].upper()):
+        return None
+    if family == "npm":
+        key = name[len(table["prefix"]):]
+        if not key.startswith("//"):
+            key = (key[:1] + key[1:].replace("_", "-")).lower()
+        return key
+    return name.upper()
+
+
+def classify_env(family, name):
+    """What `name=...` in front of this family's installer means.
+
+    None when the installer does not read it. Otherwise `allow`, `locked`
+    (counts as --locked), `path` (allowed as a literal absolute path), a
+    refusal category of `env_reasons`, or `unknown`: a name with the family's
+    prefix that no list carries is refused by default.
+    """
+    upper = name.upper()
+    for category, names in ENV_SHARED_REFUSE.items():
+        if upper in names:
+            return category
+    key = env_key(family, name)
+    if key is None:
+        return None
+    table = ENVIRONMENT[family]
+    if key in table.get("paths", ()):
+        return "path"
+    if key in table.get("locked", ()):
+        return "locked"
+    if key in table.get("allow", ()) or any(key.startswith(p) for p in table.get("allow_prefixes", ())):
+        return "allow"
+    for category, names in (table.get("refuse") or {}).items():
+        if key in names:
+            return category
+    for category, prefixes in (table.get("refuse_prefixes") or {}).items():
+        if any(key.startswith(p) for p in prefixes):
+            return category
+    for category, suffixes in (table.get("refuse_suffixes") or {}).items():
+        if any(key.endswith(s) for s in suffixes):
+            return category
+    return "unknown"
+
+
+def env_reason(family, category, name):
+    """Why `name` is refused, and what to do instead."""
+    tool = (ENVIRONMENT.get(family) or {}).get("tool", family)
+    return ENV_REASONS[category].format(tool=tool, name=name)
+
+
 def normalize(installer, verb):
     """Canonicalise a verb for this installer."""
     if installer.get("normalize") == "npm_deref":
@@ -117,9 +224,11 @@ def samples():
 # --------------------------------------------------------------------------
 # The generated fallback hint.
 #
-# Used ONLY where the lexer could not analyse the text (unbalanced quotes, an
-# unlexable wrapper payload). It is derived from the table, never hand-edited,
-# so it cannot drift from the dispatcher the way `_ACQ_HINT` did.
+# Used ONLY where the parser cannot read the command: text the lexer could not
+# analyse (unbalanced quotes), a wrapper option or command name the table does
+# not know, a command name built at run time, or the text a shell reads from
+# its standard input. It is derived from the table, never hand-edited, so it
+# cannot drift from the dispatcher the way `_ACQ_HINT` did.
 # --------------------------------------------------------------------------
 
 def _npm_spellings():
@@ -153,12 +262,32 @@ def _build_hint():
     alternatives.append(r"python[0-9.]*\s+-m\s+pip\s+install\b")
     for manager in FOREIGN:
         alternatives.append(r"%s\s+" % re.escape(manager))
+    # `=` leads too: zsh runs `=npm` as the npm on PATH, and an alias body
+    # reads `x=npm ...`.
     return re.compile(
-        r"(?:^|[\s;&|(`'\"])(?:\S*[\\/])?(?:" + "|".join(alternatives) + r")"
+        r"(?:^|[\s;&|(`'\"=])(?:\S*[\\/])?(?:" + "|".join(alternatives) + r")"
     )
 
 
 ACQUISITION_HINT = _build_hint()
+
+
+def _verb_words():
+    """Every spelling of a verb whose bare form acquires, for any installer:
+    what follows a command name the parser cannot read (`$CMD install x`)."""
+    always = {"npm_install", "npm_ci", "npm_exec", "npm_update", "uv_add", "uv_sync",
+              "pip_install", "pip_download", "pip_wheel"}
+    found = set()
+    for installer in INSTALLERS:
+        verbs_ = {verb for verb, spec in installer.get("acquire", {}).items()
+                  if verb and spec["handler"] in always}
+        found |= verbs_
+        if installer.get("normalize") == "npm_deref":
+            found |= {s for s in list(_ABBREV) + list(NPM_ALIASES) if npm_deref(s) in verbs_}
+    return frozenset(found)
+
+
+ACQUIRING_VERBS = _verb_words()
 
 
 def acquisition_hint():

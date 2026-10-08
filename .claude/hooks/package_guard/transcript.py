@@ -321,6 +321,47 @@ RED_FLAG_CODES = frozenset({
 # Strictest first: two verdict lines for one package that disagree resolve to
 # the more cautious one.
 _STRICTNESS = {"DO_NOT_RECOMMEND": 0, "NEEDS_HUMAN_REVIEW": 1, "RECOMMEND": 2}
+TYPO_SQUAT = "TYPO_SQUAT"
+# The codes the agent definition ties to evidence that is not complete: a
+# source was unreachable (partial), or the report could not be read
+# (unavailable). A verdict carrying neither, and no status saying otherwise,
+# was given on complete evidence.
+_INCOMPLETE_FLAGS = frozenset({"PROVIDER_UNREACHABLE", "REPORT_NOT_FOUND"})
+
+
+def _complete(verdict: dict) -> bool:
+    """Whether a verdict was given on complete evidence. A machine block says
+    so in `evidence_status`; a verdict line, or a block whose status is
+    missing, says nothing, and counts as complete unless its red flags name an
+    unreachable source or an unreadable report."""
+    status = verdict.get("evidence_status")
+    if status == "complete":
+        return True
+    return status == "unknown" and not _INCOMPLETE_FLAGS & set(verdict.get("red_flags") or ())
+
+
+def _binding(verdict: dict) -> bool:
+    """A verdict no later report may relax: DO_NOT_RECOMMEND,
+    NEEDS_HUMAN_REVIEW or a TYPO_SQUAT red flag, given on complete evidence.
+    A verdict on partial evidence is not binding, so a rerun after a provider
+    outage can still clear it."""
+    strict = verdict["verdict"] != "RECOMMEND" or TYPO_SQUAT in verdict["red_flags"]
+    return strict and _complete(verdict)
+
+
+def no_laxer(floor: dict | None, verdict: dict) -> dict:
+    """`verdict`, unless `floor` -- the strictest binding verdict seen
+    earlier for the same review id -- is stricter. A later verdict replaces
+    the floor only when it is at least as strict, and a TYPO_SQUAT either
+    carries is kept, so a second vetter run can confirm or tighten a verdict
+    but never relax it."""
+    if floor is None:
+        return verdict
+    kept = verdict if _STRICTNESS[verdict["verdict"]] <= _STRICTNESS[floor["verdict"]] else floor
+    typo = TYPO_SQUAT in floor["red_flags"] or TYPO_SQUAT in verdict["red_flags"]
+    if typo and TYPO_SQUAT not in kept["red_flags"]:
+        kept = dict(kept, red_flags=[TYPO_SQUAT, *kept["red_flags"]][:MAX_RED_FLAGS])
+    return kept
 
 
 def _without_version(ref: str) -> str:
@@ -620,18 +661,27 @@ def _vetter_texts(record, launches, agents, descriptions=None):
 
 
 def vetter_verdicts(transcript_path, reports=()) -> dict:
-    """review_id -> the vetter's sanitised verdict block, last one wins.
+    """review_id -> the vetter's sanitised verdict, the latest that does not
+    relax an earlier binding one.
 
     Only a report the harness delivered from a package-vetter this session
     launched is read (`_vetter_texts`); a block anywhere else -- including a
     forged <task-notification> in text the main agent wrote -- is ignored.
 
-    `reports` binds human blocks to review ids. When the vetter's hand-back
-    has no machine block for a review, its VERDICT line counts if the line's
+    `reports` binds human blocks to review ids. When a delivered report has
+    no machine block for a review, its VERDICT line counts if the line's
     `ecosystem:name@version` equals that report's resolved identity. Current
     builds deliver the report as a hand-back message the vetter writes itself,
     and such a message can drop the machine block; without this fallback each
     drop would cost a full second vetter run.
+
+    Reports are read in transcript order. A later one replaces an earlier
+    one, so a rerun after a provider outage clears the first run's verdict,
+    except that a binding verdict (`_binding`: DO_NOT_RECOMMEND,
+    NEEDS_HUMAN_REVIEW or TYPO_SQUAT on complete evidence) is replaced only
+    by one at least as strict (`no_laxer`). The approve prompt, the batch
+    rule and the Stop hook all read the result, so a second vetter run the
+    agent prompts cannot launder a verdict for any of them.
     """
     lines = read_lines(transcript_path)
     if lines is None:
@@ -648,32 +698,42 @@ def vetter_verdicts(transcript_path, reports=()) -> dict:
             records.append(record)
     launches, agents, descriptions = _vetter_launches(records)
     by_use, by_agent = _assignments(records)
-    found, human = {}, {}
+    labels = {}
+    for report in reports:
+        review_id = report.get("review_id")
+        identity = report.get("resolved_identity") or {}
+        if isinstance(review_id, str):
+            labels[review_id] = \
+                f"{identity.get('ecosystem')}:{identity.get('name')}@{identity.get('version')}"
+    found, floors = {}, {}
+
+    def take(verdict):
+        review_id = verdict["review_id"]
+        found[review_id] = no_laxer(floors.get(review_id), verdict)
+        if _binding(verdict):
+            floors[review_id] = no_laxer(floors.get(review_id), verdict)
+
     for record in records:
         asked = None
-        # Within one delivered report, lines that disagree resolve to the
-        # stricter. A later report replaces an earlier one, as a later machine
-        # block does: a rerun after a provider outage must be
-        # able to clear the first run's verdict.
-        mine = {}
+        # One delivered report: its machine blocks in order, and for an id
+        # it has no block for, its verdict line, lines that disagree
+        # resolving to the stricter.
+        blocks, mine = [], {}
         for text in _vetter_texts(record, launches, agents, descriptions):
-            for block in blocks_in(text):
-                found[block["review_id"]] = block
+            blocks += list(blocks_in(text))
             if asked is None:
                 asked = _asked_of(record, by_use, by_agent)
             for label, block in human_verdicts(text):
                 for review_id in asked:
-                    key = (review_id, label)
-                    held = mine.get(key)
+                    if labels.get(review_id) != label:
+                        continue
+                    held = mine.get(review_id)
                     if held is None or _STRICTNESS[block["verdict"]] <= _STRICTNESS[held["verdict"]]:
-                        mine[key] = block
-        human.update(mine)
-    for report in reports:
-        review_id = report.get("review_id")
-        identity = report.get("resolved_identity") or {}
-        label = f"{identity.get('ecosystem')}:{identity.get('name')}@{identity.get('version')}"
-        key = (review_id, label)
-        if review_id in found or key not in human or not isinstance(review_id, str):
-            continue
-        found[review_id] = {"review_id": review_id, **human[key]}
+                        mine[review_id] = block
+        for block in blocks:
+            take(block)
+        blocked = {block["review_id"] for block in blocks}
+        for review_id, block in mine.items():
+            if review_id not in blocked:
+                take({"review_id": review_id, **block})
     return found

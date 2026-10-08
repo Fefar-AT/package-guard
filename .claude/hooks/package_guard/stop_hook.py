@@ -128,28 +128,60 @@ def pending_reviews(root, session_id: str, verdicts=None, answered=()) -> list:
 # Is a package-vetter subagent still working?
 # ---------------------------------------------------------------------------
 
-def vetter_in_flight(transcript_path, now=None) -> bool:
-    """True when a package-vetter was launched this session and has not reported.
+def _peer_sender(record) -> str | None:
+    """The agent id a subagent's hand-back came from, or None.
 
-    Reads the session transcript (JSONL). Three records matter: the Agent
+    Current builds deliver a background subagent's report as a message from
+    that agent: a `user` record whose harness-written `origin` is
+    `{"kind": "peer", "from": <agent id>}`, or, while the main agent is still
+    in its turn, a `queued_command` attachment carrying the same origin.
+    """
+    origin = record.get("origin")
+    if record.get("type") == "attachment":
+        attachment = record.get("attachment")
+        origin = attachment.get("origin") if (
+            isinstance(attachment, dict) and attachment.get("type") == "queued_command") else None
+    elif record.get("type") != "user":
+        return None
+    if isinstance(origin, dict) and origin.get("kind") == "peer" and isinstance(origin.get("from"), str):
+        return origin["from"]
+    return None
+
+
+def vetter_status(transcript_path, now=None) -> dict | None:
+    """What this session's background package-vetter launches are doing.
+
+    `in_flight`: one was launched under `VETTER_STALE_SECONDS` ago and has not
+    reported. `stale`: one was launched longer ago than that and never
+    reported. `reported`: at least one has reported. None when the transcript
+    cannot be read.
+
+    Reads the session transcript (JSONL). The records that matter: the Agent
     tool_use that launched the vetter, its tool_result (which says whether the
-    launch was backgrounded), and the <task-notification> that later carries
-    the report, naming the launch's tool-use id. A missing or unreadable
-    transcript yields False -- the stricter answer, never looser.
+    launch was backgrounded, and names the background agent's id), and the
+    report: a <task-notification> naming the launch's tool-use id, or a
+    hand-back from the launch's agent id (`_peer_sender`). The vetter
+    has no tool to message its parent mid-run, so any message from its agent
+    id is its report.
     """
     lines = transcript.read_lines(transcript_path)
     if lines is None:
-        return False
+        return None
     launched = {}  # tool_use id -> launch time
     backgrounded = set()
+    agents = {}  # agent id -> tool_use id
     reported = set()
+    senders = set()
     for raw in lines:
         # Cheap pre-filter: only records that can matter are parsed.
-        if _VETTER_AGENT not in raw and _ASYNC_LAUNCH not in raw and _NOTIFICATION not in raw:
+        if (_VETTER_AGENT not in raw and _ASYNC_LAUNCH not in raw and _NOTIFICATION not in raw
+                and '"peer"' not in raw):
             continue
         try:
             record = json.loads(raw)
         except ValueError:
+            continue
+        if not isinstance(record, dict):
             continue
         for node in _walk(record):
             kind = node.get("type")
@@ -157,18 +189,40 @@ def vetter_in_flight(transcript_path, now=None) -> bool:
                 if (node.get("input") or {}).get("subagent_type") == _VETTER_AGENT:
                     launched[node.get("id")] = _parse_timestamp(record.get("timestamp"))
             elif kind == "tool_result" and node.get("tool_use_id") in launched:
-                if any(_ASYNC_LAUNCH in text for text in _strings(node.get("content"))):
+                texts = list(_strings(node.get("content")))
+                if any(_ASYNC_LAUNCH in text for text in texts):
                     backgrounded.add(node["tool_use_id"])
+                agent = transcript._launch_agent_id(record, "\n".join(texts))
+                if agent:
+                    agents[agent] = node["tool_use_id"]
         for text in _strings(record):
             if _NOTIFICATION in text:
                 reported.update(_TOOL_USE_ID.findall(text))
+        sender = _peer_sender(record)
+        if sender:
+            senders.add(sender)
+    reported |= {agents[agent] for agent in senders if agent in agents}
     now = now or datetime.now(timezone.utc)
+    status = {"in_flight": False, "stale": False,
+              "reported": any(use in reported for use in launched)}
     for tool_use_id, started in launched.items():
         if tool_use_id not in backgrounded or tool_use_id in reported or started is None:
             continue
         if (now - started).total_seconds() < VETTER_STALE_SECONDS:
-            return True
-    return False
+            status["in_flight"] = True
+        else:
+            status["stale"] = True
+    return status
+
+
+def vetter_in_flight(transcript_path, now=None) -> bool:
+    """True when a package-vetter was launched this session and has not reported.
+
+    A missing or unreadable transcript yields False -- the stricter answer,
+    never looser. See `vetter_status` for what counts as a report.
+    """
+    status = vetter_status(transcript_path, now)
+    return bool(status and status["in_flight"])
 
 
 def asked_the_user(event: dict, pending, findings) -> bool:
@@ -195,7 +249,30 @@ def asked_the_user(event: dict, pending, findings) -> bool:
 # Decision
 # ---------------------------------------------------------------------------
 
-def render_block(pending, nag: int, root) -> str:
+def _relaunch_line(vetters) -> str:
+    """What to do about a vetter that has not reported, given `vetter_status`.
+
+    "Launch it again" only for a launch that went stale with no report. A
+    vetter that reported is done: its hand-back is in the conversation, and a
+    second run would only repeat it. With no transcript to read (`None`) the
+    conditional form is all that can be said.
+    """
+    stale = (f"If you launched one more than {VETTER_STALE_SECONDS // 60} minutes ago and "
+             "have no report, it did not finish: launch it again.")
+    if vetters is None:
+        return " " + stale
+    if vetters.get("stale"):
+        return (f" A package-vetter you launched more than {VETTER_STALE_SECONDS // 60} minutes "
+                "ago has not reported; it did not finish: launch it again.")
+    if vetters.get("reported"):
+        return (" The package-vetter you launched has reported: act on its verdicts; a second "
+                "run for the ids it covered would only repeat them.")
+    return ""
+
+
+def render_block(pending, nag: int, root, vetters=None) -> str:
+    """The block message. `vetters` is `vetter_status(...)`, or None when the
+    transcript could not be read."""
     ids = " ".join(r["review_id"] for r in pending)
     lines = [
         f"PACKAGE_GUARD_PENDING_REVIEWS ({nag}/{MAX_NAGS}): you cannot stop yet — "
@@ -222,9 +299,8 @@ def render_block(pending, nag: int, root) -> str:
         "already settled; it needs nothing.",
         "Run the guard CLI exactly as written: a simple standalone command, no `cd`, no `&&`.",
         "A running package-vetter counts as progress: its report arrives as a notification, "
-        "and you may end the turn to wait for it — run no other package command meanwhile. "
-        f"If you launched one more than {VETTER_STALE_SECONDS // 60} minutes ago and have no "
-        "report, it did not finish: launch it again.",
+        "and you may end the turn to wait for it — run no other package command meanwhile."
+        + _relaunch_line(vetters),
     ]
     return "\n".join(lines)
 
@@ -258,7 +334,8 @@ def evaluate(event: dict, root) -> str | None:
         store_error = store_error or exc
     if not pending and not findings and store_error is None:
         return None
-    if (pending or findings) and vetter_in_flight(event.get("transcript_path")):
+    vetters = vetter_status(path)
+    if (pending or findings) and vetters and vetters["in_flight"]:
         # The report arrives as a user turn; letting the agent stop is how it
         # gets there. Not counted as a nag: the pending set is unchanged and
         # will be pushed again once the report is in and reviews are still open.
@@ -281,7 +358,7 @@ def evaluate(event: dict, root) -> str | None:
         )
     blocks = []
     if pending:
-        blocks.append(render_block(pending, nag, root))
+        blocks.append(render_block(pending, nag, root, vetters))
     if findings:
         blocks.append(disk_guard.render_block(
             findings, root,

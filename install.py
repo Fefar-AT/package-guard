@@ -142,6 +142,7 @@ GITIGNORE_LINES = (
     ".claude/package-guard/.disk-state.json",
     ".claude/package-guard/.disk-findings.json",
     ".claude/package-guard/.transitive-state.json",
+    ".claude/package-guard/.environments.json",
 )
 
 EMPTY_VETTED = {"schema_version": 1, "packages": []}
@@ -508,7 +509,7 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
 
     gitignore = target / ".gitignore"
     present = set(gitignore.read_text(encoding="utf-8").splitlines()) if gitignore.exists() else set()
-    rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the four local files"))
+    rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the local state files"))
     return rows
 
 
@@ -555,7 +556,7 @@ def uninstall(target: Path) -> list[str]:
     state = target / STATE_DIR
     if state.is_dir():
         for name in (".stop-state.json", ".disk-state.json", ".disk-findings.json",
-                     ".transitive-state.json"):
+                     ".transitive-state.json", ".environments.json"):
             if (state / name).exists():
                 (state / name).unlink()
         reports = state / "reports"

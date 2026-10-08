@@ -217,25 +217,30 @@ _PIP_ENV = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_NO_IN
             "PIP_TRUSTED_HOST", "PIP_CONFIG_FILE")
 
 
-def _pip_conf_files(directory, home, environ):
+def _pip_conf_files(directory, home, environ, environments=None):
+    """Every pip.conf pip may read. `environments` are the Python environments
+    the install may use (the hook passes `disk_guard.environments`); without
+    it, `<directory>/.venv`."""
     home = Path(home)
     files = [home / ".config" / "pip" / "pip.conf", home / ".pip" / "pip.conf",
-             home / "Library" / "Application Support" / "pip" / "pip.conf",
-             Path(directory) / ".venv" / "pip.conf"]
+             home / "Library" / "Application Support" / "pip" / "pip.conf"]
+    if environments is None:
+        environments = [Path(directory) / ".venv"]
+    files += [Path(env) / "pip.conf" for env in environments]
     venv = environ.get("VIRTUAL_ENV")
     if venv:
         files.append(Path(venv) / "pip.conf")
-    return files
+    return list(dict.fromkeys(files))
 
 
-def pip_config_problems(directory, home=None, environ=None) -> list:
+def pip_config_problems(directory, home=None, environ=None, environments=None) -> list:
     home = HOME if home is None else home
     environ = os.environ if environ is None else environ
     problems = [f"environment: {name} changes where pip fetches from"
                 for name in _PIP_ENV
                 if environ.get(name) and not (name == "PIP_INDEX_URL"
                                               and _same_url(environ[name], PYPI_INDEX))]
-    for path in _pip_conf_files(directory, home, environ):
+    for path in _pip_conf_files(directory, home, environ, environments):
         if not path.is_file():
             continue
         # Raw, as pip reads it: a `%` in a URL is not interpolation.
@@ -463,9 +468,11 @@ def artifact_problems(kinds, directory, artifacts_of) -> list:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None) -> list:
+def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
+                 environments=None) -> list:
     """Every reason the installer `parsed` describes would fetch from somewhere
-    other than the identity its review vetted."""
+    other than the identity its review vetted. `environments` are the Python
+    environments the install may use, whose pip.conf pip reads."""
     ecosystems = {r.ecosystem for r in parsed.requests}
     managers = {r.manager for r in parsed.requests}
     kinds = {m.kind for m in parsed.manifests}
@@ -482,7 +489,7 @@ def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None) 
         uses_pip = (any(not m.startswith("uv") for m in managers if m)
                     or kinds & {"requirements", "build-requires"})
         if uses_pip:
-            problems += pip_config_problems(directory, home, environ)
+            problems += pip_config_problems(directory, home, environ, environments)
         if uses_uv or "requirements" in kinds:
             problems += uv_config_problems(directory, home, environ)
     if "uv-project" in kinds:

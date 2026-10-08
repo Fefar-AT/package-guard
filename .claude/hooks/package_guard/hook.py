@@ -12,6 +12,7 @@ closed (deny / exit 2). Standard library only.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -19,9 +20,11 @@ import shlex
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from concurrent import futures
 from pathlib import Path
+from typing import NamedTuple
 
 # The floor, checked before the siblings are imported so an old interpreter gets
 # a sentence naming the cause instead of an ImportError about a module nobody has
@@ -43,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # guard is absent while appearing installed. tomllib (manifest.py) needs 3.11+;
 # the same hole opens for any syntax error or missing file in these four modules.
 try:
+    import tomllib  # noqa: E402
     import disk_guard  # noqa: E402
     import manifest as pg_manifest  # noqa: E402
     import parser as pg_parser  # noqa: E402
@@ -812,6 +816,15 @@ _REVIEW_WORKERS = 8
 # budget by one in-flight review (~56s). 150 + 56 + 56 leaves ~38s under the
 # 300s ceiling. The ceiling is the harness's, so the guard's own share is what
 # moves when a review grows more calls.
+#
+# A mandatory call retries once after a timeout or a reset
+# (vetting._mandatory_json), but only when the backoff and a whole second
+# request end within _REVIEW_BUDGET_SECONDS of evaluate()'s start, a mark no
+# later than any deadline below. Retries therefore spend time inside the
+# budget, never after it, and add no term. A review whose npm packument is
+# too large to read spends two more registry calls (the dist-tags and the
+# version document) and skips the two repository-manifest fetches, so it
+# stays within _REVIEW_CALLS.
 _REVIEW_BATCH = 20
 _REVIEW_BUDGET_SECONDS = 150.0
 # A function deadline is not a process deadline: abandoned review threads are
@@ -861,7 +874,11 @@ _UV_UNLOCKED = (
     "versions Package Guard has not reviewed. Re-run the same command with `--locked` "
     "added, e.g. `uv sync --locked` or `uv run --locked <command>`. If uv then reports "
     "that the lock is out of date, run `uv lock` as its own command first; the next "
-    "`--locked` run reviews the new lock."
+    "`--locked` run reviews the new lock. `uv version` with a new version or `--bump` "
+    "re-locks and syncs the same way, and the new version changes the lock, so `--locked` "
+    "fails there: add "
+    "`--no-sync` to it instead (it re-locks without installing), then run "
+    "`uv sync --locked`."
 )
 
 
@@ -1036,6 +1053,28 @@ def _lifecycle_check(directory, root):
     return None
 
 
+def _source_problems(parsed, targets, directory, root, **kwargs) -> list:
+    """`sources.problems_for` for the shell's directory, as always, and again
+    for every project directory an installer reads instead (`targets`): the
+    manifest, lock and project configuration it finds there. npm also reads
+    that project's .npmrc for the packages a command names."""
+    problems = list(sources.problems_for(parsed, directory, **kwargs))
+    here = os.path.realpath(directory)
+    groups = {}
+    for scope, path in targets:
+        if os.path.realpath(path) != here:
+            groups.setdefault(os.path.realpath(path), (path, [], []))[2].append(scope)
+    named = [r for r in parsed.requests if r.ecosystem == "npm"]
+    if named:
+        home = _npm_project(directory, root)
+        if os.path.realpath(home) != here:
+            groups.setdefault(os.path.realpath(home), (home, [], []))[1].extend(named)
+    for path, requests, scopes in groups.values():
+        subset = dataclasses.replace(parsed, requests=tuple(requests), manifests=tuple(scopes))
+        problems += sources.problems_for(subset, path, **kwargs)
+    return list(dict.fromkeys(problems))
+
+
 def _render_alternate_source(problems) -> str:
     lines = ["PACKAGE_GUARD_UNSUPPORTED: this install would fetch from somewhere other than "
              "the registry its review vets (alternate registries, indexes and direct "
@@ -1046,6 +1085,337 @@ def _render_alternate_source(problems) -> str:
     lines.append("Tell the user which file or setting this is. Do not edit it yourself to "
                  "make the install pass; the user decides whether that source is acceptable.")
     return "\n".join(lines)
+
+
+class _BuildRequirement(NamedTuple):
+    """An unpinned `[build-system] requires` entry, with the project it is in.
+
+    No resolver pins these and no lock records them, so the denial's remedy
+    differs from a manifest's: pin the line in that project's pyproject.toml.
+    `default_backend` marks a project with no `[build-system]` at all, which is
+    built with setuptools' default backend."""
+    requirement: str
+    reason: str
+    project: Path
+    default_backend: bool
+
+
+def _build_requires(directory):
+    resolved, unresolved = pg_manifest.build_requires(directory)
+    return resolved, [_BuildRequirement(spec, reason, Path(directory),
+                                        (spec, reason) == pg_manifest._DEFAULT_BACKEND)
+                      for spec, reason in unresolved]
+
+
+# ---------------------------------------------------------------------------
+# Which project a command installs
+#
+# npm and uv do not install the manifest of the shell's directory: they walk
+# up from it to the project they find, and install that. Run from `src/`,
+# `npm ci` installs the parent's package-lock.json and `uv sync --locked` the
+# parent's uv.lock. The gate reads the project each installer finds. When
+# nothing inside the guard root stops the walk, the installers keep climbing
+# past it, and so does the gate (`_beyond`); a project found out there is not
+# one the guard protects, and the command is refused (`_outside_project`).
+# ---------------------------------------------------------------------------
+
+def _upward(directory, root) -> list:
+    """`directory` and each parent up to the guard root, nearest first.
+
+    Walked on real paths, as the installers walk from the process's working
+    directory, then spelled under `root` as given. A directory outside the
+    guard root yields only itself.
+    """
+    start = Path(directory)
+    try:
+        relative = Path(os.path.realpath(start)).relative_to(os.path.realpath(root))
+    except ValueError:
+        return [start]
+    parts = relative.parts
+    chain = [Path(root).joinpath(*parts[:depth]) for depth in range(len(parts), -1, -1)]
+    chain[0] = start
+    return chain
+
+
+def _within(path, root) -> bool:
+    """True when `path` is the guard root or lies under it, on real paths."""
+    try:
+        Path(os.path.realpath(path)).relative_to(os.path.realpath(root))
+    except ValueError:
+        return False
+    return True
+
+
+def _beyond(directory, root) -> list:
+    """The directories above the guard root, nearest first, on real paths:
+    where npm and uv go on looking when nothing inside the guarded project
+    stopped them. Empty for a `directory` outside the guard root, which is
+    read alone, as before."""
+    if not _within(directory, root):
+        return []
+    return list(Path(os.path.realpath(root)).parents)
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+
+
+def _read_toml(path):
+    try:
+        with open(path, "rb") as handle:
+            return tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _npm_stops(candidate: Path) -> bool:
+    return (candidate / "package.json").is_file() or (candidate / "node_modules").is_dir()
+
+
+def _npm_workspace_takes(project: Path, workspace_root: Path, data) -> bool:
+    """Whether the package.json `data` of `workspace_root` declares workspaces
+    that could take `project`. npm matches each `workspaces` glob (the array,
+    or its `packages` array) against the member's path; here `*` also
+    crosses `/` and a `!` exclusion is not subtracted, so a doubtful match
+    reads as a member. A workspaces value of any other shape counts as one."""
+    if not isinstance(data, dict) or not data.get("workspaces"):
+        return False
+    declared = data["workspaces"]
+    patterns = declared.get("packages") if isinstance(declared, dict) else declared
+    if not isinstance(patterns, list):
+        return True
+    try:
+        relative = Path(os.path.realpath(project)).relative_to(
+            os.path.realpath(workspace_root)).as_posix()
+    except ValueError:
+        return False
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            return True
+        if pattern.startswith("!"):
+            continue
+        compiled = _uv_glob(pattern)
+        if compiled is None or compiled.match(relative):
+            return True
+    return False
+
+
+def _npm_project(directory, root) -> Path:
+    """The directory npm acts on for a command run in `directory`.
+
+    npm's own rule: the nearest directory at or above it holding a
+    package.json or a node_modules directory. From there npm keeps climbing
+    for a workspace root that lists it, and installs from that root. Inside
+    the guard root, any ancestor package.json declaring workspaces is taken as
+    that root, which the source check then refuses (workspaces are not
+    supported). npm does not stop at the guard root, and neither does this
+    walk (`_beyond`): above it, a workspace root whose globs take the project,
+    or the nearest directory npm stops at when nothing inside did, is returned
+    though it lies outside, and `_outside_project` refuses it. `directory`
+    itself when nothing is found, where npm would create the manifest.
+    """
+    chain = _upward(directory, root)
+    beyond = _beyond(directory, root)
+    for index, candidate in enumerate(chain):
+        if _npm_stops(candidate):
+            for outer in chain[index + 1:]:
+                data = _read_json(outer / "package.json")
+                if isinstance(data, dict) and data.get("workspaces"):
+                    return outer
+            for outer in beyond:
+                if (outer / "package.json").is_file() and _npm_workspace_takes(
+                        candidate, outer, _read_json(outer / "package.json")):
+                    return outer
+            return candidate
+    for candidate in beyond:
+        if _npm_stops(candidate):
+            return candidate
+    return Path(directory)
+
+
+def _uv_workspace(directory):
+    """The `[tool.uv.workspace]` table of `directory`'s pyproject.toml, or None."""
+    data = _read_toml(Path(directory) / "pyproject.toml")
+    tool = data.get("tool") if isinstance(data, dict) else None
+    uv = tool.get("uv") if isinstance(tool, dict) else None
+    workspace = uv.get("workspace") if isinstance(uv, dict) else None
+    return workspace if isinstance(workspace, dict) else None
+
+
+def _uv_glob(pattern: str):
+    """A compiled regex matching what uv's workspace glob matches: the glob is
+    matched against the whole path, `*` and `?` crossing `/`, and a `**`
+    component standing for any number of directories, none included."""
+    parts = [p for p in pattern.strip().replace("\\", "/").split("/") if p not in ("", ".")]
+    out = []
+    for index, part in enumerate(parts):
+        last = index == len(parts) - 1
+        if part == "**":
+            out.append(".*" if last else "(?:.*/)?")
+            continue
+        piece, i = "", 0
+        while i < len(part):
+            char = part[i]
+            if char == "*":
+                piece += ".*"
+            elif char == "?":
+                piece += "."
+            elif char == "[" and "]" in part[i + 2:]:
+                end = part.index("]", i + 2)
+                body = part[i + 1:end]
+                piece += "[" + ("^" + body[1:] if body.startswith("!") else body).replace("\\", "\\\\") + "]"
+                i = end
+            else:
+                piece += re.escape(char)
+            i += 1
+        out.append(piece + ("" if last else "/"))
+    try:
+        return re.compile("".join(out) + r"\Z", re.DOTALL)
+    except re.error:
+        return None
+
+
+def _uv_member(project: Path, workspace_root: Path, workspace: dict) -> bool:
+    """uv's membership test: a `members` glob takes the project and no
+    `exclude` glob does."""
+    try:
+        relative = Path(os.path.realpath(project)).relative_to(
+            os.path.realpath(workspace_root)).as_posix()
+    except ValueError:
+        return False
+
+    def matched(key):
+        globs = workspace.get(key)
+        for glob in globs if isinstance(globs, list) else []:
+            compiled = _uv_glob(glob) if isinstance(glob, str) else None
+            if compiled is not None and compiled.match(relative):
+                return True
+        return False
+
+    return matched("members") and not matched("exclude")
+
+
+def _uv_nearest(directory, root):
+    """The nearest directory at or above `directory` holding a pyproject.toml,
+    as uv finds its project, or None. uv does not stop at the guard root, and
+    neither does this walk (`_beyond`)."""
+    walk = _upward(directory, root) + _beyond(directory, root)
+    return next((d for d in walk if (d / "pyproject.toml").is_file()), None)
+
+
+def _uv_projects(directory, root) -> list:
+    """The directories whose uv.lock a uv project command run in `directory`
+    installs from, primary first; empty when uv finds no pyproject.toml.
+
+    uv takes the nearest pyproject.toml as the project. Unless that file
+    declares a workspace itself, the first pyproject.toml above it decides:
+    when it declares `[tool.uv.workspace]` whose globs take the project, the
+    project is a member and uv installs from the workspace root's uv.lock.
+    Both searches go on past the guard root, as uv's do (`_beyond`); a
+    project or workspace root found there is returned though it lies outside,
+    and `_outside_project` refuses it. Inside the guard root, a lock of the
+    project's own next to a workspace is read as well, so a misjudged
+    membership never leaves the lock uv uses unread.
+    """
+    chain = _upward(directory, root)
+    walk = chain + _beyond(directory, root)
+    project = next((d for d in walk if (d / "pyproject.toml").is_file()), None)
+    if project is None:
+        return []
+    if _uv_workspace(project) is not None:
+        return [project]
+    above = walk[walk.index(project) + 1:]
+    first = next((d for d in above if (d / "pyproject.toml").is_file()), None)
+    workspace = _uv_workspace(first) if first is not None else None
+    if workspace is not None and _uv_member(project, first, workspace):
+        own = (project / "uv.lock").is_file()
+        return [first, project] if own else [first]
+    if (project / "uv.lock").is_file() and project in chain:
+        outer = next((d for d in chain[chain.index(project) + 1:] if _uv_workspace(d) is not None), None)
+        if outer is not None:
+            return [project, outer]
+    return [project]
+
+
+def _python_project(parsed, directory, root) -> Path:
+    """Where the Python environments a command names are recorded and read:
+    the uv project it acts on (`_uv_projects`) when it carries one, else the
+    shell's directory. `uv pip` and pip look for no project, and a
+    requirements file is reconciled from its own directory."""
+    if any(scope.kind == "uv-project" for scope in parsed.manifests):
+        found = _uv_projects(directory, root)
+        # A project outside the guard root is refused (`_outside_project`)
+        # and keys nothing.
+        if found and (_within(found[0], root) or not _within(directory, root)):
+            return found[0]
+    return Path(directory)
+
+
+def _scope_directories(scope, directory, root) -> list:
+    """Every directory the installer reads `scope` from, for a command run
+    in `directory`. A requirements file is named relative to the shell's
+    directory. A local build is pip's `.` or uv's discovered project, so both
+    are read."""
+    if scope.kind == "npm":
+        return [_npm_project(directory, root)]
+    if scope.kind == "uv-project":
+        return _uv_projects(directory, root) or [Path(directory)]
+    if scope.kind == "build-requires":
+        nearest = _uv_nearest(directory, root)
+        same = nearest is None or os.path.realpath(nearest) == os.path.realpath(directory)
+        return [Path(directory)] if same else [Path(directory), nearest]
+    return [Path(directory)]
+
+
+# What each installer looks for on its way up, named in the refusal, and the
+# command that gives the guarded project its own manifest so the walk stops
+# inside it. Both commands acquire nothing.
+_OWN_MANIFEST = {
+    "npm": ("npm walks up to the nearest package.json or node_modules", "npm init -y"),
+    "uv-project": ("uv walks up to the nearest pyproject.toml", "uv init --no-workspace"),
+    "build-requires": ("a local build takes the nearest pyproject.toml at or above this directory",
+                       "uv init --no-workspace"),
+}
+
+
+def _outside_project(targets, directory, root) -> dict | None:
+    """A denial when an installer, run in `directory` inside the guard root,
+    would act on a project outside it.
+
+    npm and uv climb past the guard root when nothing inside it stops them,
+    and a workspace above it takes a member inside it (`_npm_project`,
+    `_uv_projects`). That project's manifest, lock and configuration are
+    nobody's to review here, and what it installs lands where no scan of this
+    project reads. A command run from outside the guard root is read where it
+    runs, as before, and is not refused here."""
+    if not _within(directory, root):
+        return None
+    for scope, path in targets:
+        if _within(path, root):
+            continue
+        outside = os.path.realpath(path)
+        guarded = os.path.realpath(root)
+        lines = [f"PACKAGE_GUARD_UNSUPPORTED: this install would use {outside}, outside the "
+                 f"project Package Guard protects ({guarded}); run it from inside the project, "
+                 f"or install the guard at {outside}."]
+        chain = _upward(directory, root)
+        stopped = (any(_npm_stops(d) for d in chain) if scope.kind == "npm"
+                   else any((d / "pyproject.toml").is_file() for d in chain))
+        walk, create = _OWN_MANIFEST.get(scope.kind, (None, None))
+        if walk and not stopped:
+            lines.append(f"{walk}, and the project has none of its own, so it climbs out. To make "
+                         f"this directory the project, create its manifest first, as its own "
+                         f"command: `{create}`.")
+        else:
+            lines.append(f"{outside} is a workspace root that takes this project as a member, "
+                         "so the installer works from there.")
+        lines.append("Do not edit or move files outside the project to make the install pass; "
+                     "tell the user which project the install would use.")
+        return _decision("deny", "\n".join(lines))
+    return None
 
 
 def _read_manifest(scope, directory):
@@ -1064,23 +1434,28 @@ def _read_manifest(scope, directory):
         for built in pg_manifest.uv_built_directories(directory):
             # Syncing builds the packaged root and every editable or
             # path member, each fetching its own backend.
-            more, missing = pg_manifest.build_requires(built)
+            more, missing = _build_requires(built)
             resolved, unresolved = resolved + more, unresolved + missing
         return resolved, unresolved, Path(directory) / "uv.lock"
     if scope.kind == "build-requires":
-        resolved, unresolved = pg_manifest.build_requires(directory)
+        resolved, unresolved = _build_requires(directory)
         return resolved, unresolved, Path(directory) / "pyproject.toml"
     raise pg_manifest.ManifestError(f"unknown manifest kind {scope.kind!r}")
 
 
-def _create_reviews(requests, root, session_id, deadline=None):
+def _create_reviews(requests, root, session_id, deadline=None, project=None, environments=(),
+                    uv_project=False):
     """(reports, abandoned) for PackageRequests, in the given order.
 
     `deadline` is a time.monotonic() value shared by every call in one hook
     invocation (None starts a fresh budget). `abandoned` counts requests whose
     review did not finish in time. Their reports are not returned; a review
     that was mid-flight may still land on disk afterwards, and the next run
-    picks it up unchanged.
+    picks it up unchanged. `project` is the directory the command runs in,
+    whose Python a wheel is judged against, `environments` the Python
+    environments outside the tree the command names, and `uv_project` true
+    for the dependencies of a uv project the command syncs, whose Python uv
+    chooses when the project names none.
     """
     if not requests:
         return [], 0
@@ -1089,9 +1464,15 @@ def _create_reviews(requests, root, session_id, deadline=None):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return [], len(requests)
+    extra = {"uv_project": True} if uv_project else {}
 
     def build(request):
-        return vetting.create_review(request, root, session_id=session_id)
+        if project is None:
+            return vetting.create_review(request, root, session_id=session_id, **extra)
+        if environments:
+            return vetting.create_review(request, root, session_id=session_id, project=project,
+                                         environments=tuple(environments), **extra)
+        return vetting.create_review(request, root, session_id=session_id, project=project, **extra)
 
     workers = min(_REVIEW_WORKERS, len(requests))
     pool = futures.ThreadPoolExecutor(max_workers=workers)
@@ -1119,10 +1500,11 @@ _PIN_HELP = {
         "  uv pip compile <input>.in -o <this-file>",
         "Editing every line to a bare name==version pin works too.",
     ),
+    # A [build-system] requirement has no resolver to pin it: the denial names
+    # the exact version to write (`_render_build_unpinned`), and for a local
+    # build this is the other way out.
     "build-requires": (
-        "An isolated build fetches these build requirements from PyPI and runs them. "
-        "Pin each in pyproject.toml's [build-system] requires to an exact version "
-        "(name==version), or build without isolation:",
+        "Or build without isolation, which fetches nothing:",
         "  pip install --no-deps --no-build-isolation .   (or: uv build --no-build-isolation)",
         "",
     ),
@@ -1134,65 +1516,522 @@ _PIN_HELP = {
     ),
 }
 
+# Unpinned build requirements whose exact version the denial looks up, one
+# PyPI call each, never retried, and only while the review deadline leaves
+# room for the call: they end before the deadline, so the budget arithmetic
+# is unchanged.
+_BUILD_PIN_LOOKUPS = 3
 
-def _render_unpinned(unresolved, where, kind) -> str:
-    """The manifest declares versions Package Guard cannot pin to an exact release."""
+
+def _build_pins(unresolved, deadline=None) -> dict:
+    """requirement -> (name, version) or None, for the unpinned build
+    requirements in `unresolved` (`vetting.suggest_build_pin`)."""
+    pins = {}
+    for entry in unresolved:
+        if not isinstance(entry, _BuildRequirement) or entry.requirement in pins:
+            continue
+        if len(pins) >= _BUILD_PIN_LOOKUPS or (
+                deadline is not None and time.monotonic() + vetting.TIMEOUT_SECONDS > deadline):
+            break
+        pins[entry.requirement] = vetting.suggest_build_pin(entry.requirement, pg_parser.PYPI_REGISTRY)
+    return pins
+
+
+def _render_build_unpinned(entries, pins, kind) -> list:
+    """The remedy for unpinned `[build-system] requires`: the exact line to
+    write, said to be allowed, and the project shape that needs none."""
     lines = [
-        "PACKAGE_GUARD_MANIFEST_UNPINNED",
-        f"manifest: {where}",
         "",
-        "This command installs everything the manifest lists, so these dependencies "
-        "would land without ever being named on the command line. Package Guard "
-        "cannot vet them because they are not pinned to exact versions:",
+        "Building this project runs the build backend its pyproject.toml names under "
+        "[build-system] requires, fetched from PyPI. Package Guard reviews exact versions "
+        "only, and these are not pinned:",
     ]
-    lines += [f"  {name}: {spec}" for name, spec in unresolved]
-    intro, fix, extra = _PIN_HELP.get(kind, _PIN_HELP["npm"])
-    lines += ["", intro, fix]
-    directory = Path(where).parent
-    lines.append(f"Run it with {directory} as the working directory, so it resolves the "
-                 "manifest above and not another one: change directory in its own command "
-                 "first, then run the pinning command bare -- no `cd ... &&`, no pipe, no `;`.")
-    lines += ["", "Then re-run the install. The exact pinned versions become the reviews."]
-    if extra:
-        lines.append(extra)
+    for entry in entries:
+        pyproject = entry.project / "pyproject.toml"
+        pin = pins.get(entry.requirement)
+        exact = f"{pin[0]}=={pin[1]}" if pin else None
+        if entry.default_backend:
+            lines += [
+                f"  {entry.project}: no [build-system], so the build uses setuptools' default "
+                "backend, fetched unpinned.",
+                f"    fix: declare that backend, pinned, in {pyproject}:",
+                "      [build-system]",
+                f"      requires = [\"{exact or 'setuptools==<version>'}\"]",
+                "      build-backend = \"setuptools.build_meta:__legacy__\"",
+            ]
+        else:
+            lines.append(f"  {pyproject}: {entry.requirement}")
+            lines.append(f"    fix: change `{entry.requirement}` to `{exact}`" if exact else
+                         f"    fix: change `{entry.requirement}` to one exact `name==version` pin "
+                         "(Package Guard could not look the version up)")
+    if any(pins.get(e.requirement) for e in entries):
+        lines.append("The version shown is the newest release the range allows, held back to "
+                     "the newest one at least a week old when the latest is newer.")
+    lines += [
+        "This edit is allowed: it pins a build requirement the project already uses and adds "
+        "no dependency, so the rule against hand-editing pyproject.toml to add a dependency "
+        "does not apply. Change only that requirement, then re-run the same command. The pinned "
+        "version is reviewed and approved like any other package.",
+        "An application needs no build backend: `uv init --app --no-package` creates a project "
+        "without [build-system], so this does not come up.",
+    ]
+    if kind == "build-requires":
+        intro, fix, _extra = _PIN_HELP["build-requires"]
+        lines += [intro, fix]
+    return lines
+
+
+def _render_unpinned(unresolved, where, kind, pins=None) -> str:
+    """The manifest declares versions Package Guard cannot pin to an exact release."""
+    build = [e for e in unresolved if isinstance(e, _BuildRequirement)]
+    rest = [e for e in unresolved if not isinstance(e, _BuildRequirement)]
+    if build and not rest:
+        where = build[0].project / "pyproject.toml"
+    lines = ["PACKAGE_GUARD_MANIFEST_UNPINNED", f"manifest: {where}"]
+    if rest:
+        lines += [
+            "",
+            "This command installs everything the manifest lists, so these dependencies "
+            "would land without ever being named on the command line. Package Guard "
+            "cannot vet them because they are not pinned to exact versions:",
+        ]
+        lines += [f"  {name}: {spec}" for name, spec in rest]
+        intro, fix, extra = _PIN_HELP.get(kind, _PIN_HELP["npm"])
+        lines += ["", intro, fix]
+        directory = Path(where).parent
+        lines.append(f"Run it with {directory} as the working directory, so it resolves the "
+                     "manifest above and not another one: change directory in its own command "
+                     "first, then run the pinning command bare -- no `cd ... &&`, no pipe, no `;`.")
+        lines += ["", "Then re-run the install. The exact pinned versions become the reviews."]
+        if extra:
+            lines.append(extra)
+    if build:
+        lines += _render_build_unpinned(build, pins or {}, kind)
     return "\n".join(lines)
 
 
-def _age(days) -> str:
-    if not isinstance(days, int):
-        return "unknown"
+# The approval prompt is read in a yellow box by a human deciding in seconds.
+# Every line is at most this wide, wrapped at spaces only, so a URL or a package
+# name is never split; a wrapped line counts against the prompt's line budget.
+_PROMPT_WIDTH = 100
+_DETAIL = "    "
+_DETAIL_MORE = "      "
+_OFFICIAL_REGISTRIES = {"npm": pg_parser.NPM_REGISTRY, "pypi": pg_parser.PYPI_REGISTRY}
+
+# One approve is one prompt, and Claude Code cuts a long hook reason with "…":
+# a package past the cut would be approved unseen. An approve names at most
+# this many review ids; every message that hands the agent an approve command
+# splits a longer list into commands of this size.
+_APPROVE_BATCH_MAX = 12
+
+
+def _lookalike_of(report: dict):
+    """The far more downloaded name the hook found one edit away, or None."""
+    reputation = (report.get("optional_checks") or {}).get("reputation")
+    name = reputation.get("lookalike_of") if isinstance(reputation, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def _alone_flags(report: dict, verdict: dict | None) -> list:
+    """Why an id may only be approved on its own: a DO_NOT_RECOMMEND verdict,
+    a TYPO_SQUAT red flag, or the hook's own lookalike signal. Such a package's
+    prompt must never ride on the approval of others."""
+    flags = []
+    if verdict and verdict.get("verdict") == "DO_NOT_RECOMMEND":
+        flags.append("DO_NOT_RECOMMEND")
+    if "TYPO_SQUAT" in ((verdict or {}).get("red_flags") or []):
+        flags.append("TYPO_SQUAT")
+    lookalike = _lookalike_of(report)
+    if lookalike:
+        flags.append(f"one edit from '{lookalike}'")
+    return flags
+
+
+def _approval_kind(report: dict, verdict: dict | None) -> str:
+    """Which prompt an id belongs on.
+
+    `flagged`: approved alone (`_alone_flags`). `decision`: a
+    NEEDS_HUMAN_REVIEW verdict, the human's call. `recommended`: a RECOMMEND
+    verdict, or no verdict and the established tier. A verdict outranks the
+    tier, and an id that has neither is a decision: nothing recommends it."""
+    if _alone_flags(report, verdict):
+        return "flagged"
+    said = (verdict or {}).get("verdict")
+    if said == "RECOMMEND" or (said is None and vetting.is_established(report)):
+        return "recommended"
+    return "decision"
+
+
+_KIND_RANK = {"flagged": 0, "decision": 1, "recommended": 2}
+
+
+def _approve_commands(root, ids) -> list:
+    """The approve command(s) for `ids`, at most _APPROVE_BATCH_MAX ids each."""
+    ids = list(dict.fromkeys(ids))
+    return [store.cli_command(root, "approve", " ".join(ids[i:i + _APPROVE_BATCH_MAX]))
+            for i in range(0, len(ids), _APPROVE_BATCH_MAX)]
+
+
+def _ids_by_kind(reports, verdicts) -> dict:
+    """kind -> review ids in the agent's order, for ids that are not flagged."""
+    groups = {"recommended": [], "decision": []}
+    for report in reports:
+        kind = _approval_kind(report, verdicts.get(report["review_id"]))
+        if kind in groups:
+            groups[kind].append(report["review_id"])
+    return groups
+
+
+def _approve_in_order(root, reports, verdicts) -> list:
+    """The approve commands for the ids that are not flagged: every recommended
+    id first, then every decision id, never both kinds in one command."""
+    groups = _ids_by_kind(reports, verdicts)
+    return _approve_commands(root, groups["recommended"]) + _approve_commands(root, groups["decision"])
+
+
+def _command_lines(commands) -> str:
+    """Several commands, one per line, to run one after another."""
+    return "\n".join(f"  {command}" for command in commands)
+
+
+def _wrap(text: str, indent: str = "", more: str = "  ") -> list:
+    return textwrap.wrap(str(text), width=_PROMPT_WIDTH, initial_indent=indent,
+                         subsequent_indent=more, break_long_words=False,
+                         break_on_hyphens=False) or [indent.rstrip()]
+
+
+_VERSION_TEXT = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,63}")
+
+
+def _same_package(ecosystem: str, one: str, other) -> bool:
+    if ecosystem == "pypi":
+        return vetting._pypi_normalise(one) == vetting._pypi_normalise(str(other or ""))
+    return one == other
+
+
+def _pinned_alternative(alternative: str, report: dict | None) -> str:
+    """The alternative as the human should read it.
+
+    A vetter's verdict line loses the alternative's version, so an earlier
+    release of the package itself arrives as its bare name. That release is
+    the hook's own settled one: the newest at least a week old."""
+    identity = (report or {}).get("resolved_identity") or {}
+    ecosystem, _, name = alternative.partition(":")
+    if "@" in name[1:] or ecosystem != identity.get("ecosystem") \
+            or not _same_package(ecosystem, name, identity.get("name")):
+        return alternative
+    settled = ((report or {}).get("evidence") or {}).get("settled_release")
+    if isinstance(settled, str) and _VERSION_TEXT.fullmatch(settled) and settled != identity.get("version"):
+        return f"{alternative}@{settled}"
+    return f"an earlier version of {alternative}"
+
+
+def _render_verdict(verdict: dict, report: dict | None = None) -> list:
+    """The suggestion line under a package that needs the human's decision.
+
+    Built only from the sanitised fields transcript.vetter_verdicts kept: the
+    alternative is rendered only when it is still one `npm:` or `pypi:`
+    package reference, so free text from the vetter never reaches the prompt.
+    The verdict itself is the prompt's kind, and its red flags and evidence
+    status are reasons (`_plain_reasons`)."""
+    alternative = verdict.get("alternative")
+    if isinstance(alternative, str) and transcript._PACKAGE_REF.fullmatch(alternative):
+        line = f"Claude suggests: use {_pinned_alternative(alternative, report)} instead"
+    else:
+        line = ("Claude suggests: approve only if you need this exact package; "
+                "the vetter found no alternative")
+    return _wrap(line, _DETAIL, _DETAIL_MORE)
+
+
+# The hook's own unmet strings, cut to what a human needs on one line, for a
+# criterion that has no plain phrase below. The full text stays in the report
+# and in `cli.py show`. An unknown string keeps its words and loses only a
+# trailing parenthesis.
+_UNMET_SHORT = (
+    (re.compile(r"package age unknown day\(s\), under \d+"), "package age unknown"),
+    (re.compile(r"unknown release\(s\), under \d+"), "release count unknown"),
+    (re.compile(r"version age unknown day\(s\), under \d+"), "version age unknown"),
+    (re.compile(r"repository manifest does not name this package"),
+     "repository manifest names a different package"),
+    (re.compile(r"(one edit from '[^']*'),.*"), r"\1"),
+    (re.compile(r"no wheel for this version\b.*"), "no wheel"),
+)
+
+
+def _short_unmet(reason) -> str:
+    text = " ".join(str(reason).split())
+    for pattern, short in _UNMET_SHORT:
+        match = pattern.fullmatch(text)
+        if match:
+            return match.expand(short)
+    return re.sub(r"\s*\([^()]*\)$", "", text) or text
+
+
+# The approval prompt is read by people who are not package experts. Each
+# reason under a package is one fixed plain phrase, keyed here from the three
+# places a reason comes from: the hook's risk signals, the unmet criteria of a
+# package outside the established tier, and the vetter's red-flag codes. The
+# numbers in a phrase come from the report. A string or code with no key is
+# shown as the hook or the vetter wrote it, so nothing is dropped, and two
+# sources with the same key make one line.
+_SIGNAL_KEYS = (
+    (re.compile(r"version published \d+ day\(s\) ago(, no provenance attestation)?"), "fresh"),
+    (re.compile(r"package declares npm lifecycle/install scripts"), "install"),
+    (re.compile(r"deprecated on the registry\b.*"), "deprecated"),
+    (re.compile(r"package first published \d+ day\(s\) ago"), "young"),
+    (re.compile(r"only \d+ release\(s\) on the registry"), "young"),
+    (re.compile(r"last publish \d+ year\(s\) ago"), "stale"),
+    (re.compile(r"\d+ known OSV vulnerability record\(s\) for this exact version"), "vulns"),
+    (re.compile(r"cool-down unavailable \(.*"), "partial"),
+    (re.compile(r"registry history too large to read\b.*"), "history"),
+    (re.compile(r"name is one edit from '[^']*', which has .*\(possible lookalike\)"), "lookalike"),
+    (re.compile(r"sdist only: setup\.py may execute on install"), "sdist"),
+    (re.compile(r"no wheel for this platform\b.*"), "sdist"),
+    (re.compile(r"the sdist's build backend .*unreviewed"), "build"),
+)
+_UNMET_KEYS = (
+    (re.compile(r"version age \d+ day\(s\), under \d+"), "fresh"),
+    (re.compile(r"declares install scripts"), "install"),
+    (re.compile(r"deprecated on the registry"), "deprecated"),
+    (re.compile(r"repository manifest (could not be read|not checked)\b.*"), "repo"),
+    (re.compile(r"weekly downloads \d+ under \d+"), "few"),
+    (re.compile(r"not in the top-[\d,]+ list\b.*"), "few"),
+    (re.compile(r"package age \d+ day\(s\), under \d+"), "young"),
+    (re.compile(r"\d+ release\(s\), under \d+"), "young"),
+    (re.compile(r"\d+ OSV record\(s\) for this version"), "vulns"),
+    (re.compile(r"(no weekly download count from|weekly downloads unavailable|near-name check "
+                r"unavailable|reputation evidence was malformed)\b.*"), "partial"),
+    (re.compile(r"registry history too large to read\b.*"), "history"),
+    (re.compile(r"one edit from '[^']*', which has .*"), "lookalike"),
+    (re.compile(r"no wheel for this version\b.*"), "sdist"),
+    # Unknown because the history could not be read: the history line says so.
+    (re.compile(r"(package age|version age) unknown day\(s\).*|unknown release\(s\).*"), "unknown"),
+)
+_CODE_KEYS = {
+    "FRESH_PUBLISH": "fresh", "INSTALL_SCRIPT": "install", "DEPRECATED": "deprecated",
+    "NO_REPOSITORY": "repo", "REPO_REDIRECTED": "repo", "LOW_ADOPTION": "adoption",
+    "STALE": "stale", "ADVISORY": "vulns", "ADVISORY_UNFIXED": "vulns",
+    "PROVIDER_UNREACHABLE": "partial", "REPORT_NOT_FOUND": "partial",
+    "PURPOSE_UNCONFIRMED": "purpose", "TYPO_SQUAT": "lookalike", "SDIST_ONLY": "sdist",
+    "RELEASE_DIFF": "diff",
+}
+_FIXED_PHRASES = {
+    "install": "runs code while installing (install script)",
+    "deprecated": "marked deprecated by its maintainers",
+    "repo": "its source repository could not be confirmed",
+    "partial": "some checks could not be completed",
+    "history": "release history too large to read: age unknown",
+    "purpose": "may not do what the task needs",
+    "sdist": "installing builds it from source, which runs the package's own code",
+    "build": "its build tool is downloaded and run while installing, unreviewed",
+    "diff": "this release changed in ways worth checking against the previous one",
+}
+
+
+def _key_of(table, text: str):
+    return next((key for pattern, key in table if pattern.fullmatch(text)), None)
+
+
+def _ago(days: int) -> str:
+    if days >= 730:
+        return f"{days // 365} years ago"
     if days >= 365:
-        return f"{days // 365}y"
-    return f"{days}d"
+        return "over a year ago"
+    if days >= 60:
+        return f"{days // 30} months ago"
+    return "today" if days == 0 else "1 day ago" if days == 1 else f"{days} days ago"
 
 
-def _render_install_time_code(identity: dict, evidence: dict) -> str:
-    """npm lists lifecycle scripts; PyPI says whether a wheel exists."""
-    if identity.get("ecosystem") == "pypi":
-        distribution = evidence.get("distribution")
-        if distribution == "wheel":
-            return "  install-time code: wheel (none)"
-        if distribution == "sdist-only":
-            return "  install-time code: sdist only (setup.py may run)"
-        if distribution == "sdist-build":
-            return "  install-time code: no wheel for this platform (setup.py may run)"
-        return "  install-time code: not determined"
-    return f"  install scripts: {', '.join(evidence.get('install_scripts') or []) or 'none'}"
+def _plural(count: int, word: str) -> str:
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
 
 
-def _render_verdict(verdict: dict) -> list:
-    """Only the sanitised fields transcript.vetter_verdicts kept:
-    the verdict token, an integer, a status token, red-flag codes and a package
-    reference. Free text from the vetter never reaches the prompt."""
-    lines = [
-        f"  vetter: {verdict['verdict']}  confidence {verdict['confidence']}  "
-        f"evidence: {verdict['evidence_status']}"
-    ]
-    for flag in verdict.get("red_flags") or []:
-        lines.append(f"  red flag: {flag}")
-    if verdict.get("alternative"):
-        lines.append(f"  alternative: {verdict['alternative']}")
-    return lines
+def _first_number(texts, pattern: str):
+    for text in texts:
+        match = re.fullmatch(pattern, text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+class _Phrases:
+    """The plain phrase for each key, read from one package's report."""
+
+    def __init__(self, report: dict, signals: list, unmet: list):
+        self.evidence = report.get("evidence") or {}
+        optional = report.get("optional_checks") or {}
+        reputation = optional.get("reputation")
+        self.reputation = reputation if isinstance(reputation, dict) else {}
+        self.signals, self.unmet = signals, unmet
+        provenance = optional.get("provenance")
+        # Only the hook's own evidence says "not signed": npm reports whether
+        # a version is attested; PyPI's attestations are never fetched, so
+        # there it is unknown, and a vetter code alone cannot tell absent
+        # from not fetched.
+        self.unsigned = (isinstance(provenance, dict) and provenance.get("attested") is False) or any(
+            s.endswith(", no provenance attestation") for s in signals)
+        mandatory = report.get("mandatory_checks") or {}
+        ids = [i for i in ((mandatory.get("osv") or {}).get("ids") or []) if not str(i).startswith("MAL-")]
+        known = self.evidence.get("known_vulnerabilities")
+        self.vulns = len(ids) or (len(known) if isinstance(known, list) else 0) or _first_number(
+            signals, r"(\d+) known OSV vulnerability record\(s\) for this exact version")
+
+    def fresh(self):
+        age = self.evidence.get("version_age_days")
+        if not _is_count(age):
+            age = _first_number(self.signals, r"version published (\d+) day\(s\) ago.*") or \
+                _first_number(self.unmet, r"version age (\d+) day\(s\), under \d+")
+        text = (f"published {_ago(age)}" if _is_count(age)
+                else f"published less than {vetting.FRESH_VERSION_DAYS} days ago")
+        return text + (" and not signed" if self.unsigned else "")
+
+    def young(self):
+        releases, age = self.evidence.get("release_count"), self.evidence.get("package_age_days")
+        parts = []
+        if _is_count(releases):
+            parts.append(_plural(releases, "release"))
+        if _is_count(age):
+            parts.append(f"first published {_ago(age)}")
+        if not parts:
+            return None
+        # Few releases over more than a year is not a new package.
+        old = _is_count(age) and age >= vetting.ESTABLISHED_MIN_AGE_DAYS
+        return ("only " if old else "new package: ") + ", ".join(parts)
+
+    def few(self):
+        downloads = self.reputation.get("weekly_downloads")
+        if not _is_count(downloads):
+            downloads = _first_number(self.unmet, r"weekly downloads (\d+) under \d+")
+        if _is_count(downloads):
+            return f"few users ({downloads:,} downloads a week)"
+        for reason in self.unmet:
+            match = re.fullmatch(r"not in the top-([\d,]+) list\b.*", reason)
+            if match:
+                return f"few users (not in PyPI's top {match.group(1)} by downloads)"
+        return "few users"
+
+    def adoption(self):
+        """LOW_ADOPTION is the vetter's code for few downloads or for a young
+        package; the report's own count says which one it can be."""
+        downloads = self.reputation.get("weekly_downloads")
+        if _is_count(downloads) and downloads >= vetting.ESTABLISHED_MIN_WEEKLY_DOWNLOADS:
+            return self.young()
+        return self.few()
+
+    def stale(self):
+        years = _first_number(self.signals, r"last publish (\d+) year\(s\) ago")
+        if years is None:
+            return f"not updated in over {vetting.STALE_PUBLISH_DAYS // 365} years"
+        return f"not updated in {_plural(years, 'year')}"
+
+    def vulns_phrase(self):
+        if self.vulns:
+            return f"{_plural(self.vulns, 'known vulnerability report')} for this version"
+        return "known vulnerability reports for this version"
+
+    def lookalike(self):
+        name = self.reputation.get("lookalike_of")
+        if not isinstance(name, str) or not name:
+            for text in self.signals + self.unmet:
+                match = re.search(r"one edit from '([^']+)'", text)
+                if match:
+                    name = match.group(1)
+                    break
+        if isinstance(name, str) and re.fullmatch(r"[@A-Za-z0-9._/-]{1,214}", name or ""):
+            return f"name is one letter away from '{name}', a far more popular package (possible typosquat)"
+        return "name looks like a far more popular package (possible typosquat)"
+
+    def phrase(self, key):
+        if key in _FIXED_PHRASES:
+            return _FIXED_PHRASES[key]
+        return {"fresh": self.fresh, "young": self.young, "few": self.few,
+                "adoption": self.adoption, "stale": self.stale,
+                "vulns": self.vulns_phrase, "lookalike": self.lookalike}[key]()
+
+
+def _plain_reasons(report: dict, verdict: dict | None = None, skip_fresh: bool = False) -> list:
+    """One plain phrase per reason this package needs the human's eye, in
+    order: risk signals, unmet criteria, the vetter's red flags and evidence
+    status, an assumed-interpreter wheel, a license that is not permissive.
+
+    A package with none of these gets no lines, and the summary line speaks
+    for it. `skip_fresh` drops the fresh-release phrase when the package line
+    already says it in its continuity suffix."""
+    evidence = report.get("evidence") or {}
+    reputation = (report.get("optional_checks") or {}).get("reputation")
+    signals = [" ".join(str(s).split()) for s in report.get("risk_signals") or [] if str(s).strip()]
+    established = vetting.is_established(report)
+    unmet = [] if established else [
+        " ".join(str(u).split()) for u in (reputation or {}).get("unmet") or [] if u] \
+        if isinstance(reputation, dict) else []
+    phrases = _Phrases(report, signals, unmet)
+    entries = [("signal", _key_of(_SIGNAL_KEYS, s), s) for s in signals]
+    entries += [("unmet", _key_of(_UNMET_KEYS, u), u) for u in unmet]
+    if not established and not unmet:
+        entries.append(("unmet", None, "no reason recorded" if isinstance(reputation, dict)
+                        else "reputation not checked"))
+    if verdict:
+        entries += [("code", _CODE_KEYS.get(code), code) for code in verdict.get("red_flags") or []]
+        if verdict.get("evidence_status") in ("partial", "unavailable"):
+            entries.append(("code", "partial", verdict["evidence_status"]))
+    pypi = (report.get("resolved_identity") or {}).get("ecosystem") == "pypi"
+    assumed = vetting.assumed_wheel(evidence) if pypi else None
+    if assumed:
+        entries.append(("signal", None, assumed))
+    license_class = evidence.get("license_class")
+    if isinstance(license_class, str) and license_class and license_class != "permissive":
+        entries.append(("signal", None, f"license: {evidence.get('license') or 'none declared'} "
+                                        f"({license_class} — check it fits your project)"))
+    history = any(key == "history" for _source, key, _text in entries)
+    out = []
+    for source, key, text in entries:
+        if (key == "fresh" and skip_fresh) or (key == "unknown" and history):
+            continue
+        phrase = phrases.phrase(key) if key not in (None, "unknown") else None
+        if phrase is None:
+            phrase = _short_unmet(text) if source == "unmet" else text
+            # An unmet criterion a signal above already states in full.
+            if source == "unmet" and any(phrase in line for line in out):
+                continue
+        if phrase not in out:
+            out.append(phrase)
+    return out
+
+
+def _continuity_suffix(report: dict) -> str:
+    """A fresh release of an established package, on its own package line.
+
+    The facts the hook compared against the newest release at least a week
+    old, in plain words: when this version was published, whether it is
+    signed, and whether the same publisher released both."""
+    continuity = (report.get("optional_checks") or {}).get("release_continuity")
+    if not isinstance(continuity, dict) or not vetting.is_established(report):
+        return ""
+    parts = []
+    age = (report.get("evidence") or {}).get("version_age_days")
+    if _is_count(age):
+        parts.append(f"published {_ago(age)}")
+    attested, same = continuity.get("attested"), continuity.get("same_publisher")
+    baseline = continuity.get("baseline")
+    baseline = baseline if isinstance(baseline, str) and baseline else None
+    publisher = None
+    if baseline and same is True:
+        publisher = f"the same publisher as {baseline}"
+    elif baseline and same is False:
+        publisher = f"a different publisher than {baseline}"
+    if attested is True:
+        parts.append(f"signed by {publisher}" if publisher else "signed")
+    else:
+        if attested is False:
+            parts.append("not signed")
+        if publisher:
+            parts.append(f"from {publisher}")
+    for key, label in (("new_install_scripts", "new install script"),
+                       ("new_dependencies", "new dependency")):
+        added = continuity.get(key)
+        if isinstance(added, list) and added:
+            parts.append(f"{label}: {', '.join(str(a) for a in added)}")
+    return f"  ({', '.join(parts)})" if parts else ""
 
 
 def _refresh_reports(reports, deadline=None) -> dict:
@@ -1215,7 +2054,15 @@ def _refresh_reports(reports, deadline=None) -> dict:
         identity = report["resolved_identity"]
         request = pg_manifest.as_request(
             identity["name"], identity["version"], "(approve-time refresh)", identity["ecosystem"])
-        return vetting.gather(request)
+        if identity["ecosystem"] != "pypi":
+            return vetting.gather(request)
+        # The interpreter the review judged the wheels against, and where it
+        # came from, so the prompt does not re-derive it from another
+        # directory and still says when it was assumed.
+        source = vetting.reviewed_python_source(report)
+        if source:
+            return vetting.gather(request, python=vetting.reviewed_python(report), python_source=source)
+        return vetting.gather(request, python=vetting.reviewed_python(report))
 
     pool = futures.ThreadPoolExecutor(max_workers=min(_REVIEW_WORKERS, len(reports)))
     submitted = {report["review_id"]: pool.submit(refresh, report) for report in reports}
@@ -1234,123 +2081,172 @@ def _refreshed_view(report: dict, found: dict) -> dict:
         provenance=found["provenance"],
         reputation=found.get("reputation"),
     )
+    if "release_continuity" in found:
+        view["optional_checks"]["release_continuity"] = found["release_continuity"]
     view["risk_signals"] = found["risk_signals"]
     view["refreshed_at"] = store.utcnow()
     return view
 
 
+def _shows_fresh_suffix(report: dict) -> bool:
+    """The package line's continuity suffix already says when it was published."""
+    return bool(_continuity_suffix(report)) and _is_count(
+        (report.get("evidence") or {}).get("version_age_days"))
+
+
+def _package_details(report: dict, verdict: dict | None = None) -> list:
+    """The reason lines under one package, wrapped: only what needs the
+    human's eye (`_plain_reasons`). A package with none gets no lines, and the
+    summary line speaks for it."""
+    lines = []
+    for reason in _plain_reasons(report, verdict, skip_fresh=_shows_fresh_suffix(report)):
+        lines += _wrap(reason, _DETAIL, _DETAIL_MORE)
+    return lines
+
+
 def _render_package_block(report: dict, verdict: dict | None = None) -> list:
-    identity = report["resolved_identity"]
-    osv = report["mandatory_checks"].get("osv", {})
-    evidence = report.get("evidence", {})
-    provenance = (report.get("optional_checks") or {}).get("provenance")
-    if isinstance(provenance, dict):
-        attested = "attested" if provenance.get("attested") else "none"
-    else:
-        attested = "not checked"
-    maintainers = evidence.get("maintainers") or []
-    publisher = evidence.get("publisher")
-    who = f"publisher: {publisher or 'unknown'}"
-    if maintainers:
-        who += f" (maintainers: {', '.join(str(m) for m in maintainers[:5])}"
-        who += ", ..." if len(maintainers) > 5 else ")"
-    lines = [
-        f"{_label(identity)}",
-        f"  registry: {identity['registry']}",
-        f"  review: {report['review_id']}",
-        "  checks: exists on official registry; "
-        f"OSV malware records: {len(osv.get('malware_ids') or [])}; "
-        f"known vulnerabilities: {len(evidence.get('known_vulnerabilities') or [])}",
-        f"  repository: {evidence.get('repository_url') or 'none listed'}",
-        _render_install_time_code(identity, evidence),
-        f"  provenance: {attested}; {who}",
-        f"  age: package {_age(evidence.get('package_age_days'))}, "
-        f"version {_age(evidence.get('version_age_days'))}; "
-        f"releases: {evidence.get('release_count') if evidence.get('release_count') is not None else 'unknown'}; "
-        f"deps: {evidence.get('dependency_count') if evidence.get('dependency_count') is not None else 'unknown'}; "
-        f"license: {evidence.get('license') or 'none declared'}",
-    ]
-    for signal in report.get("risk_signals") or []:
-        lines.append(f"  risk signal: {signal}")
-    lines += _render_reputation(report)
-    if report.get("refreshed_at"):
-        lines.append(f"  evidence refreshed: {report['refreshed_at']} (reviewed {report.get('created_at')})")
-    if verdict:
-        lines += _render_verdict(verdict)
+    """`ecosystem:name@version` alone on its line -- the column a human scans
+    for a lookalike -- then the package's reason lines, if any, and, for a
+    package that needs the human's decision, Claude's suggestion."""
+    line = f"{_label(report['resolved_identity'])}{_continuity_suffix(report)}"
+    lines = _wrap(line, "  ", _DETAIL_MORE) + _package_details(report, verdict)
+    if verdict and _approval_kind(report, verdict) != "recommended":
+        lines += _render_verdict(verdict, report)
     return lines
 
 
-def _render_reputation(report: dict) -> list:
-    """The deterministic tier and the facts behind it, for the prompt.
+def _is_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
-    Only numbers, booleans and fixed phrases from the hook's own block reach
-    the prompt; `unmet` entries are the hook's own strings, never researched
-    content."""
+
+def _summary_facts(report: dict, verdicts: dict) -> dict:
+    """Each fixed phrase, true only when this package's own fields show it.
+
+    A missing field is a fact not shown, never a fact assumed: an old report,
+    a catalog identity that skipped the download count, or a manifest that
+    could not be read all leave the phrase out of the summary."""
+    identity = report.get("resolved_identity") or {}
+    ecosystem = identity.get("ecosystem")
+    mandatory = report.get("mandatory_checks") or {}
+    registry = mandatory.get("registry") or {}
+    osv = mandatory.get("osv") or {}
+    evidence = report.get("evidence") or {}
     reputation = (report.get("optional_checks") or {}).get("reputation")
-    if not isinstance(reputation, dict):
-        return ["  reputation: not checked"]
-    trust = reputation.get("trust") or {}
-    if trust.get("status") == "trusted":
-        lines = [
-            f"  user trust: TRUSTED IDENTITY (catalog {trust.get('catalog_version')})",
-            f"  canonical repository: {trust.get('repository')}",
-            "  project approval: HUMAN PERMISSION REQUIRED for this exact version",
-            "  reputation: " + ("ESTABLISHED (catalog identity and release checks; no vetter run)"
-                                 if reputation.get("tier") == "established" else "unresolved (release needs review)"),
-        ]
-        lines.extend(f"    unmet: {reason}" for reason in reputation.get("unmet") or [])
-        return lines
-    # A catalog fault withdrew the shortcut and decided nothing
-    # else; the tier below stands on the package's own evidence.
-    prefix = ([f"  user trust: catalog not consulted ({trust.get('reason')})"]
-              if trust.get("status") in ("expired", "unavailable") else [])
-    downloads = reputation.get("weekly_downloads")
-    manifest = reputation.get("manifest") or {}
-    names = manifest.get("names_package")
-    manifest_text = {True: "names this package", False: "does NOT name this package"}.get(
-        names, "not checked")
-    near = reputation.get("near_names") or []
-    if reputation.get("tier") == "established":
-        near_text = (f"none of {len(near)} near name(s) has {vetting.LOOKALIKE_DOWNLOAD_RATIO}x its downloads"
-                     if near else "no near name on the registry")
-        return prefix + [
-            "  reputation: ESTABLISHED (deterministic; no vetter run) -- "
-            f"weekly downloads {downloads:,}; repository manifest {manifest_text}; {near_text}"
-        ]
-    lines = prefix + [
-        f"  reputation: unresolved -- weekly downloads "
-        f"{f'{downloads:,}' if isinstance(downloads, int) else 'unknown'}; "
-        f"repository manifest {manifest_text}"
-    ]
-    for reason in reputation.get("unmet") or []:
-        lines.append(f"    unmet: {reason}")
-    return lines
+    reputation = reputation if isinstance(reputation, dict) else {}
+    manifest = reputation.get("manifest") if isinstance(reputation.get("manifest"), dict) else {}
+    scripts = evidence.get("install_scripts")
+    age, downloads = evidence.get("package_age_days"), reputation.get("weekly_downloads")
+    return {
+        "registry": (registry.get("exists") is True and ecosystem in _OFFICIAL_REGISTRIES
+                     and identity.get("registry") == _OFFICIAL_REGISTRIES[ecosystem]),
+        "osv": osv.get("ok") is True and osv.get("ids") == [],
+        # A wheel judged against an assumed interpreter is not "nothing runs
+        # while installing": it holds only if the installer runs that one.
+        "wheel": (ecosystem == "pypi" and evidence.get("distribution") == "wheel"
+                  and vetting.assumed_wheel(evidence) is None),
+        "scripts": ecosystem == "npm" and scripts == [],
+        "age": _is_count(age) and age >= 365,
+        "downloads": _is_count(downloads) and downloads >= 10_000,
+        "manifest": manifest.get("names_package") is True,
+    }
+
+
+_REGISTRY_NAMES = {"npm": "npm", "pypi": "PyPI"}
+
+
+def _render_summary(clean: list, count: int, verdicts: dict) -> list:
+    """The "Why" line for every package shown with nothing under it, computed
+    for this batch: a phrase appears only when it held for each of them."""
+    if not clean:
+        return []
+    facts = [_summary_facts(report, verdicts) for report in clean]
+
+    def held(key):
+        return all(f[key] for f in facts)
+
+    ecosystems = {(r.get("resolved_identity") or {}).get("ecosystem") for r in clean}
+    phrases = []
+    if held("registry"):
+        phrases.append(f"from the official {_REGISTRY_NAMES[next(iter(ecosystems))]} registry"
+                       if len(ecosystems) == 1 else "from the official registries")
+    if held("age"):
+        phrases.append("first published over a year ago")
+    if held("downloads"):
+        phrases.append("widely used (10,000+ downloads a week)")
+    if held("osv"):
+        phrases.append("no known vulnerabilities or malware reports for "
+                       f"{'this version' if len(clean) == 1 else 'these versions'} (checked today)")
+    if all(f["wheel"] or f["scripts"] for f in facts):
+        phrases.append("nothing runs while installing")
+    if held("manifest"):
+        phrases.append("published from its own source repository")
+    if len(clean) == count:
+        lead = "Why: "
+    else:
+        lead = ("Why, for the one without notes: " if len(clean) == 1
+                else f"Why, for the {len(clean)} without notes: ")
+    line = lead + (", ".join(phrases) + "." if phrases else "Package Guard's own checks passed.")
+    return _wrap(line, "", "")
+
+
+def _noun(count: int) -> str:
+    return f"{count} package{'' if count == 1 else 's'}"
+
+
+def _render_header(kinds: list) -> str:
+    """One header per kind of prompt. The hook never mixes kinds on one
+    approve (`_flagged_in_batch`, `_mixed_in_batch`); a mixed list, rendered
+    directly, still says what each package is."""
+    count = len(kinds)
+    if set(kinds) == {"recommended"}:
+        return (f"Package Guard — approve {count} recommended package{'' if count == 1 else 's'} "
+                "for this project")
+    if set(kinds) == {"decision"}:
+        return f"Package Guard — {_noun(count)} need{'s' if count == 1 else ''} your decision"
+    if set(kinds) == {"flagged"}:
+        return f"Package Guard — {_noun(count)} NOT recommended"
+    parts = []
+    for kind, words in (("flagged", "NOT recommended"), ("decision", None),
+                        ("recommended", "recommended")):
+        n = kinds.count(kind)
+        if n:
+            parts.append(f"{n} {words or ('needs your decision' if n == 1 else 'need your decision')}")
+    return f"Package Guard — approve {_noun(count)}: {', '.join(parts)}"
 
 
 def _render_approval(reports, verdicts: dict | None = None) -> str:
+    """The permission prompt, in plain words for a reader who is not a
+    package expert: a header that says which kind of prompt it is, one line
+    per package with reason lines only where something needs the human's eye
+    and Claude's suggestion under a package that needs a decision, one "Why"
+    line for the recommended packages with nothing under them, and the
+    question. Flagged and decision packages come first. No review ids and no
+    paths: the human cannot act on them in a modal prompt, and `cli.py show`
+    carries every dropped fact."""
     verdicts = verdicts or {}
+    kinds = {r["review_id"]: _approval_kind(r, verdicts.get(r["review_id"])) for r in reports}
+    details = {r["review_id"]: _package_details(r, verdicts.get(r["review_id"])) for r in reports}
+    # A reason too long for the prompt is cut at its end, so the end is where
+    # the packages with nothing to weigh go.
+    reports = sorted(reports, key=lambda r: (_KIND_RANK[kinds[r["review_id"]]],
+                                             0 if details[r["review_id"]] else 1))
+    order = [kinds[r["review_id"]] for r in reports]
     count = len(reports)
-    header = f"Package Guard approval — {count} package{'s' if count != 1 else ''}"
-    said = [verdicts[r["review_id"]]["verdict"] for r in reports if r["review_id"] in verdicts]
-    notes = []
-    if said.count("DO_NOT_RECOMMEND"):
-        notes.append(f"{said.count('DO_NOT_RECOMMEND')} not recommended by the vetter")
-    if said.count("NEEDS_HUMAN_REVIEW"):
-        notes.append(f"{said.count('NEEDS_HUMAN_REVIEW')} left to your judgement by the vetter")
-    if notes:
-        header += f" ({'; '.join(notes)})"
-    lines = [header, ""]
+    lines = _wrap(_render_header(order), "", "  ")
+    clean = []
     for report in reports:
         lines += _render_package_block(report, verdicts.get(report["review_id"]))
+        if kinds[report["review_id"]] == "recommended" and not details[report["review_id"]]:
+            clean.append(report)
+    if "recommended" in order:
         lines.append("")
+        lines += _render_summary(clean, count, verdicts)
+    anyway = "" if set(order) == {"recommended"} else " anyway"
     if count == 1:
-        lines.append("Approve this exact version for this project?")
+        lines.append(f"Approve this exact version{anyway}? Rejecting installs nothing and declines nothing.")
     else:
-        lines += [
-            "Approve ALL of these exact versions for this project?",
-            "To skip one: reject this prompt and tell Claude which to leave out; it re-approves "
-            "the rest. A permanent decline is only for a package you never want here.",
-        ]
+        lines.append(f"Approve these exact versions{anyway}? To skip one or see details, reject and "
+                     "tell Claude.")
     return "\n".join(lines)
 
 
@@ -1404,6 +2300,78 @@ def _load_for_cli(root, review_ids):
     return reports, problems
 
 
+def _oversized_approve(root, review_ids) -> dict | None:
+    """A denial for an approve naming more ids than one prompt may carry."""
+    if len(review_ids) <= _APPROVE_BATCH_MAX:
+        return None
+    return _decision(
+        "deny",
+        f"PACKAGE_GUARD_UNSUPPORTED: one approve takes at most {_APPROVE_BATCH_MAX} review ids "
+        f"and this one names {len(review_ids)}, so its prompt could be cut before the user saw "
+        "every package. Nothing was approved. Split it: run these one after another, each as a "
+        "simple standalone command (no `cd`, no `&&`):\n"
+        + _command_lines(_approve_commands(root, review_ids)),
+    )
+
+
+def _flagged_in_batch(root, reports, verdicts) -> dict | None:
+    """A denial when a DO_NOT_RECOMMEND, TYPO_SQUAT or lookalike id shares an
+    approve with any other id. The prompt is one accept for every package on
+    it, so a flagged package in a batch is approved by the keypress meant for
+    the clean ones."""
+    if len(reports) < 2:
+        return None
+    flagged = {r["review_id"]: _alone_flags(r, verdicts.get(r["review_id"])) for r in reports}
+    flagged = {rid: flags for rid, flags in flagged.items() if flags}
+    if not flagged:
+        return None
+    labels = " | ".join(
+        f"{_label(r['resolved_identity'])} ({', '.join(flagged[r['review_id']])}; "
+        f"review {r['review_id']})" for r in reports if r["review_id"] in flagged)
+    rest = [r for r in reports if r["review_id"] not in flagged]
+    lines = [f"PACKAGE_GUARD_UNSUPPORTED: approve flagged packages alone: {labels}. "
+             "Nothing was approved."]
+    if rest:
+        lines += ["Approve the other ids without the flagged ones, exactly as written, one "
+                  "command after another (recommended ids first, then the ones that need the "
+                  "user's decision):",
+                  _command_lines(_approve_in_order(root, rest, verdicts))]
+    lines.append(
+        "Tell the user about each flagged package in one short message and offer the "
+        "alternative the vetter named. Run a separate approve for one flagged id, alone, only "
+        "if the user explicitly asks to approve it anyway: "
+        f"{store.cli_command(root, 'approve', '<review-id>')}")
+    return _decision("deny", "\n".join(lines))
+
+
+def _mixed_in_batch(root, reports, verdicts) -> dict | None:
+    """A denial when one approve names recommended ids and ids that need the
+    user's decision. Each kind has a prompt of its own: the recommended ones
+    first, then the decision ones, each package with its reasons and Claude's
+    suggestion, so the keypress meant for the recommended packages never
+    approves a package the vetter left to the user."""
+    groups = _ids_by_kind(reports, verdicts)
+    if not groups["recommended"] or not groups["decision"]:
+        return None
+    by_id = {r["review_id"]: r for r in reports}
+
+    def labels(ids):
+        return ", ".join(dict.fromkeys(_label(by_id[rid]["resolved_identity"]) for rid in ids))
+
+    lines = [
+        "PACKAGE_GUARD_CLI_REFUSED: cannot approve — this approve mixes recommended packages "
+        f"({labels(groups['recommended'])}) with packages that need the user's decision "
+        f"({labels(groups['decision'])}). Nothing was approved. Run the recommended ids first, "
+        "exactly as written and as a simple standalone command (no `cd`, no `&&`):",
+        _command_lines(_approve_commands(root, groups["recommended"])),
+        "Then give the user ONE short chat line per package that needs a decision, with your "
+        "suggestion (approve it, or use the alternative the vetter named), and run the decision "
+        "ids as a separate command, without waiting for a reply: its prompt is the question.",
+        _command_lines(_approve_commands(root, groups["decision"])),
+    ]
+    return _decision("deny", "\n".join(lines))
+
+
 def _handle_cli(call, root, transcript_path=None) -> dict:
     subcommand, review_ids = call
     if subcommand == "show":
@@ -1414,7 +2382,7 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
         # agent blacklist canonical packages on its own), and revoke withdraws
         # an approval a human gave.
         if not review_ids:
-            return _decision("deny", f"Package Guard: '{subcommand}' requires at least one review id.")
+            return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: '{subcommand}' requires at least one review id.")
         reports, problems = _load_for_cli(root, review_ids)
         for report in reports:
             label = f"{report['review_id']} ({_label(report['resolved_identity'])})"
@@ -1428,7 +2396,7 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
         if problems:
             return _decision(
                 "deny",
-                f"Package Guard: cannot {subcommand} — " + " | ".join(problems)
+                f"PACKAGE_GUARD_CLI_REFUSED: cannot {subcommand} — " + " | ".join(problems)
                 + ". Remove the offending id(s) and re-run with the rest.",
             )
         render = {"decline": _render_decline, "undecline": _render_undecline,
@@ -1450,9 +2418,12 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
         # needs approval, so `_GUARD_CLI_HINT` does not name it.
         return _decision("allow", "Package Guard: re-checking the approved set against OSV.")
     if subcommand != "approve":
-        return _decision("deny", f"Package Guard CLI: unknown subcommand {subcommand!r}.")
+        return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: unknown subcommand {subcommand!r}.")
     if not review_ids:
-        return _decision("deny", "Package Guard: 'approve' requires at least one review id.")
+        return _decision("deny", "PACKAGE_GUARD_CLI_REFUSED: 'approve' requires at least one review id.")
+    oversized = _oversized_approve(root, review_ids)
+    if oversized:
+        return oversized
     loaded, problems = _load_for_cli(root, review_ids)
     reports = []
     for report in loaded:
@@ -1469,14 +2440,16 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
     if problems:
         return _decision(
             "deny",
-            "Package Guard: cannot approve — nothing was vetted. "
+            "PACKAGE_GUARD_CLI_REFUSED: cannot approve — nothing was vetted. "
             + " | ".join(problems)
             + ". Remove the offending id(s) and re-run approve with the rest.",
         )
     # The vetter's report exists only in the conversation, so the transcript is
     # the one copy this hook can read. No block for an id means the human would
     # be shown a prompt with no research behind it. The verdict itself is not
-    # enforced: a DO_NOT_RECOMMEND still reaches the prompt, marked.
+    # enforced: a DO_NOT_RECOMMEND still reaches the prompt, marked -- but only
+    # on a prompt of its own (`_flagged_in_batch`), and a NEEDS_HUMAN_REVIEW
+    # only on a prompt without recommended packages (`_mixed_in_batch`).
     # A report whose own evidence put it in the established tier needs no
     # vetter: the facts the vetter would have fetched are in the report, and
     # the prompt renders them.
@@ -1488,15 +2461,19 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
     if missing:
         return _decision(
             "deny",
-            "Package Guard: cannot approve — no package-vetter verdict in this session for "
+            "PACKAGE_GUARD_CLI_REFUSED: cannot approve — no package-vetter verdict in this session for "
             + " ".join(missing)
             + ". Wait for the vetter's notification. If its report arrived without a verdict "
-            "for ids that vetter was launched with, ask the same vetter (SendMessage to its "
-            "agent id) to resend its full report with the machine blocks; launch a new vetter "
-            "only if it cannot be reached. A review id never given to a vetter needs a new "
+            "for ids that vetter was launched with, load the SendMessage tool first (it is "
+            "deferred: ToolSearch with query `select:SendMessage`), then ask the same vetter "
+            "(SendMessage to its agent id) to resend its full report with the machine blocks; "
+            "launch a new vetter only if that fails. A review id never given to a vetter needs a new "
             "package-vetter launch with that id; do not send it to an existing vetter. "
             "Approve only after a verdict has arrived.",
         )
+    flagged = _flagged_in_batch(root, reports, verdicts) or _mixed_in_batch(root, reports, verdicts)
+    if flagged:
+        return flagged
     # Render what is true now, not what was true at review time.
     refreshed = _refresh_reports(reports)
     abandoned = [rid for rid, found in refreshed.items() if found is None]
@@ -1524,7 +2501,7 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
     if lapsed and not malware and not failures:
         return _decision(
             "deny",
-            "Package Guard: cannot approve — the established reputation did not hold at approve time for "
+            "PACKAGE_GUARD_CLI_REFUSED: cannot approve — the established reputation did not hold at approve time for "
             + " | ".join(lapsed)
             + ". Nothing was approved; launch the package-vetter with these review ids and approve "
             "after its report has arrived.",
@@ -1543,6 +2520,10 @@ def _handle_cli(call, root, transcript_path=None) -> dict:
             + ". Nothing was approved; re-run the same approve command.",
         )
     views = [_refreshed_view(report, refreshed[report["review_id"]]) for report in reports]
+    # Again on the live view: a lookalike the registry shows only now.
+    flagged = _flagged_in_batch(root, views, verdicts) or _mixed_in_batch(root, views, verdicts)
+    if flagged:
+        return flagged
     return _decision("ask", _render_approval(views, verdicts))
 
 
@@ -1612,18 +2593,20 @@ def _locked_tree(scope, directory):
     return None  # a requirements file is already flattened: every line is direct
 
 
-def _check_transitives(scopes, directory, root) -> tuple:
+def _check_transitives(targets, root) -> tuple:
     """(denial or None, notes) for the trees the command installs.
 
-    Runs only on the allow path: direct dependencies are all vetted, so what
-    lands now is the tree. Vetted and declined identities are skipped (they
-    were judged individually); a MAL record on anything else denies; other
-    advisories become notes on the allow. Cached per lockfile digest.
+    `targets` pairs each gated scope with a directory it is read from
+    (`_scope_directories`). Runs only on the allow path: direct dependencies
+    are all vetted, so what lands now is the tree. Vetted and declined
+    identities are skipped (they were judged individually); a MAL record on
+    anything else denies; other advisories become notes on the allow. Cached
+    per lockfile digest.
     """
     import hashlib
     notes = []
     calls = 0
-    for scope in scopes:
+    for scope, directory in targets:
         tree = _locked_tree(scope, directory)
         if tree is None:
             continue
@@ -1847,16 +2830,27 @@ def _render_review_required(reports, root, deferred: int = 0) -> str:
         "",
         "STOP. Do not run any other install, npx, pip, or uv package command.",
     ]
+    split = (f"At most {_APPROVE_BATCH_MAX} ids fit one approve, so run these one after another, "
+             "each exactly as written and as a simple standalone command (no `cd`, no `&&`)")
     if established:
-        blocks += [
-            f"ESTABLISHED ids [{established_ids}]: the hook's own checks hold (age, releases, weekly "
+        commands = _approve_commands(root, [r["review_id"] for r in established])
+        intro = (
+            f"ESTABLISHED ids [{established_ids}]: recommended, and approved first. The hook's own "
+            "checks hold (age, releases, weekly "
             "downloads, repository manifest, no near-name giant, no install script, no advisory, "
-            "allowed license, not fresh). No vetter is needed. State in one line per package whether "
-            "it is the mainstream choice for its purpose and name a successor if you know one, then "
-            "run ONE approve command with these ids, exactly as written and as a simple standalone "
-            f"command (no `cd`, no `&&`): {store.cli_command(root, 'approve', established_ids)}",
-        ]
+            "not fresh unless an attested release continues its publisher). No vetter is needed. "
+            "State in one line per package whether "
+            "it is the mainstream choice for its purpose and name a successor if you know one, then ")
+        blocks += ([intro + "run ONE approve command with these ids, exactly as written and as a "
+                    f"simple standalone command (no `cd`, no `&&`): {commands[0]}"]
+                   if len(commands) == 1 else
+                   [intro + f"approve them. {split}:", _command_lines(commands)])
     if unresolved:
+        # The hook's own near-name signal is known now; the vetter's verdicts
+        # are not. A lookalike id is kept out of the batch command, because
+        # approve refuses it next to any other id.
+        alone = [r["review_id"] for r in unresolved if _lookalike_of(r)]
+        batch = [r["review_id"] for r in unresolved if not _lookalike_of(r)]
         blocks += [
             ("NEXT ACTION (mandatory)" if not established else "UNRESOLVED ids, in parallel")
             + ": Agent tool -> subagent_type: package-vetter, ONCE, passing all "
@@ -1868,14 +2862,34 @@ def _render_review_required(reports, root, deferred: int = 0) -> str:
             # absolute path rather than one the reader must rebuild.
             f"Tell it each report is at {store.reports_dir(root)}/<review-id>.json -- pass that "
             "absolute path; it must not rebuild it from its own working directory.",
-            "THEN: for every RECOMMEND verdict, run ONE approve command with all of those ids, "
-            "exactly as written and as a simple standalone command (no `cd`, no `&&`): "
-            f"{store.cli_command(root, 'approve', unresolved_ids)}",
-            "The user will see a single permission prompt carrying the vetter's verdict; approve is "
-            "refused for an unresolved id until the vetter's notification has arrived. For "
-            "DO_NOT_RECOMMEND / NEEDS_HUMAN_REVIEW, do not approve; ask the user, offering the "
-            "alternative the vetter named.",
         ]
+        if batch:
+            # The verdicts are not known yet, so the order is given, not the ids.
+            blocks += [
+                "THEN approve in this order, never both kinds in one approve, each exactly as "
+                "written with the ids filled in and as a simple standalone command (no `cd`, no "
+                f"`&&`), at most {_APPROVE_BATCH_MAX} ids per approve:",
+                "  1. the RECOMMEND ids, together: "
+                + store.cli_command(root, "approve", "<RECOMMEND ids>"),
+                "  2. then the NEEDS_HUMAN_REVIEW ids, together: "
+                + store.cli_command(root, "approve", "<NEEDS_HUMAN_REVIEW ids>"),
+                "Before step 2, give the user ONE short chat line per NEEDS_HUMAN_REVIEW package "
+                "with your suggestion (approve it, or use the alternative the vetter named), then "
+                "run it without waiting for a reply: its prompt shows each reason in plain words "
+                "and your suggestion, and the prompt is the question. A DO_NOT_RECOMMEND or "
+                "TYPO_SQUAT id gets no approve command.",
+            ]
+        if alone:
+            blocks.append(
+                f"LOOKALIKE ids [{' '.join(alone)}]: the hook found each name one edit from a package "
+                "with far more downloads, so none goes in an approve command above.")
+        blocks.append(
+            "Approve is refused for an unresolved id until the vetter's notification has arrived, "
+            "and for recommended and NEEDS_HUMAN_REVIEW ids together. For DO_NOT_RECOMMEND, a "
+            "TYPO_SQUAT red flag or a LOOKALIKE id, tell the user in one short message and offer "
+            "the alternative the vetter named; run a separate approve for that id only if the user "
+            "explicitly asks to approve it anyway. Approve refuses such an id together with any "
+            "other id.")
     blocks.append("Retry the install only after approval, using the exact 'retry' versions above.")
     if deferred:
         blocks += ["", _deferred_note(deferred)]
@@ -1916,12 +2930,13 @@ def _render_hard_deny(reports) -> str:
     return "\n".join(lines)
 
 
-def _advance_watermark(event: dict, root) -> None:
+def _advance_watermark(event: dict, root, environments=None) -> None:
     """Decide on everything already installed, before this command runs.
 
     After this, whatever the command puts on disk is attributable
     to *that* command rather than to the accumulated past, which is what makes
-    the PostToolUse report readable.
+    the PostToolUse report readable. `environments` maps the command's
+    directory to the Python environments it names (`_command_environments`).
 
     Fails SOFT, and that is structural rather than a judgement call: the
     PostToolUse scan re-derives the same set from the same filesystem
@@ -1938,6 +2953,7 @@ def _advance_watermark(event: dict, root) -> None:
             session_id=event.get("session_id"),
             command=(event.get("tool_input") or {}).get("command") or None,
             session_started=transcript.session_started(event.get("transcript_path")),
+            environments=environments,
         )
     except Exception as exc:  # noqa: BLE001 - see the docstring
         print(
@@ -1948,6 +2964,64 @@ def _advance_watermark(event: dict, root) -> None:
         # No disk view. Every caller must read this as "unknown", never as
         # "nothing is installed".
         return None
+
+
+def _command_environments(parsed, event: dict, root) -> dict | None:
+    """{project directory: [environment, ...]} for the Python environments a
+    command names (a literal UV_PROJECT_ENVIRONMENT, or VIRTUAL_ENV used by
+    `uv --active` / `uv pip`), or None. Keyed by the uv project the command
+    acts on (`_python_project`), which is the scope reconciliation reads."""
+    if parsed is None or parsed.kind != "package" or not parsed.environments:
+        return None
+    return {str(_python_project(parsed, event.get("cwd") or root, root)): list(parsed.environments)}
+
+
+def _inside_guard_dir(root, path) -> bool:
+    """True when `path` resolves into the project's `.claude/`: through any
+    symlink, in any letter case, or by any other spelling of the same
+    directory.
+
+    A case-insensitive volume (APFS, NTFS) opens `.CLAUDE` as `.claude`, and
+    realpath keeps the case it was given, so the paths are compared
+    case-folded. Then by device and inode along every ancestor of the target
+    that exists, which no spelling can get past."""
+    guard = os.path.realpath(Path(root) / ".claude")
+    target = os.path.realpath(path)
+    folded_guard = os.path.normcase(guard).casefold()
+    folded = os.path.normcase(target).casefold()
+    if folded == folded_guard or folded.startswith(folded_guard + os.sep):
+        return True
+    try:
+        guard_stat = os.stat(guard)
+    except OSError:
+        return False
+    for candidate in (Path(target), *Path(target).parents):
+        try:
+            if os.path.samestat(os.stat(candidate), guard_stat):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _record_environments(parsed, directory, root) -> str | None:
+    """Remember the environments an allowed command installs into, under the
+    project directory it acts on, so every later scan of that project reads
+    them even when the next command does not name them.
+
+    Returns the store's reason when it refuses the record (a string from
+    `store.record_environments`): the command is then denied, because an
+    environment no scan will read is an install nobody reconciles. Any other
+    failure is soft: the project's own `.venv` is read regardless."""
+    if not parsed.environments:
+        return None
+    try:
+        result = store.record_environments(root, directory, list(parsed.environments))
+    except Exception as exc:  # noqa: BLE001 - a lost record costs scan coverage, not the gate
+        print(f"Package Guard: could not record the environment "
+              f"({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        return None
+    return result if isinstance(result, str) and result else None
 
 
 def _render_pin_approved(approved, heading: bool) -> str:
@@ -2038,10 +3112,21 @@ def _unreviewed_on_disk(findings, root) -> dict:
 def evaluate(event: dict, root) -> dict | None:
     if event.get("tool_name") != "Bash":
         return None
+    # The review and refresh deadlines this invocation sets are at least
+    # _REVIEW_BUDGET_SECONDS from here, so a retry that ends by this mark
+    # spends no time past the budget (see the budget arithmetic above).
+    vetting.set_retry_deadline(time.monotonic() + _REVIEW_BUDGET_SECONDS)
     tool_input = event.get("tool_input")
     command = (tool_input or {}).get("command") or ""
 
-    advanced = _advance_watermark(event, root)
+    # Parsing is pure, so it runs once, here: a Python environment the command
+    # names is then part of the scan before the command runs. A parser failure
+    # is retried below, where it fails closed as it always has.
+    try:
+        early = pg_parser.parse_command(command)
+    except Exception:  # noqa: BLE001 - see the comment
+        early = None
+    advanced = _advance_watermark(event, root, _command_environments(early, event, root))
 
     try:
         tokens = shlex.split(command)
@@ -2101,7 +3186,7 @@ def evaluate(event: dict, root) -> dict | None:
             f"{store.cli_command(root, '<approve|decline|undecline|revoke>', '<review-id> ...')}",
         )
 
-    parsed = pg_parser.parse_command(command)
+    parsed = early if early is not None else pg_parser.parse_command(command)
     if parsed.kind == "ignore":
         return None
 
@@ -2126,6 +3211,34 @@ def evaluate(event: dict, root) -> dict | None:
 
     if parsed.kind == "unsupported":
         return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {parsed.reason}")
+    inside = [e for e in parsed.environments if _inside_guard_dir(root, e)]
+    if inside:
+        # The parser refuses a `.claude` path it can read; this is the one a
+        # symlink leads into.
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_UNSUPPORTED: the environment {inside[0]!r} resolves inside this "
+            "project's .claude/, which holds Package Guard's own files. Use a directory "
+            "outside .claude/, written as a literal absolute path.")
+    cwd = event.get("cwd") or root
+    # Each manifest where its installer finds it, from the shell's directory
+    # up (`_scope_directories`); the Python project the command acts on keys
+    # its environments. A project the installer finds outside the guard root
+    # is refused before anything reads it or opens a review for it.
+    targets = [(scope, directory) for scope in parsed.manifests
+               for directory in _scope_directories(scope, cwd, root)]
+    outside = _outside_project(targets, cwd, root)
+    if outside:
+        return outside
+    project = _python_project(parsed, cwd, root)
+    # A full record refuses before any review is opened: approving packages
+    # for a command that is refused anyway would waste the human's prompt.
+    # Recording at the allow asks the store again.
+    refusal = parsed.environments and store.environments_refusal(
+        root, project, list(parsed.environments))
+    if refusal:
+        return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {refusal}")
+    environments = disk_guard.environments(project, root, parsed.environments)
 
     # A review vets registry/name@version; refuse when configuration, a
     # lock entry or a manifest spec would make the installer fetch from
@@ -2136,7 +3249,8 @@ def evaluate(event: dict, root) -> dict | None:
             "registry": pg_parser.NPM_REGISTRY if ecosystem == "npm" else pg_parser.PYPI_REGISTRY})
 
     try:
-        problems = sources.problems_for(parsed, event.get("cwd") or root, artifacts_of=artifacts_of)
+        problems = _source_problems(parsed, targets, cwd, root, artifacts_of=artifacts_of,
+                                    environments=environments)
     except store.StoreError as exc:
         return _decision("deny", f"PACKAGE_GUARD_ERROR: Package Guard state is unavailable ({exc}). "
                                  "Package operations are blocked until it is repaired.")
@@ -2167,10 +3281,17 @@ def evaluate(event: dict, root) -> dict | None:
         elif not any(r["review_id"] == report["review_id"] for r in pending):
             pending.append(report)
 
-    def review(requests):
+    def review(requests, uv_project=False):
         nonlocal allowance, deferred
         batch, surplus = requests[:allowance], requests[allowance:]
-        reports, abandoned = _create_reviews(batch, root, session_id, deadline)
+        # The project, not the shell's directory: its environments are
+        # recorded under it, and its interpreter is the one a wheel must fit.
+        # A named request says which installer runs it; a manifest dependency
+        # is a uv project's when its scope is (`uv_project`).
+        extra = {"uv_project": True} if uv_project else {}
+        reports, abandoned = _create_reviews(batch, root, session_id, deadline,
+                                             project=str(project) if event.get("cwd") else None,
+                                             environments=parsed.environments, **extra)
         allowance -= len(batch)
         deferred += len(surplus) + abandoned
         return reports
@@ -2229,11 +3350,11 @@ def evaluate(event: dict, root) -> dict | None:
                     store.discard_report(root, report["review_id"])
                     report = existing
             file(report)
-        # Any npm install also reconciles the manifest in its working
-        # directory. Those dependencies land on disk without ever being named
-        # on the command line, so they need the same gate.
-        for scope in parsed.manifests:
-            directory = event.get("cwd") or root
+        # Any npm install also reconciles the manifest of the project npm
+        # finds from the working directory. Those dependencies land on disk
+        # without ever being named on the command line, so they need the
+        # same gate.
+        for scope, directory in targets:
             if (scope.kind == "uv-project" and not scope.locked and not scope.relocks
                     and (Path(directory) / "uv.lock").is_file()):
                 return _decision("deny", _UV_UNLOCKED)
@@ -2246,7 +3367,8 @@ def evaluate(event: dict, root) -> dict | None:
                     "Package operations are blocked until it is repaired.",
                 )
             if unresolved:
-                return _decision("deny", _render_unpinned(unresolved, where, scope.kind))
+                return _decision("deny", _render_unpinned(unresolved, where, scope.kind,
+                                                          _build_pins(unresolved, deadline)))
             if scope.kind == "npm" and scope.scripts:
                 blocked = _lifecycle_check(directory, root)
                 if blocked:
@@ -2282,7 +3404,7 @@ def evaluate(event: dict, root) -> dict | None:
                     file(existing)
                     continue
                 todo.append(pg_manifest.as_request(name, version, command, ecosystem))
-            for report in review(todo):
+            for report in review(todo, uv_project=scope.kind == "uv-project"):
                 file(report)
     except store.StoreError as exc:
         return _decision(
@@ -2313,9 +3435,15 @@ def evaluate(event: dict, root) -> dict | None:
         return blocked
     # Everything named or declared is vetted; what lands now is
     # the tree under it. One batch call answers "is anything in it malware".
-    blocked, notes = _check_transitives(parsed.manifests, event.get("cwd") or root, root)
+    blocked, notes = _check_transitives(targets, root)
     if blocked:
         return blocked
+    # Recorded before the allow, under the project directory: a record the
+    # store refuses would leave an environment no scan reads.
+    refusal = _record_environments(parsed, project, root)
+    if refusal:
+        return _decision("deny", refusal if refusal.startswith("PACKAGE_GUARD_")
+                         else f"PACKAGE_GUARD_UNSUPPORTED: {refusal}")
     reason = "Package Guard: all direct external packages are exact vetted versions."
     if audit_notes:
         reason += " " + " | ".join(audit_notes) + "."
