@@ -722,7 +722,9 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
     head_word = words[0]
     head = _executable(head_word.text)
 
-    if head in verbs.CD_COMMANDS:
+    # A real `Cd` is not the shell builtin: only the exact-case name changes
+    # the directory the guard evaluates (reducing site, no folding).
+    if _executable(head_word.text, fold=False) in verbs.CD_COMMANDS:
         return _CD_MARKER
 
     if head in _PEEL_WRAPPERS:
@@ -750,6 +752,10 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
 
     _check_env(inherited + assignments, installer, head)
     result = _dispatch(installer, head, words, command)
+    if result is not None and result.kind == "package" and any(
+            r.ecosystem == "npm" and r.name.casefold() == "corepack" for r in result.requests):
+        # `npx corepack ...` / `npm exec corepack ...` fetch corepack itself.
+        raise _Unsupported(verbs.FOREIGN["corepack"], code="foreign-manager")
     if _scripts_off(assignments, inherited) and result is not None and result.manifests:
         result = dataclasses.replace(result, manifests=tuple(
             dataclasses.replace(m, scripts=False) if m.kind == "npm" else m
@@ -1071,7 +1077,8 @@ def _check_unknown_head(head_word, head, words, assignments, command="", stdin=N
     command (`X=sh; $X -c '...'`). `su` with no command runs a shell on its
     standard input."""
     dynamic = bool(re.search(r"[$`*?]", head))
-    if not dynamic and head in verbs.INERT_HEADS:
+    # Exact case only: `Echo`/`./Echo` is not the builtin and may run its words.
+    if not dynamic and _executable(head_word.text, fold=False) in verbs.INERT_HEADS:
         return
     command_options = verbs.STDIN_SHELLS.get(head)
     if command_options is not None and stdin and verbs.ACQUISITION_HINT.search(stdin) and not any(
@@ -1132,10 +1139,26 @@ def _reads_stdin(words, payload_words) -> bool:
 
 def _parse_foreign(head, words):
     """Recognise-and-deny the package managers this project forbids."""
-    verb = next((w.text for w in words[1:] if not w.text.startswith("-")), None)
-    flags = [w.text for w in words[1:] if w.text.startswith("-")]
-    if verb in verbs.FOREIGN_SAFE or (verb is None and set(flags) & verbs.FOREIGN_SAFE):
-        return None
+    # Only words[1] is the verb: a flag's value must never be read as one
+    # (`pnpm -C list add evil`). A leading flag is safe only as a bare print.
+    first = words[1].text if len(words) > 1 else None
+    if head in verbs.FOREIGN_PRINT_ONLY:
+        # corepack: only a bare --version/--help; any subcommand may download.
+        if len(words) == 2 and first in verbs.FOREIGN_PRINT_ONLY[head]:
+            return None
+        raise _Unsupported(verbs.FOREIGN[head], code="foreign-manager")
+    if head in verbs.FOREIGN_NO_SAFE:
+        first = None  # a runner's first argument is the package it executes
+    if first is not None and first in verbs.FOREIGN_SAFE:
+        if first.startswith("-"):
+            if len(words) == 2:
+                return None
+        elif first == "config":
+            # read-only forms only: `config get ...` / `config list`
+            if len(words) > 2 and words[2].text in ("get", "list"):
+                return None
+        else:
+            return None
     raise _Unsupported(verbs.FOREIGN[head], code="foreign-manager")
 
 
@@ -1375,16 +1398,35 @@ def _run_handler(name, tokens, command, head):
     return handler(tokens, command)
 
 
-def _executable(token: str) -> str:
+def _executable(token: str, fold: bool = True) -> str:
     """The command word's basename.
 
     An installer invoked by path is the same installer: `.venv/bin/pip`,
     `/opt/homebrew/bin/npm`, `..\\Scripts\\pip.exe`. Dispatching on the raw
     token would let every one of those through ungated, which matters most for
     virtualenvs, where using the env's own pip is the normal thing to do.
+
+    Folding rule. `fold=True` (casefold, .exe/.cmd/.bat/.ps1 stripped) is for
+    lookups that ADD scrutiny, where a wrong match only refuses more:
+      - _past_wrappers / _PEEL_WRAPPERS, _RECURSIVE_WRAPPERS (payload parsed)
+      - verbs.lookup installers, FOREIGN managers, python -m pip/uv
+      - _SHELLS / STRING_RUNNERS / STDIN_SHELLS / eval / xargs (payload re-read)
+      - ln/gln symlink detection, _write_targets, _inline_code
+    `fold=False` (exact case, only the historical `.exe` strip) is for lookups
+    that REDUCE scrutiny or change context, where a loose match fails open:
+      - verbs.INERT_HEADS (`Echo npm i x` must still be hint-scanned)
+      - verbs.CD_COMMANDS (`Cd /tmp` is not the builtin; the guard would
+        evaluate the wrong directory)
+    Never add a new allow/skip table lookup with fold=True.
     """
     name = re.split(r"[\\/]", token)[-1]
-    if name.lower().endswith(".exe"):
+    if fold:
+        name = name.casefold()
+        for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                break
+    elif name.lower().endswith(".exe"):
         name = name[:-4]
     # Version-suffixed interpreters are the same interpreter: pip3, pip3.12,
     # python3.13. Matching only `pip`/`pip3` would let

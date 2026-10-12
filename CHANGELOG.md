@@ -1,5 +1,28 @@
 # Release notes
 
+## v1.8.7
+
+- A refused package manager (pnpm, yarn, bun) could slip past the guard when
+  a flag with a value came before the command word, as in
+  `pnpm -C list add evil`. Only the word right after the manager counts now,
+  and any other flag in front of it is refused. A bare `--version` or
+  `--help` still works.
+- `env` for a refused manager is now refused, and so are `config set`,
+  `config delete` and `config edit`. These could point the registry somewhere
+  else or download Node. Only `config get` and `config list` are still
+  allowed.
+- `bunx`, `pnpx`, `pnx` and `yarnpkg` are now recognised and refused. They
+  download and run packages, so use `npx` instead, which the guard reviews.
+- `corepack` is now refused, apart from `corepack --version` and
+  `corepack --help`. It downloads package managers, and `corepack use` installs
+  a project's dependencies with no review. Fetching corepack itself through
+  `npx` or `npm exec` is refused too.
+- Command names are matched in any letter case, and with a Windows `.cmd`,
+  `.bat` or `.ps1` ending, wherever that makes the guard stricter. `NPM
+  install x` is now reviewed like `npm install x`.
+- Look-alikes are not given a free pass: `Echo` is not treated as the
+  harmless built-in `echo`.
+
 ## v1.8.6
 
 - The approval prompt is short: one line per package, with more lines only

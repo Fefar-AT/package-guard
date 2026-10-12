@@ -1615,13 +1615,30 @@
       "list",
       "ls",
       "outdated",
-      "env",
       "which"
     ],
+    "no_safe_verbs": [
+      "bunx",
+      "pnpx",
+      "pnx"
+    ],
+    "print_only": {
+      "corepack": [
+        "--version",
+        "-v",
+        "--help",
+        "-h"
+      ]
+    },
     "managers": {
       "pnpm": "pnpm is not permitted in this project; use npm",
       "yarn": "yarn is not permitted in this project; use npm",
+      "yarnpkg": "yarnpkg (yarn) is not permitted in this project; use npm",
+      "bunx": "bunx downloads and runs packages and is not permitted in this project; use npx",
+      "pnpx": "pnpx downloads and runs packages and is not permitted in this project; use npx",
+      "pnx": "pnx (pnpm dlx) downloads and runs packages and is not permitted in this project; use npx",
       "bun": "bun is not permitted in this project; use npm",
+      "corepack": "corepack downloads package managers (pnpm, yarn) and 'corepack use' installs the project's dependencies; it is not permitted in this project, only 'corepack --version' and 'corepack --help'; use npm",
       "pipx": "pipx is not permitted in this project; use 'uv tool install'",
       "poetry": "poetry is not permitted in this project; use 'uv add'",
       "pdm": "pdm is not permitted in this project; use 'uv add'",

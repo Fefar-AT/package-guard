@@ -30,6 +30,10 @@ STDIN_SHELLS = TABLE.get("stdin_shells") or {}
 CD_COMMANDS = set(TABLE["cd_commands"])
 FOREIGN = TABLE["foreign"]["managers"]
 FOREIGN_SAFE = set(TABLE["foreign"]["safe_verbs"])
+# Runners execute their first argument as a package: no verb is read-only.
+FOREIGN_NO_SAFE = set(TABLE["foreign"].get("no_safe_verbs") or ())
+# Heads allowed only as a bare print (`corepack --version`), nothing else.
+FOREIGN_PRINT_ONLY = {h: set(f) for h, f in (TABLE["foreign"].get("print_only") or {}).items()}
 
 ENV_REASONS = TABLE.get("env_reasons") or {}
 ENVIRONMENT = TABLE.get("environment") or {}
@@ -240,13 +244,17 @@ def _npm_spellings():
     return sorted(found, key=len, reverse=True)
 
 
+# A launcher script is the same command: `pnpm.cmd`, `npm.ps1`, `pip.exe`.
+_HEAD_SUFFIX = r"(?:\.(?:exe|cmd|bat|ps1))?"
+
+
 def _build_hint():
     alternatives = []
     for installer in INSTALLERS:
-        heads = "|".join(re.escape(h) for h in installer["heads"])
+        heads = "(?:%s)%s" % ("|".join(re.escape(h) for h in installer["heads"]), _HEAD_SUFFIX)
         # Versioned interpreters: pip3.12, python3.13.
         if "pip" in installer["heads"]:
-            heads = r"pip[0-9.]*"
+            heads = r"pip[0-9.]*" + _HEAD_SUFFIX
         if installer.get("head_only"):
             alternatives.append(r"%s\s+" % heads)
             continue
@@ -261,11 +269,12 @@ def _build_hint():
                     heads, re.escape(name), "|".join(re.escape(v) for v in subverbs)))
     alternatives.append(r"python[0-9.]*\s+-m\s+pip\s+install\b")
     for manager in FOREIGN:
-        alternatives.append(r"%s\s+" % re.escape(manager))
+        alternatives.append(r"%s%s\s+" % (re.escape(manager), _HEAD_SUFFIX))
     # `=` leads too: zsh runs `=npm` as the npm on PATH, and an alias body
     # reads `x=npm ...`.
     return re.compile(
-        r"(?:^|[\s;&|(`'\"=])(?:\S*[\\/])?(?:" + "|".join(alternatives) + r")"
+        r"(?:^|[\s;&|(`'\"=])(?:\S*[\\/])?(?:" + "|".join(alternatives) + r")",
+        re.IGNORECASE,
     )
 
 
