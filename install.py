@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.11.*"
 # ///
 """Install Package Guard into a project, or remove it.
 
@@ -8,11 +8,13 @@
     python3 install.py <project-dir> --sandbox    the same, plus the strict sandbox
     python3 install.py <project-dir> --check      report what is present, change nothing
     python3 install.py <project-dir> --uninstall  remove the guard, keep vetted.json / declined.json
+    python3 install.py <project-dir> --plugin     project state only, for the Claude Code plugin
+    python3 install.py <project-dir> --plugin --check
 
 Run from a clone of the Package Guard repository; the guard files are copied from
 the clone this script lives in. Standard library only -- a tool that
 installs a dependency gate must not acquire dependencies. Python 3.11+, the same
-floor as the guard.
+floor as the guard; install.sh runs it on 3.11, the guard's pinned interpreter.
 
 What one run does, in the order the README's manual procedure lists:
 
@@ -31,6 +33,14 @@ What one run does, in the order the README's manual procedure lists:
 It does not commit; it prints the `git add` to run. Every step is idempotent, so
 re-running is safe and is the upgrade path. Nothing outside <project-dir> is
 written.
+
+--plugin is the setup for the Claude Code plugin (`/package-guard:setup` runs it). The
+plugin carries the hooks, so this seeds only project state: vetted.json /
+declined.json when absent, reports/.gitignore, the `## Packages` CLAUDE.md
+section (worded without file-install paths) and the .gitignore lines. It copies no
+hooks and merges no hook entries. A project that already has the file-based install
+is migrated: the old hook entries, deny rules and copied code are removed so the
+hooks never run twice, and vetted.json / declined.json are kept.
 
 The install never goes through Claude: a Claude session in a guarded project
 cannot write .claude/package-guard/ (README step 4 is denied with
@@ -144,6 +154,29 @@ GITIGNORE_LINES = (
     ".claude/package-guard/.transitive-state.json",
     ".claude/package-guard/.environments.json",
 )
+
+# Plugin projects: the guard's code lives in the plugin, so the section names no
+# file-install hook path. The plugin's own hook enforces the file locks.
+PLUGIN_PACKAGES_SECTION = """\
+## Packages
+
+User trust catalogs identify established packages; they never grant project
+installation approval. Never change `~/.config/package-guard/` or the bundled
+`trusted-packages.json` to make an installation pass. Human permission is
+required for every new project package/version approval.
+
+Every Bash command passes the Package Guard plugin's PreToolUse hook, and every
+one is reconciled against disk afterwards. Before adding, syncing, or running any
+dependency-touching command, invoke the `package-guard` skill and follow it.
+
+Never: hand-edit `package.json` / `pyproject.toml` / lockfiles to add a
+dependency, use `pnpm`/`yarn`/`bun`, wrap installs in `sh -c`/`eval`, use any
+other installer or wrapper to get packages onto disk, edit the project's
+Package Guard state directory, or disable or uninstall the `package-guard`
+plugin. Package Guard is the only gate in this project; if a Bash denial does
+not start with `PACKAGE_GUARD_`, it did not come from this project — tell the
+user and stop.
+"""
 
 EMPTY_VETTED = {"schema_version": 1, "packages": []}
 EMPTY_DECLINED = {"schema_version": 1, "reviews": []}
@@ -370,12 +403,27 @@ def _remove_sandbox(settings: dict) -> bool:
     return removed
 
 
-def _append_claude_md(target: Path) -> list[str]:
+def _section_of(text: str) -> str:
+    start = text.find(CLAUDE_MD_HEADING)
+    if start < 0:
+        return ""
+    end = text.find("\n## ", start + len(CLAUDE_MD_HEADING))
+    return text[start:] if end < 0 else text[start:end]
+
+
+def _append_claude_md(target: Path, plugin: bool = False) -> list[str]:
     path = target / "CLAUDE.md"
-    section = _packages_section()
+    section = PLUGIN_PACKAGES_SECTION if plugin else _packages_section()
     if path.exists():
         text = path.read_text(encoding="utf-8")
         if CLAUDE_MD_HEADING in text:
+            if plugin and HOOK_MARK in _section_of(text):
+                # Migration: the file-install wording names paths that are gone.
+                start = text.find(CLAUDE_MD_HEADING)
+                end = text.find("\n## ", start + len(CLAUDE_MD_HEADING))
+                tail = "" if end < 0 else "\n" + text[end + 1:]
+                path.write_text(text[:start] + section + tail, encoding="utf-8")
+                return [f"updated  CLAUDE.md {CLAUDE_MD_HEADING} (plugin wording)"]
             return []
         joiner = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
         path.write_text(text + joiner + section, encoding="utf-8")
@@ -427,6 +475,57 @@ def install(target: Path, sandbox: bool = False) -> list[str]:
     changed += _append_gitignore(target)
     (target / VERSION_FILE).write_text(source_version() + "\n", encoding="utf-8")
     return changed
+
+
+def _settings_commands(settings: dict) -> list[str]:
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    return [
+        h.get("command", "")
+        for entries in hooks.values() if isinstance(entries, list)
+        for e in entries
+        for h in e.get("hooks", [])
+    ]
+
+
+def has_file_install(target: Path) -> bool:
+    """The file-based install is present: copied hook code or guard hook entries."""
+    if (target / HOOK_DIR).exists():
+        return True
+    try:
+        settings = _load_json(target / SETTINGS, "the guard")
+    except (InstallError, OSError):
+        return False
+    return any(HOOK_MARK in c for c in _settings_commands(settings))
+
+
+def install_plugin(target: Path) -> list[str]:
+    """Seed project state for the plugin; migrate a file-based install away."""
+    changed = []
+    if has_file_install(target):
+        changed += _remove_file_install(target)
+    changed += _append_claude_md(target, plugin=True)
+    changed += _seed_state(target)
+    changed += _append_gitignore(target)
+    return changed
+
+
+def check_plugin(target: Path) -> list[tuple[bool, str]]:
+    rows = [(not has_file_install(target),
+             "no file-based install left (its hooks would run twice beside the plugin)")]
+    claude_md = target / "CLAUDE.md"
+    text = claude_md.read_text(encoding="utf-8") if claude_md.exists() else ""
+    rows.append((CLAUDE_MD_HEADING in text and HOOK_MARK not in _section_of(text),
+                 f"CLAUDE.md has the plugin {CLAUDE_MD_HEADING} section"))
+    for name in ("vetted.json", "declined.json"):
+        rows.append(((target / STATE_DIR / name).is_file(), str(STATE_DIR / name)))
+    reports_ignore = STATE_DIR / "reports" / ".gitignore"
+    rows.append(((target / reports_ignore).is_file(), str(reports_ignore)))
+    gitignore = target / ".gitignore"
+    present = set(gitignore.read_text(encoding="utf-8").splitlines()) if gitignore.exists() else set()
+    rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the local state files"))
+    return rows
 
 
 def source_version() -> str:
@@ -513,7 +612,8 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
     return rows
 
 
-def uninstall(target: Path) -> list[str]:
+def _remove_file_install(target: Path) -> list[str]:
+    """Remove the copied code, hook entries, deny rules and sandbox block."""
     changed = []
     for component in COMPONENTS:
         path = target / component
@@ -550,6 +650,11 @@ def uninstall(target: Path) -> list[str]:
             changed.append("removed  sandbox settings")
         if changed:
             settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return changed
+
+
+def uninstall(target: Path) -> list[str]:
+    changed = _remove_file_install(target)
 
     # Local state goes; the trust record stays. vetted.json and declined.json
     # are committed project history and deleting them is the owner's call.
@@ -628,7 +733,8 @@ def _next_steps(target: Path, sandboxed: bool) -> list[str]:
         f"  {step + 2}. Ask Claude to add a package. You approve each new package once,",
         "       at a permission prompt that shows its evidence.",
         "",
-        "Every machine that runs Claude Code here needs uv, or python3 >= 3.11.",
+        "Every machine that runs Claude Code here needs uv with Python 3.11",
+        "(uv python install 3.11), or a python3.11 on PATH.",
         f"Check the install any time: python3 {SOURCE / 'install.py'} {target} --check",
     ]
     return lines
@@ -640,6 +746,9 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="report, change nothing")
     mode.add_argument("--uninstall", action="store_true", help="remove the guard")
+    parser.add_argument("--plugin", action="store_true",
+                        help="seed project state for the Claude Code plugin; copies no hooks, "
+                             "and migrates a file-based install away")
     parser.add_argument("--sandbox", action="store_true",
                         help="also turn on the strict Claude Code sandbox; "
                              "it confines every Bash command in the project")
@@ -659,7 +768,26 @@ def main(argv: list[str] | None = None) -> int:
         print("install.py: the target is this clone; pick the project to guard.", file=sys.stderr)
         return 2
 
+    if args.plugin and (args.sandbox or args.uninstall or args.init_user_trust):
+        print("install.py: --plugin takes only --check.", file=sys.stderr)
+        return 2
+
     try:
+        if args.plugin:
+            if args.check:
+                rows = check_plugin(target)
+                for ok, what in rows:
+                    print(f"{'pass' if ok else 'MISSING'}  {what}")
+                return 0 if all(ok for ok, _ in rows) else 1
+            for line in install_plugin(target):
+                print(line)
+            print("")
+            print(f"Package Guard project state is set up in {target}.")
+            print("Commit it so teammates share it:")
+            print(f"  git add {STATE_DIR / 'vetted.json'} {STATE_DIR / 'declined.json'} "
+                  f"{STATE_DIR / 'reports' / '.gitignore'} CLAUDE.md .gitignore")
+            print("If this project had the file-based install, restart Claude Code so its old hooks unload.")
+            return 0
         if args.check:
             rows = check(target, args.sandbox)
             print(f"installed {installed_version(target) or 'unknown (installed before v1.8.2)'}"

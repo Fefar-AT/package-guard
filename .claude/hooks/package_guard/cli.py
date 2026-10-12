@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.11.*"
 # ///
 """Package Guard CLI: show / approve / decline / undecline / revoke / reconcile / audit.
 
@@ -18,6 +18,7 @@ Standard library only.
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from concurrent import futures
@@ -55,7 +56,8 @@ except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
 USAGE = (
     "usage: cli.py show <review-id>... | cli.py approve <review-id>... | "
     "cli.py decline <review-id>... | cli.py undecline <review-id>... | "
-    "cli.py revoke <review-id>... | cli.py reconcile | cli.py audit"
+    "cli.py revoke <review-id>... | cli.py reconcile | cli.py audit "
+    "(optionally `<subcommand> --root <project>` to name the project)"
 )
 _COMMANDS = ("show", "approve", "decline", "undecline", "revoke")
 # Take no arguments: each acts on state the guard already holds — whatever the
@@ -507,11 +509,34 @@ def _audit(root) -> int:
     return 1 if malware else 0
 
 
+def _explicit_root(argv):
+    """(argv without `--root <dir>`, root or None). `--root` is accepted only
+    directly after the subcommand: the form the hook prints and recognises."""
+    if len(argv) >= 3 and argv[1] == "--root":
+        root = os.path.realpath(argv[2])
+        if not os.path.isdir(root):
+            raise store.StoreError(f"--root {argv[2]!r} is not a directory")
+        if os.path.realpath(__file__) != os.path.realpath(os.path.join(root, store.CLI_SUFFIX)):
+            # Not this project's own file install: a plugin copy, run without
+            # CLAUDE_PLUGIN_ROOT. Print commands in the plugin form.
+            store._PLUGIN_CLI = True
+        return [argv[0]] + argv[3:], Path(root)
+    if any(a == "--root" or a.startswith("--root=") for a in argv):
+        raise store.StoreError("--root must come directly after the subcommand")
+    return argv, None
+
+
 def main(argv) -> int:
+    try:
+        argv, explicit = _explicit_root(argv)
+    except store.StoreError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    project = (lambda: explicit) if explicit is not None else (lambda: store.project_root(__file__))
     if argv and argv[0] in _NO_ARGUMENT_COMMANDS:
         run = {"reconcile": _reconcile, "audit": _audit}[argv[0]]
         try:
-            return run(store.project_root(__file__))
+            return run(project())
         except store.StoreError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
@@ -520,7 +545,7 @@ def main(argv) -> int:
         return 2
     command, review_ids = argv[0], _dedupe(argv[1:])
     try:
-        root = store.project_root(__file__)
+        root = project()
         reports = _load_all(root, review_ids)
         if command == "show":
             fresh = _refresh(reports)

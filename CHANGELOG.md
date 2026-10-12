@@ -1,5 +1,48 @@
 # Release notes
 
+## v1.9.0
+
+- Package Guard is now a Claude Code plugin for teams. The Owner connects the
+  repository to claude.ai once (Organization settings, Plugins & skills, Sync
+  from GitHub), and it reaches every member. Members sign in with their
+  claude.ai account. Outside members install it with `claude plugin install`.
+  The README has a quick start for each.
+- **Projects set up with `install.sh` need `/package-guard:setup` once** after
+  the plugin arrives. Until then both guards run there and approvals cannot
+  complete, because each refuses the other's approve command. Setup removes
+  the old hooks and keeps your approvals. Do this before the Owner makes the
+  plugin Required.
+- Everyone needs `uv`, installed once. Python 3.11 is then installed for you at
+  the start of a session. If `uv` is missing, you are told to install it and
+  nothing else happens; the guard blocks Bash commands and file edits until
+  you do.
+- The guard runs on Python 3.11 exactly, through `uv`. Before, it used
+  whichever Python `uv` found first. A newer Python alone no longer counts.
+  `install.sh` installs a uv-managed 3.11 if there is none.
+- With the plugin, if the guard cannot start, or times out, the command is now
+  blocked instead of let through (Claude Code v2.1.295 or newer).
+- Native Windows works with the plugin, with Git for Windows. PowerShell
+  commands are refused because the guard cannot inspect them; set
+  `CLAUDE_CODE_USE_POWERSHELL_TOOL=0` so Claude uses Git Bash. `install.sh`
+  still needs macOS, Linux or WSL2.
+- The README has a new "Logging in to GitHub" section. When its clone fails,
+  `install.sh` now explains how to log in over HTTPS (`gh auth login`, Git
+  Credential Manager or a token), use SSH, or install from a ZIP. The
+  `curl | sh` one-liner does not work while the repository is private.
+- Fixed: with the plugin, approvals could not be recorded. The approve,
+  decline and revoke commands Claude shows now work in a plugin project.
+- Fixed: the plugin left the approvals and settings unprotected. File edits are
+  now checked too, and changes to the project's approval records and
+  `.claude/settings*.json`, your `~/.config/package-guard/` and the guard's own
+  files are refused.
+- Fixed: `/package-guard:setup` could not run. It now shows one command to
+  type with a `!` in front.
+- Fixed: with no Python 3.11 on the machine, the guard's error kept Claude from
+  finishing its turn, over and over. It now fails the normal way and says
+  clearly to run `uv python install 3.11`.
+- Fixed: `uv` in `~/.local/bin` was missed when Claude Code started from the
+  macOS dock.
+
 ## v1.8.7
 
 - A refused package manager (pnpm, yarn, bun) could slip past the guard when

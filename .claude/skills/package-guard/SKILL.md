@@ -78,6 +78,9 @@ acquires a package is blocked unless the **exact version** is already vetted in
      Copy it **verbatim from the denial message** — it gives an absolute path
      to `cli.py`, so it works from any directory — with the ids filled in:
      `uv run --no-project --no-config --no-python-downloads <ABSOLUTE>/.claude/hooks/package_guard/cli.py approve <id> <id> ...`
+     With the Package Guard plugin, the denial names the plugin's own `cli.py`
+     instead and puts `--root <project>` right after the subcommand; copy it
+     exactly as given.
      Run it as a **simple standalone command**. Never prefix it with `cd`,
      never join it with `&&` or `;`, never wrap it in a subshell — the hook
      refuses any compound form, because a wrapped approve would skip the

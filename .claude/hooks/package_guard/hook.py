@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.11.*"
 # ///
 """Package Guard — Claude Code PreToolUse hook for Bash package commands.
 
@@ -73,6 +73,10 @@ _REQUIRED_CLI_FLAGS = {"--no-project", "--no-config", "--no-python-downloads"}
 # wrapped or prefixed form would run outside it.
 _GUARD_CLI_HINT = re.compile(
     r"package_guard/cli\.py\s+(?:approve|decline|undecline|revoke|reconcile|audit)\b")
+# A plugin's guard lives wherever the plugin is installed, so any cli.py named
+# with one of those verbs counts.
+_PLUGIN_CLI_HINT = re.compile(
+    r"cli\.py\s+(?:approve|decline|undecline|revoke|reconcile|audit)\b")
 
 # Guard state -- vetted.json, declined.json, the reports, the identity
 # catalogs -- is written only by the guard CLI behind its prompts. In a project
@@ -150,7 +154,12 @@ _SHELL_UNREAD = {"for", "case", "select", "function", "coproc", "trap", "alias"}
 
 
 def _guard_locked(root) -> bool:
-    """The installer's lock rules are in this project's settings."""
+    """The installer's lock rules are in this project's settings.
+
+    A plugin cannot ship deny rules; the guard's own Edit hook is its lock, so a
+    plugin project is always locked."""
+    if store.plugin_mode():
+        return True
     path = Path(root) / ".claude" / "settings.json"
     try:
         settings = json.loads(path.read_text(encoding="utf-8"))
@@ -514,6 +523,8 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
     root = os.path.normpath(str(root))
     state = [os.path.join(root, p) for p in _STATE_PATHS] + [os.path.join(home, ".config/package-guard")]
     source = [os.path.join(root, p) for p in _SOURCE_PATHS] if locked else []
+    if locked and store.plugin_root():
+        source.append(store.plugin_root())
     real_state = [os.path.realpath(p) for p in state]
     real_source = [os.path.realpath(p) for p in source]
     here = os.path.normpath(str(cwd or root))
@@ -777,6 +788,69 @@ def _clean_project_cli(tokens, root, cwd) -> bool:
     if not script.is_absolute():
         script = Path(cwd or root) / script
     return os.path.realpath(script) == os.path.realpath(Path(root) / store.CLI_SUFFIX)
+
+
+_CLI_VERBS = ("show", "approve", "decline", "undecline", "revoke", "reconcile", "audit")
+_REVIEW_ID_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
+# A path token must mean the same to the shell as to this parser.
+_UNSAFE_PATH_TOKEN = re.compile(r"[$`*?\[\]{}()<>|&;!\n\x00]")
+
+
+def _plain_abs_path(token: str) -> bool:
+    return os.path.isabs(token) and not _UNSAFE_PATH_TOKEN.search(token)
+
+
+def _plugin_cli_call(tokens, root):
+    """A plugin's guard CLI call: None when these tokens are not one, a refusal
+    decision when they look like one but are not exactly the permitted form, else
+    (subcommand, [review ids]).
+
+    The form, and nothing else:
+      uv run <the three flags> <abs path of THIS guard's cli.py> <verb> --root <abs project root> [ids]
+    """
+    if len(tokens) < 6 or tokens[0] != "uv" or tokens[1] != "run":
+        return None
+    own = os.path.realpath(store.own_cli())
+    looks = False
+    for i, token in enumerate(tokens[2:], start=2):
+        slashed = token.replace("\\", "/")
+        if slashed.rsplit("/", 1)[-1] != "cli.py":
+            continue
+        following = tokens[i + 1] if i + 1 < len(tokens) else None
+        if following in _CLI_VERBS or "package_guard" in slashed or (
+                _plain_abs_path(token) and os.path.realpath(token) == own):
+            looks = True
+            break
+    if not looks:
+        return None
+    verb = tokens[6] if len(tokens) > 6 else None
+    form = store.cli_command(root, verb if verb in _CLI_VERBS else "<approve|decline>",
+                             "" if verb in ("reconcile", "audit") else "<review-id> ...")
+
+    def refuse(why):
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_CLI_REFUSED: {why}. Package Guard accepts only its own CLI, "
+            f"with no other option, exactly as:\n  {form.rstrip()}")
+
+    flags = tokens[2:5]
+    if len(set(flags)) != 3 or set(flags) != _REQUIRED_CLI_FLAGS:
+        return refuse("`uv run` takes exactly --no-project --no-config --no-python-downloads")
+    if not _plain_abs_path(tokens[5]) or os.path.realpath(tokens[5]) != own:
+        return refuse("that is not this Package Guard's own cli.py")
+    if verb not in _CLI_VERBS:
+        return refuse("the subcommand must come directly after cli.py")
+    if len(tokens) < 9 or tokens[7] != "--root":
+        return refuse("`--root <project root>` must come directly after the subcommand")
+    if not _plain_abs_path(tokens[8]) or os.path.realpath(tokens[8]) != os.path.realpath(str(root)):
+        return refuse("`--root` is not this project's root")
+    ids = []
+    for rid in tokens[9:]:
+        if verb in ("reconcile", "audit") or not _REVIEW_ID_TOKEN.match(rid):
+            return refuse("only review ids may follow; no other option or shell syntax")
+        if rid not in ids:
+            ids.append(rid)
+    return verb, ids
 
 
 def _label(identity: dict) -> str:
@@ -3109,8 +3183,108 @@ def _unreviewed_on_disk(findings, root) -> dict:
     )
 
 
+_EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def _powershell_refusal() -> dict:
+    return _decision(
+        "deny",
+        "PACKAGE_GUARD_UNSUPPORTED: Package Guard cannot inspect PowerShell commands, so it "
+        "cannot tell whether this one installs a package. Run the command through the Bash "
+        "tool (Git Bash) instead. To make Claude Code use Bash and not PowerShell, set "
+        "CLAUDE_CODE_USE_POWERSHELL_TOOL=0.")
+
+
+def _edit_protected(root) -> list:
+    """Absolute paths a plugin-mode guard keeps the agent's file tools out of."""
+    home = str(Path.home())
+    roots = {os.path.normpath(str(root)), os.path.realpath(str(root))}
+    paths = [os.path.join(home, ".config", "package-guard")]
+    for base in roots:
+        paths += [os.path.join(base, ".claude", "package-guard"),
+                  os.path.join(base, ".claude", "settings.json"),
+                  os.path.join(base, ".claude", "settings.local.json")]
+        paths += [os.path.join(base, p) for p in _SOURCE_PATHS]
+    if store.plugin_root():
+        paths.append(store.plugin_root())
+        paths.append(os.path.normpath(os.environ["CLAUDE_PLUGIN_ROOT"]))
+    return paths
+
+
+def _edit_hits(candidate: str, protected: list) -> bool:
+    # Lexical and resolved forms, compared case-insensitively: macOS and
+    # Windows volumes are, and `.Claude/Package-Guard` is the same directory.
+    forms = {os.path.normpath(candidate).casefold(), os.path.realpath(candidate).casefold()}
+    for path in protected:
+        for prot in {os.path.normpath(path).casefold(), os.path.realpath(path).casefold()}:
+            if any(f == prot or f.startswith(prot.rstrip(os.sep) + os.sep) for f in forms):
+                return True
+    # The same file under another name: a bind mount, a hard link, or a case
+    # spelling the volume treats as equal that casefolding missed.
+    probe = os.path.realpath(candidate)
+    try:
+        info = os.stat(probe)
+    except OSError:
+        info = None
+    if info is not None and os.path.isfile(probe) and info.st_nlink > 1:
+        seen = 0
+        for path in protected:
+            for here, _dirs, files in os.walk(path):
+                for name in files:
+                    seen += 1
+                    try:
+                        if seen > 20000 or os.path.samestat(info, os.stat(os.path.join(here, name))):
+                            return True
+                    except OSError:
+                        continue
+    while True:
+        for path in protected:
+            try:
+                if os.path.exists(probe) and os.path.exists(path) and os.path.samefile(probe, path):
+                    return True
+            except OSError:
+                continue
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return False
+        probe = parent
+
+
+def _edit_decision(event: dict, root) -> dict | None:
+    """Plugin mode's lock: the file tools may not touch the guard's own files or
+    the approval state, which a plugin cannot protect with permission rules."""
+    tool_input = event.get("tool_input")
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    named = [tool_input[k] for k in ("file_path", "notebook_path") if k in tool_input]
+    refusal = _decision(
+        "deny",
+        "PACKAGE_GUARD_UNSUPPORTED: this file is part of Package Guard (its approval state under "
+        ".claude/package-guard/, the user's trust catalog, .claude/settings*.json or the guard "
+        "and plugin files themselves). Only the human changes it, outside Claude. Do not look for "
+        "another way: stop and tell the user what you were asked and that this is theirs to do.")
+    if not named or not all(isinstance(n, str) and n for n in named):
+        return refusal  # a path the hook cannot read is not one it can clear
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) and event.get("cwd") else str(root)
+    try:
+        protected = _edit_protected(root)
+        for raw in named:
+            candidates = [os.path.join(cwd, raw)]
+            if raw == "~" or raw.startswith(("~/", "~\\")):
+                candidates.append(os.path.expanduser(raw))
+            if any(_edit_hits(c, protected) for c in candidates):
+                return refusal
+    except (OSError, ValueError):
+        return refusal
+    return None
+
+
 def evaluate(event: dict, root) -> dict | None:
-    if event.get("tool_name") != "Bash":
+    tool = event.get("tool_name")
+    if isinstance(tool, str) and tool.lower() == "powershell":
+        return _powershell_refusal()
+    if tool in _EDIT_TOOLS:
+        return _edit_decision(event, root) if store.plugin_mode() else None
+    if tool != "Bash":
         return None
     # The review and refresh deadlines this invocation sets are at least
     # _REVIEW_BUDGET_SECONDS from here, so a retry that ends by this mark
@@ -3132,7 +3306,14 @@ def evaluate(event: dict, root) -> dict | None:
         tokens = shlex.split(command)
     except ValueError:
         tokens = None
-    if tokens:
+    plugin = store.plugin_mode()
+    if tokens and plugin:
+        outcome = _plugin_cli_call(tokens, root)
+        if isinstance(outcome, dict):
+            return outcome
+        if outcome:
+            return _handle_cli(outcome, root, event.get("transcript_path"))
+    elif tokens:
         call = _guard_cli_call(tokens)
         if call:
             if not _clean_project_cli(tokens, root, event.get("cwd")):
@@ -3148,7 +3329,7 @@ def evaluate(event: dict, root) -> dict | None:
     # recognised as a clean standalone invocation above. Falling through would
     # hand it to the normal permission flow, where an auto-accept mode runs it
     # with no human prompt — silently defeating the approval gate. Fail closed.
-    if _GUARD_CLI_HINT.search(command):
+    if (_PLUGIN_CLI_HINT if plugin else _GUARD_CLI_HINT).search(command):
         return _decision(
             "deny",
             "PACKAGE_GUARD_UNSUPPORTED: a Package Guard approve/decline must be a simple "
@@ -3489,6 +3670,31 @@ def _arm_watchdog():
         signal.alarm(_WATCHDOG_SECONDS)
 
 
+# A project that still has the file install runs both guards once the plugin
+# arrives (org sync puts it in every project), and each refuses the other's
+# approve command, so no approval can complete. The plugin never stands down for
+# a file install it finds -- a cloned repository could ship a fake one -- it says
+# how to migrate instead.
+_MIGRATE_NOTE = (
+    "\n\nNOTE: this project still has the older file-based Package Guard install, so two "
+    "guards run and an approval cannot complete (each refuses the other's approve command). "
+    "Ask the user to migrate once: run /package-guard:setup (it removes the old hooks and "
+    "keeps the approvals), then restart Claude Code.")
+
+
+def _with_migration_note(decision: dict, root) -> dict:
+    if not store.plugin_mode():
+        return decision
+    if not (Path(root) / ".claude" / "hooks" / "package_guard").is_dir():
+        return decision
+    out = decision.get("hookSpecificOutput")
+    reason = out.get("permissionDecisionReason") if isinstance(out, dict) else None
+    if (out.get("permissionDecision") == "deny" and isinstance(reason, str)
+            and reason.startswith(("PACKAGE_GUARD_REVIEW_REQUIRED", "PACKAGE_GUARD_CLI_REFUSED"))):
+        out["permissionDecisionReason"] = reason + _MIGRATE_NOTE
+    return decision
+
+
 def main() -> int:
     _arm_watchdog()
     try:
@@ -3499,6 +3705,8 @@ def main() -> int:
     try:
         root = store.project_root(__file__)
         decision = evaluate(event, root)
+        if decision is not None:
+            decision = _with_migration_note(decision, root)
     except Exception as exc:  # fail closed on any internal error
         print(f"Package Guard: internal failure ({exc.__class__.__name__}: {exc}); failing closed.", file=sys.stderr)
         return 2

@@ -52,7 +52,7 @@ permissions:
       - api.deps.dev
       - data.jsdelivr.com
       - inspector.pypi.io
-      # the installer: uv (and a managed CPython if the image has no 3.11+);
+      # the installer: uv (and a managed CPython if the image has no 3.11);
       # github.com covers the Package Guard repository and uv's release
       # assets on objects.githubusercontent.com
       - astral.sh

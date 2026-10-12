@@ -25,11 +25,40 @@ class StoreError(Exception):
     pass
 
 
+# Set by cli.py when it runs from a plugin copy (it is run through the Bash tool,
+# where CLAUDE_PLUGIN_ROOT is not set) and was told its project with --root.
+_PLUGIN_CLI = False
+
+
+def plugin_mode() -> bool:
+    """This code is running as a Claude Code plugin's guard copy.
+
+    True only when CLAUDE_PLUGIN_ROOT is set AND this file really lives under it
+    (symlinks followed): the variable alone proves nothing.
+    """
+    if _PLUGIN_CLI:
+        return True
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if not env:
+        return False
+    try:
+        plugin = os.path.realpath(env)
+        mine = os.path.realpath(__file__)
+        return os.path.commonpath([plugin, mine]) == plugin
+    except ValueError:
+        return False
+
+
+def plugin_root() -> str | None:
+    env = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    return os.path.realpath(env) if env and plugin_mode() else None
+
+
 def project_root(script_file: str | None = None) -> Path:
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
         return Path(env)
-    if script_file is not None:
+    if script_file is not None and not plugin_mode():
         # <root>/.claude/hooks/package_guard/<script>
         return Path(script_file).resolve().parents[3]
     raise StoreError("CLAUDE_PROJECT_DIR is not set")
@@ -65,16 +94,28 @@ MESSAGE_UNREVIEWED_ON_DISK = "PACKAGE_GUARD_UNREVIEWED_ON_DISK"
 MESSAGE_PIN_APPROVED = "PACKAGE_GUARD_PIN_APPROVED"
 
 
+def own_cli() -> str:
+    """The cli.py next to this running guard copy, symlinks resolved."""
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)), "cli.py")
+
+
 def cli_path(root) -> str:
-    """Absolute path to the guard CLI, so callers never need a `cd` prefix."""
+    """Absolute path to the guard CLI, so callers never need a `cd` prefix.
+
+    A plugin has no project-local copy: it names its own."""
+    if plugin_mode():
+        return own_cli()
     return str(Path(root) / CLI_SUFFIX)
 
 
 def cli_command(root, subcommand: str, ids: str) -> str:
-    return (
-        "uv run --no-project --no-config --no-python-downloads "
-        f"{cli_path(root)} {subcommand} {ids}"
-    )
+    base = "uv run --no-project --no-config --no-python-downloads "
+    if plugin_mode():
+        # The Bash tool has no CLAUDE_PROJECT_DIR, so the project is named.
+        import shlex
+        return (f"{base}{shlex.quote(cli_path(root))} {subcommand} "
+                f"--root {shlex.quote(os.path.realpath(str(root)))} {ids}")
+    return f"{base}{cli_path(root)} {subcommand} {ids}"
 
 
 def utcnow() -> str:
