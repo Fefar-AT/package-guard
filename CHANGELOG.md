@@ -1,5 +1,16 @@
 # Release notes
 
+## v1.9.1
+
+- Windows hosts without WSL2 can run the guard in a Docker sandbox (`sbx`)
+  with the kit in `.sbx/package-guard/`. The guard runs on Linux inside it.
+- The guard's files now stay LF on a Windows checkout. A CRLF `run.sh`
+  (Git for Windows' default) blocked every command and kept Claude from
+  ending its turn. Re-run the installer once: it adds `.gitattributes`
+  lines and repairs the file, and `--check` reports both until you do.
+- `git -c safe.directory=...` and other `-c` options no longer slip a
+  checkout that rewrites the guard's files past the hook.
+
 ## v1.9.0
 
 - Package Guard is now a Claude Code plugin for teams. The Owner connects the

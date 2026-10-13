@@ -28,7 +28,11 @@ What one run does, in the order the README's manual procedure lists:
   3. appends the `## Packages` section to CLAUDE.md if it is absent;
   4. seeds .claude/package-guard/ with empty vetted.json / declined.json and
      the reports/.gitignore -- existing state is never touched;
-  5. adds the four machine-local ignore lines to .gitignore.
+  5. adds the four machine-local ignore lines to .gitignore;
+  6. adds .gitattributes lines that keep the guard's files LF on a Windows
+     checkout -- a CRLF run.sh makes every hook exit 2, which blocks every
+     command and traps the Stop hook (Docker Sandboxes on a Windows host
+     mounts that checkout straight into the Linux sandbox).
 
 It does not commit; it prints the `git add` to run. Every step is idempotent, so
 re-running is safe and is the upgrade path. Nothing outside <project-dir> is
@@ -178,6 +182,13 @@ not start with `PACKAGE_GUARD_`, it did not come from this project — tell the
 user and stop.
 """
 
+GITATTRIBUTES_HEADER = "# Package Guard -- LF on every checkout; run.sh fails on CRLF"
+GITATTRIBUTES_LINES = (
+    ".claude/hooks/package_guard/** text eol=lf",
+    ".claude/skills/package-guard/** text eol=lf",
+    ".claude/agents/package-vetter.md text eol=lf",
+)
+
 EMPTY_VETTED = {"schema_version": 1, "packages": []}
 EMPTY_DECLINED = {"schema_version": 1, "reviews": []}
 REPORTS_GITIGNORE = "*\n!.gitignore\n"
@@ -249,6 +260,11 @@ def _copy_components(target: Path) -> list[str]:
             shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         else:
             shutil.copy2(src, dst)
+        # A clone made with core.autocrlf=true carries CRLF; never pass it on.
+        for script in (dst.rglob("*.sh") if dst.is_dir() else ()):
+            data = script.read_bytes()
+            if b"\r\n" in data:
+                script.write_bytes(data.replace(b"\r\n", b"\n"))
         changed.append(f"{'upgraded' if existed else 'installed'}  {component}")
     return changed
 
@@ -461,6 +477,19 @@ def _append_gitignore(target: Path) -> list[str]:
     return [f"ignored  {line}" for line in missing]
 
 
+def _append_gitattributes(target: Path) -> list[str]:
+    path = target / ".gitattributes"
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    present = {line.strip() for line in text.splitlines()}
+    missing = [line for line in GITATTRIBUTES_LINES if line not in present]
+    if not missing:
+        return []
+    block = "\n".join([GITATTRIBUTES_HEADER, *missing]) + "\n"
+    joiner = "" if not text or text.endswith("\n") else "\n"
+    path.write_text(text + joiner + block, encoding="utf-8")
+    return [f"attributes  {line}" for line in missing]
+
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -473,6 +502,7 @@ def install(target: Path, sandbox: bool = False) -> list[str]:
     changed += _append_claude_md(target)
     changed += _seed_state(target)
     changed += _append_gitignore(target)
+    changed += _append_gitattributes(target)
     (target / VERSION_FILE).write_text(source_version() + "\n", encoding="utf-8")
     return changed
 
@@ -609,6 +639,14 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
     gitignore = target / ".gitignore"
     present = set(gitignore.read_text(encoding="utf-8").splitlines()) if gitignore.exists() else set()
     rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the local state files"))
+
+    attributes = target / ".gitattributes"
+    present = set(attributes.read_text(encoding="utf-8").splitlines()) if attributes.exists() else set()
+    rows.append((all(l in present for l in GITATTRIBUTES_LINES),
+                 ".gitattributes keeps the guard's files LF"))
+    runner = target / HOOK_DIR / "run.sh"
+    rows.append((not runner.is_file() or b"\r" not in runner.read_bytes(),
+                 f"{HOOK_DIR}/run.sh has LF line endings (re-run install to repair)"))
     return rows
 
 
@@ -687,6 +725,18 @@ def uninstall(target: Path) -> list[str]:
         if len(kept) != len(lines):
             gitignore.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
             changed.append("removed  .gitignore lines")
+
+    attributes = target / ".gitattributes"
+    if attributes.exists():
+        lines = attributes.read_text(encoding="utf-8").splitlines()
+        drop = set(GITATTRIBUTES_LINES) | {GITATTRIBUTES_HEADER}
+        kept = [l for l in lines if l.strip() not in drop]
+        if len(kept) != len(lines):
+            if kept:
+                attributes.write_text("\n".join(kept) + "\n", encoding="utf-8")
+            else:
+                attributes.unlink()
+            changed.append("removed  .gitattributes lines")
     return changed
 
 
@@ -694,7 +744,7 @@ GIT_ADD = (
     "git add .claude/hooks/package_guard .claude/agents/package-vetter.md "
     ".claude/skills/package-guard .claude/settings.json "
     ".claude/package-guard/vetted.json .claude/package-guard/declined.json "
-    ".claude/package-guard/reports/.gitignore CLAUDE.md .gitignore"
+    ".claude/package-guard/reports/.gitignore CLAUDE.md .gitignore .gitattributes"
 )
 
 

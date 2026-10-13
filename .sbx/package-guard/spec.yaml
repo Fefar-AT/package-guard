@@ -3,28 +3,60 @@
 #   sbx run claude --kit <path-to-this-directory> .
 #   sbx create --name <n> claude --kit <path-to-this-directory> .
 #
-# On sandbox creation it runs the Package Guard one-liner against the
-# workspace, so Claude Code inside the sandbox is gated from its first command.
-# The sandbox's outbound proxy is closed by default; the allow list below is
-# exactly what the installer and the guard need. PG_REPO points at the
-# published repository; while that repository is private, the sandbox needs a
-# git credential for github.com (a token in the clone URL, or a credential
-# helper the image carries) or the install step fails at the clone.
+# The same on every host. On Windows, sbx runs a Linux microVM on the Windows
+# Hypervisor Platform -- no WSL2 -- and mounts the project folder into it, so
+# the guard runs on Linux exactly as it does on macOS and Linux hosts.
+#
+# Two steps, because the workspace may not be mounted yet when setup.install
+# runs (Docker's v2 kit spec), and sbx substitutes nothing in a command: every
+# $VAR below is expanded by the shell.
+#
+#   setup.install  (once, at creation) clones PG_REPO into the agent user's
+#                  ~/.cache/package-guard and runs its install.sh against a
+#                  scratch directory, which puts uv (and a CPython 3.11 if the
+#                  image has none) in ~/.local/bin, where the hooks look.
+#   setup.startup  (every start, no network) installs the guard into
+#                  $WORKSPACE_DIR when the project does not already carry it.
+#
+# Both run as the agent user (1000), so nothing in the workspace or home ends
+# up owned by root. The sandbox's outbound proxy is closed by default; the
+# allow list below is exactly what the installer and the guard need.
+#
+# While PG_REPO is private the clone needs a git credential for github.com (a
+# token in PG_REPO, or a credential helper the image carries); without one the
+# install step fails at the clone and says so.
 
+schemaVersion: "2"
 kind: mixin
 name: package-guard
 
 setup:
   install:
-    - command: >-
-        curl -fsSL "${PG_INSTALL_URL}" |
-        PG_REPO="${PG_REPO}" PG_REF="${PG_REF}" sh -s -- "${WORKDIR}"
+    - description: Fetch Package Guard and set up its runner (uv)
+      user: "1000"
+      command: >-
+        set -eu;
+        HOME="${HOME:-/home/agent}"; export HOME;
+        command -v git >/dev/null || { echo "package-guard kit: git is not in this image" >&2; exit 1; };
+        src="$HOME/.cache/package-guard"; rm -rf "$src";
+        git -c advice.detachedHead=false clone --quiet --depth 1
+        --branch "$PG_REF" "$PG_REPO" "$src";
+        scratch=$(mktemp -d); sh "$src/install.sh" "$scratch" >/dev/null; rm -rf "$scratch";
+        echo "package-guard kit: fetched $PG_REF and set up the runner"
+  startup:
+    - command:
+        - sh
+        - -c
+        - >-
+          ws="${WORKSPACE_DIR:-}";
+          [ -n "$ws" ] || { echo "package-guard kit: WORKSPACE_DIR is not set; guard not installed" >&2; exit 1; };
+          [ -f "$ws/.claude/hooks/package_guard/run.sh" ] ||
+          sh "${HOME:-/home/agent}/.cache/package-guard/install.sh" "$ws"
 
 environment:
   variables:
     PG_REPO: "https://github.com/Fefar-AT/package-guard.git"
     PG_REF: "release"
-    PG_INSTALL_URL: "https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh"
 
 permissions:
   network:
@@ -52,12 +84,16 @@ permissions:
       - api.deps.dev
       - data.jsdelivr.com
       - inspector.pypi.io
-      # the installer: uv (and a managed CPython if the image has no 3.11);
-      # github.com covers the Package Guard repository and uv's release
-      # assets on objects.githubusercontent.com
+      # the installer: uv (and a managed CPython 3.11 if the image has none).
+      # astral.sh/uv/<v>/install.sh redirects to releases.astral.sh, which
+      # falls back to GitHub releases; those redirect to
+      # release-assets.githubusercontent.com (objects.* is the older host).
+      # github.com also covers the Package Guard clone.
       - astral.sh
+      - releases.astral.sh
       - github.com
       - objects.githubusercontent.com
+      - release-assets.githubusercontent.com
 
 agentInstructions:
   content: |

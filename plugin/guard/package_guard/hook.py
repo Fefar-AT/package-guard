@@ -326,6 +326,12 @@ def _git(args, cwd):
     return done.returncode, done.stdout.decode("utf-8", "replace")
 
 
+# `git -c` keys that change only output or identity, never which tree is
+# written. Any other key makes the command opaque.
+_GIT_INERT_CONFIG = ("color.", "advice.", "user.", "core.quotepath", "commit.gpgsign",
+                     "init.defaultbranch", "pager.", "column.")
+
+
 _GIT_VALUE_FLAGS = {
     "checkout": {"-b", "-B", "--orphan", "--conflict"},
     "switch": {"-c", "-C", "--orphan", "--conflict"},
@@ -340,21 +346,27 @@ _GIT_VALUE_FLAGS = {
 }
 
 
-def _git_write(sub, args, here, protected, inside, opaque=False) -> bool:
+def _git_write(sub, args, here, protected, inside, opaque=False, config=()) -> bool:
     """Would this git command change a tracked or untracked guard file? `inside(word)` resolves a pathspec and tells whether
     it is in (True), above ("above") or outside (False) the guard files.
     Anything git cannot answer counts as a write; so does any tree-changing
-    command run with GIT_* variables the hook cannot see through (`opaque`)."""
+    command run with GIT_* variables the hook cannot see through (`opaque`).
+    `config` is the command's `-c safe.directory=...` options, passed to every
+    query so a mount git distrusts is seen as git will see it. Any other
+    config is never forwarded (core.fsmonitor and friends run commands);
+    the caller marks it opaque instead."""
     if sub in ("rm", "mv") and not opaque:
         return any(inside(a) for a in args if not a.startswith("-"))
     # A pathspec inside the guard files is a write whatever git would make of it.
     if any(inside(a) is True for a in args if not a.startswith("-")):
         return True
-    found = _git(["rev-parse", "--show-toplevel"], here)
+    found = _git([*config, "rev-parse", "--show-toplevel"], here)
     if found is None:
         return True
     if found[0] != 0:
-        return False  # not a repository: git refuses, nothing is written
+        # Not a repository here: git refuses and writes nothing, unless
+        # GIT_* variables the hook cannot see point it at one.
+        return opaque
     top = os.path.realpath(found[1].strip())
     real = [os.path.realpath(p) for p in protected]
     guard = [os.path.relpath(p, top) for p in real if p == top or p.startswith(top + "/")]
@@ -364,20 +376,20 @@ def _git_write(sub, args, here, protected, inside, opaque=False) -> bool:
         return True
 
     def differs(*revs) -> bool:
-        result = _git(["diff", "--quiet", *revs, "--", *guard], top)
+        result = _git([*config, "diff", "--quiet", *revs, "--", *guard], top)
         return result is None or result[0] != 0
 
     def untracked(*extra) -> bool:
-        result = _git(["ls-files", "--others", *extra, "--", *guard], top)
+        result = _git([*config, "ls-files", "--others", *extra, "--", *guard], top)
         return result is None or result[0] != 0 or bool(result[1].strip())
 
     def commit(rev) -> bool:
-        result = _git(["rev-parse", "--verify", "--quiet", rev + "^{commit}"], top)
+        result = _git([*config, "rev-parse", "--verify", "--quiet", rev + "^{commit}"], top)
         return result is not None and result[0] == 0
 
     def remote(name) -> str | None:
         """The remote branch `git checkout/switch <name>` would create from."""
-        listed = _git(["for-each-ref", "--format=%(refname)", "refs/remotes/*/" + name], top)
+        listed = _git([*config, "for-each-ref", "--format=%(refname)", "refs/remotes/*/" + name], top)
         refs = listed[1].split() if listed and listed[0] == 0 else []
         return refs[0] if len(refs) == 1 else None
 
@@ -413,7 +425,7 @@ def _git_write(sub, args, here, protected, inside, opaque=False) -> bool:
                 paths = operands
         elif sub == "switch":
             if "--orphan" in flags:
-                tracked = _git(["ls-files", "--", *guard], top)
+                tracked = _git([*config, "ls-files", "--", *guard], top)
                 return tracked is None or tracked[0] != 0 or bool(tracked[1].strip())
             source = operands[0] if operands else None
             if source and not commit(source):
@@ -455,7 +467,7 @@ def _git_write(sub, args, here, protected, inside, opaque=False) -> bool:
                 ref = operands[2] if len(operands) > 2 else "stash@{0}"
             if differs(ref + "^1", ref):
                 return True
-            third = _git(["ls-tree", "-r", "--name-only", ref + "^3", "--", *guard], top)
+            third = _git([*config, "ls-tree", "-r", "--name-only", ref + "^3", "--", *guard], top)
             return third is not None and third[0] == 0 and bool(third[1].strip())
         return True
     if sub == "clean":
@@ -506,7 +518,7 @@ def _git_write(sub, args, here, protected, inside, opaque=False) -> bool:
         if not operands or any(f.startswith(("-p", "--directory", "--include", "--exclude"))
                                for f in flags):
             return True
-        listed = _git(["apply", "--numstat", "-z", *[os.path.join(here, o) for o in operands]],
+        listed = _git([*config, "apply", "--numstat", "-z", *[os.path.join(here, o) for o in operands]],
                       top)
         if listed is None or listed[0] != 0:
             return True
@@ -605,11 +617,16 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                 here, moved = resolve(operands[0]), True
                 continue
             if name == "git":
-                at = here
+                at, config, opaque_config = here, [], False
                 while args and args[0].startswith("-"):
                     if args[0] == "-C" and len(args) > 1:
                         at, args = resolve(args[1]), args[2:]
                     elif args[0] == "-c" and len(args) > 1:
+                        key = args[1].split("=", 1)[0].lower()
+                        if key == "safe.directory":
+                            config += args[:2]
+                        elif not key.startswith(_GIT_INERT_CONFIG):
+                            opaque_config = True
                         args = args[2:]
                     elif args[0] in ("--no-pager", "-P", "--paginate", "--no-optional-locks",
                                      "--literal-pathspecs", "--no-replace-objects"):
@@ -623,8 +640,9 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                 if args[0] not in _GIT_TREE:
                     raise _NotUnderstood
                 saved, here = here, at
-                opaque = any(n.startswith("GIT_") for n in assigned)
-                wrote = _git_write(args[0], args[1:], here, source + state, inside, opaque)
+                opaque = opaque_config or any(n.startswith("GIT_") for n in assigned)
+                wrote = _git_write(args[0], args[1:], here, source + state, inside, opaque,
+                                   config)
                 here = saved
                 if wrote:
                     return True, "git"

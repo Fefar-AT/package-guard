@@ -116,7 +116,42 @@ Manager or `gh auth login` below set one up).
   v2.1.295 or newer.
 - Full PowerShell support is planned.
 - WSL2 behaves like Linux.
+- Or run Claude Code in a Docker sandbox, with no WSL2 and no Git for
+  Windows: see [Docker Sandboxes](#docker-sandboxes-sbx).
 - The install.sh fallback does not run on native Windows. Use the plugin.
+
+### Docker Sandboxes (`sbx`)
+
+[Docker Sandboxes](https://docs.docker.com/ai/sandboxes/) run Claude Code in a
+small Linux VM, on Windows without WSL2 or Docker Desktop (Windows 11 x64 with
+the Windows Hypervisor Platform turned on). The project folder is mounted into
+the VM, and the guard runs there as on any Linux machine.
+
+Once per machine:
+
+```powershell
+winget install -h Docker.sbx      # macOS: brew install docker/tap/sbx
+sbx login
+sbx policy init balanced
+```
+
+Then, from the project folder: create the sandbox, let it reach the guard's
+evidence sources, install the guard in it, and start Claude.
+
+```powershell
+sbx create --name myproj claude .
+sbx policy allow network --sandbox myproj "api.osv.dev,api.npmjs.org,hugovk.dev,pypistats.org,api.deps.dev,data.jsdelivr.com,inspector.pypi.io,releases.astral.sh,python-downloads.astral.sh"
+sbx exec myproj -- sh -c "curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- ."
+sbx run --name myproj
+```
+
+The `balanced` preset blocks those hosts, and without `api.osv.dev` every
+review is denied; `--sandbox` keeps the rule to this one sandbox. The install
+writes into your project folder, so commit it as usual. A new sandbox on a
+project that already carries the guard still needs the `policy allow` and
+`curl` lines: they set up Python 3.11 inside it and leave the project as is. Git for Windows checks out files with CRLF by
+default, and a CRLF `run.sh` blocks every command; the installer adds
+`.gitattributes` lines that keep the guard's files LF.
 
 ### Setup
 
