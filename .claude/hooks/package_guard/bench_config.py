@@ -57,6 +57,106 @@ def bench_root(directory) -> Path | None:
     return None
 
 
+# Bench's own rule for "the bench" (frappe-bench 5.31.x `bench/utils/__init__.py`): `paths_in_bench` is
+# `("apps", "sites", "config", "logs", "config/pids")`, `is_bench_directory` is true when every one of them
+# EXISTS (`os.path.exists`, so a link counts when its target is there), and `find_parent_bench` looks at
+# the working directory and then each parent, stopping after it has looked at the home directory or `/`.
+# `change_working_directory` (cli.py) starts from `os.path.abspath(".")`, which is the real path of the
+# working directory, and changes into what it finds. `bench_root` above is the looser rule (apps/ and
+# sites/ only) that the rest of the guard uses to say where a bench may be; a bench verb is judged by the
+# rule bench uses, in `bench_for_verb`.
+PATHS_IN_BENCH = ("apps", "sites", "config", "logs", "config/pids")
+
+
+def is_bench_directory(directory) -> bool:
+    return all(os.path.exists(os.path.abspath(os.path.join(directory, folder))) for folder in PATHS_IN_BENCH)
+
+
+def bench_as_bench_finds(directory, home=None) -> Path | None:
+    """The directory bench changes into when it is run from `directory` (`find_parent_bench`): the
+    real path of the nearest directory, from there up, that `is_bench_directory`, looking at the
+    home directory but no further; None when bench finds none."""
+    path = os.path.realpath(directory)
+    home = os.path.expanduser("~") if home is None else str(home)
+    stops = {home, os.path.abspath(os.sep)}
+    while True:
+        if is_bench_directory(path):
+            return Path(path)
+        if path in stops:
+            return None
+        parent = os.path.split(path)[0]
+        if parent == path:
+            return None
+        path = parent
+
+
+def _benchlike(directory) -> bool:
+    """A directory with `apps/` and `sites/`: a bench, or one `mkdir` away from being one."""
+    return os.path.isdir(os.path.join(directory, "apps")) and os.path.isdir(os.path.join(directory, "sites"))
+
+
+def bench_for_verb(directory) -> tuple:
+    """(bench, None) or (None, why) for a bench verb run in `directory`: the bench the verb acts on is
+    the one bench finds (`bench_as_bench_finds`), and the call refuses, with the reason in plain words, when
+    it cannot say it is the one the guard checks.
+
+    (a) The nearest directory with apps/ and sites/ (`bench_root`, what the guard used to take for the bench) is
+    not the directory bench changes into: bench would install into another env under other settings.
+    (b) is `recorded_bench_problem`, which the hook asks next.
+    (c) A directory that bench could take for the bench lies above the one it uses, all the way to `/` whatever
+    `HOME` says (a full bench, or one with apps/ and sites/ that a `mkdir` finishes): removing one folder of
+    the bench, or setting `HOME`, in a command that runs at the same time moves bench there, and the check
+    made now would be of the wrong one. When unsure, refuse."""
+    loose = bench_root(directory)
+    found = bench_as_bench_finds(directory)
+    if found is None:
+        if loose is None:
+            return None, ("no Frappe bench (a directory with apps/ and sites/) holds "
+                          f"{directory}; run the command from the bench root or from an app inside it")
+        missing = [f for f in PATHS_IN_BENCH if not os.path.exists(os.path.join(loose, f))]
+        return None, (f"bench does not take {loose} for a bench: it has no {', '.join(missing) or 'folder it needs'} "
+                      f"(a bench is a directory with {', '.join(PATHS_IN_BENCH)}), so bench would act on "
+                      "something else, or on the working directory itself. Tell the user")
+    if loose is None or os.path.realpath(loose) != str(found):
+        return None, (f"the nearest directory with apps/ and sites/ is {loose}, but bench changes into {found} "
+                      f"(the nearest directory that also has config/, logs/ and config/pids/): bench would install into "
+                      "that one's env and settings, not the ones Package Guard checked. Tell the user")
+    # (c): everything above the bench that bench could take for a bench, with or without HOME
+    above, path = [], str(found)
+    while True:
+        parent = os.path.split(path)[0]
+        if parent == path:
+            break
+        path = parent
+        if is_bench_directory(path) or _benchlike(path):
+            above.append(path)
+    if above:
+        return None, (f"{above[0]} lies above the bench at {found} and has "
+                      f"{'everything bench needs for a bench' if is_bench_directory(above[0]) else 'apps/ and sites/'}: "
+                      "if one folder of this bench were gone when the command runs, bench would use that one "
+                      "instead. Tell the user")
+    return Path(loose), None
+
+
+def recorded_bench_problem(bench, root) -> str | None:
+    """Why `bench` is not a bench the guard's installer files are recorded for, or None. The record
+    (`bench-config.json`) names every file `apply` wrote; a bench whose `env/pip.conf` is not among
+    them is not one the baselines and files of this project belong to. An empty record is not judged here
+    (`verify` reports the missing files)."""
+    try:
+        record = read_record(root)
+    except BenchConfigError:
+        return None
+    if not record:
+        return None
+    recorded = {os.path.realpath(Path(root) / name) for name in record}
+    if os.path.realpath(Path(bench) / "env" / "pip.conf") in recorded:
+        return None
+    return (f"the installer files Package Guard wrote are not those of the bench at {bench}: bench will act on "
+            "this one, and no baseline or file of the guard's is recorded for it. Tell the user; `bench-config apply` "
+            "run in that bench records it")
+
+
 def bench_env(directory) -> Path | None:
     """`<bench>/env` when `directory` is in a bench whose env exists."""
     root = bench_root(directory)
@@ -202,9 +302,11 @@ def app_names(root) -> dict:
 def env_problem(directory):
     """(bench root, None) when `directory` is in a bench that has a Python env,
     else (None, why not)."""
-    root = bench_root(directory)
-    if root is None:
+    if bench_root(directory) is None:
         return None, "no Frappe bench (a directory with `apps/` and `sites/`) holds this directory"
+    root, why = bench_for_verb(directory)  # the bench bench changes into, not only the nearest apps/ + sites/
+    if root is None:
+        return None, why
     if not (root / "env" / "pyvenv.cfg").is_file():
         return None, f"the bench at {root} has no Python environment in `env/` yet"
     return root, None
@@ -463,6 +565,9 @@ class ConfigInput:
                       one the app can install (the bench verbs refuse; see `hook`)
     requirement_names every package name some requirement of the bench names (the baselines' pins, the
                       toolchain, the allowed builds, the custom apps' declarations)
+    dev_blocked       normalised names of the direct development requirements of every app whose approved
+                      baseline does not pin its development set (`python.dev.pinned` false); see
+                      `constraint_lines`
     """
     runtime: tuple = ()
     build: tuple = ()
@@ -475,6 +580,7 @@ class ConfigInput:
     new_apps: tuple = ()
     unpinned: tuple = ()
     requirement_names: tuple = ()
+    dev_blocked: tuple = ()
 
 
 def _marker(pin) -> str:
@@ -521,7 +627,33 @@ def constraint_lines(config: ConfigInput) -> tuple:
     def render(table):
         return tuple(f"{p.name}=={p.version}{_marker(p)}" for _key, p in sorted(table.items()))
 
-    return render(runtime), render(build)
+    return (*render(runtime), *blocking_lines(config, runtime)), render(build)
+
+
+# The constraint that no release satisfies. `uv pip install hypothesis` (or pip) with it fails with
+# "you require hypothesis<0, which does not allow any versions" and installs nothing; an install
+# that does not ask for the package, directly or through another, is not touched by it. (The `===`
+# form is not used: neither tool reads it as a constraint, and every install then fails.)
+NO_RELEASE = "<0"
+
+
+def blocking_lines(config: ConfigInput, runtime: dict) -> tuple:
+    """The lines that make a development package uninstallable, for every app whose baseline does
+    not pin its development set.
+
+    With `developer_mode` on, bench installs an app's development dependencies (`uv pip install
+    <name><spec> ... --python <env>/bin/python`, run in the bench root, or `<env>/bin/python -m pip
+    install` when `BENCH_DISABLE_UV` is set: `install_python_dev_dependencies`) and it reads
+    `developer_mode` again for every app it installs. The hook reads it once, so a value changed
+    while `bench setup requirements` runs would install the unpinned set. The decision therefore does
+    not rest on that value: each direct development requirement of such an app that has no approved
+    pin gets a constraint no release satisfies, in the runtime constraint file (pip.conf) and in
+    uv.toml, and any install of it fails. Transitive development packages need nothing: they come
+    only through the direct ones, which cannot be installed. A name that has a pin (a runtime pin, the
+    toolchain, a local app, with or without a marker) gets no line: `name<0` beside `name==X` would
+    fail every install of it, runtime ones included."""
+    pinned = {p.name for p in runtime.values()}
+    return tuple(f"{name}{NO_RELEASE}" for name in sorted({_normalize(n) for n in config.dev_blocked} - pinned))
 
 
 def _constraint_text(lines) -> str:

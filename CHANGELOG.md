@@ -1,5 +1,42 @@
 # Release notes
 
+## v1.12.2
+
+Found by running Frappe v14 and v11 on real benches. **After upgrading, run `bench-config apply`
+once in the bench folder, and plan and approve a v11 or v14 baseline again** if you approved one
+with v1.12.1.
+
+- **Frappe v11: `bench setup requirements` works.** It stopped at the first app with
+  `object has no attribute 'build_editable'`, because the baseline's date picked a `setuptools`
+  too old for the editable install bench makes. The plan now pins one that can (setuptools 68.0.0
+  for Python 3.7), shows it, and you approve it with the baseline. If none fits, the plan says so
+  and writes nothing.
+- **Frappe v14: baselines can be approved.** The plan resolves frappe and erpnext together, so
+  the order you plan them in does not matter, and a package is pinned once.
+- **Development dependencies are pinned when they can be, and installs are refused while `developer_mode` is on
+  when they cannot.** With `developer_mode` on, bench installs every app's test tools (such as `hypothesis`) each
+  time it installs an app. A plan now resolves them together with the runtime set and the other apps' development
+  sets: when that works (v15, v16) they are pinned and shown in the approval text; when it cannot (v14) the
+  baseline says so, and `bench setup requirements`, `bench update --requirements` and `bench new-app` are
+  refused while `developer_mode` is on, with the way out: `bench set-config -g developer_mode 0`, run the
+  command, `bench set-config -g developer_mode 1`. `bench setup requirements --dev` (and `--node --python`, the
+  same install in bench's eyes) is never run.
+- **A companion app's directory name no longer drops a dependency from a plan.** Only the names the other apps'
+  own metadata declares are left out as local code, and the approval text lists them and every name left out.
+- **The approval text says which commit each companion app was read at**: its version, and whether the commit is
+  on its release branch or a tag, with a plain warning when it is neither.
+- **A development package that a baseline does not pin can no longer be installed**, even if
+  `developer_mode` is switched on while bench is installing: `bench-config apply` blocks each such
+  package in bench's own installer files.
+- **The guard finds the bench exactly as bench does**, and refuses a bench command when the two
+  disagree or when the bench is not the one your approvals were made for.
+
+Known limits: a deliberate, repeated timing trick (a background loop that keeps creating and removing
+a fake bench folder) can still make bench install into an environment Claude made, outside your bench;
+the guard's leftover-package check reports such packages inside the project. Planning old versions
+(v13, v14) looks up hundreds of known advisories one by one and can take over ten minutes on a slow
+connection; if the network drops, run the plan again.
+
 ## v1.12.1
 
 Closes holes found after v1.12.0 shipped; upgrade if you use a Frappe bench. **After

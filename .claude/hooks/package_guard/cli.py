@@ -929,7 +929,8 @@ def _baseline_import(root, path) -> int:
     try:
         result = baseline_plan.plan(root, seams, url=app["git_url"], ref=app["commit"], base_ids=claimed["base"],
                                     python_version=compile_["python_version"],
-                                    exclude_newer=compile_["exclude_newer"], dir_name=app["dir_name"])
+                                    exclude_newer=compile_["exclude_newer"], dir_name=app["dir_name"],
+                                    joint=compile_.get("joint_with"))
     except baseline_plan.PlanError as exc:
         print(f"error: the file could not be re-planned. {exc}", file=sys.stderr)
         return 1
@@ -948,6 +949,13 @@ def _baseline_approve(root, args) -> int:
     if unknown or len(args) != 1:
         raise ValueError("approve takes one baseline id and no option")
     doc = baseline.load(root, args[0], proposal=True)
+    clashes = baseline.pin_conflicts(doc["python"]["pins"])
+    if clashes:
+        print(f"error: {doc['id']} cannot be approved: it contradicts itself ("
+              + "; ".join(f"{n} is pinned to {a} and to {b}" for n, a, b in clashes[:4])
+              + "). Plan the app again with this release; the new proposal is one resolution. Nothing was approved.",
+              file=sys.stderr)
+        return 1
     if doc.get("approvable") is False or doc["evidence"]["osv"]["malware"]:
         print(f"error: {doc['id']} cannot be approved: OSV lists malware in it "
               f"({'; '.join(doc['evidence']['osv']['malware'][:3])}). Nothing was approved.", file=sys.stderr)
@@ -1123,6 +1131,12 @@ def _bench_config(root, args) -> int:
     for app, name, _section, why in config.unpinned:
         print(f"note: apps/{app} asks for {name} in a version range and {why}, so it is not pinned to a "
               "release the app can install; approve one (the bench command asks), then run apply again")
+    blocked = [line[:-len(bench_config.NO_RELEASE)] for line in bench_config.constraint_lines(config)[0]
+               if line.endswith(bench_config.NO_RELEASE)]
+    if blocked:
+        print("note: the development packages of an app whose baseline does not pin them (" + ", ".join(blocked)
+              + ") cannot be installed into this bench on purpose: the constraint files hold a line no release "
+              "satisfies for each, so bench fails on them even if developer_mode is turned on while it runs")
     for path in result.dropped:
         print(f"no longer recorded: {path} (its app is not in the bench any more; the file itself is left as it is)")
     if not result.written and not result.dropped:

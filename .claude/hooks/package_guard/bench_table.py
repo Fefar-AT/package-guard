@@ -238,8 +238,12 @@ def _setup(args) -> Verdict:
         apps = _apps(positional)
         if isinstance(apps, str):
             return Verdict("refuse", "setup requirements", code="unsupported-form", reason=apps)
+        # bench's own dispatch (`bench/commands/setup.py`): with neither --node nor --python (and no --dev) it
+        # runs `Bench.setup.requirements` -> `install_app`; with exactly one of them, that part only; with
+        # --dev, or with --node AND --python together, it falls to the last branch and installs ONLY the
+        # development dependencies. Both of those spellings are `dev`.
         return Verdict("scope", "setup-requirements", apps, node="--node" in flags,
-                       python="--python" in flags, dev="--dev" in flags)
+                       python="--python" in flags, dev="--dev" in flags or ("--node" in flags and "--python" in flags))
     key = f"setup {sub}"
     if key in _HUMAN:
         return _refuse(key, _HUMAN[key])

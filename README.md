@@ -72,7 +72,7 @@ second prompt. More in [What you will see](DETAILS.md#what-you-will-see).
 | OS | macOS, Linux, WSL2, native Windows (needs Git for Windows) | |
 | JavaScript | `npm`, `npx`, `pnpm`, `bun`, Yarn Berry 4.14+, Yarn Classic (in a Frappe bench) | `corepack`, Plug'n'Play |
 | Python | `pip`, `uv` | `pipx`, `poetry`, `conda` |
-| Frappe / ERPNext bench | v15 and v16 verified on a real bench; v14 and v11–v13 not confirmed yet (see [DETAILS](DETAILS.md#frappe--erpnext)) | `bench init`, `get-app`, `update` (except `--requirements`), `switch-to-branch`, `setup env` |
+| Frappe / ERPNext bench | v11 to v16 run on a real bench (v15 and v16 also on x86_64); see [DETAILS](DETAILS.md#frappe--erpnext) for the notes on old versions | `bench init`, `get-app`, `update` (except `--requirements`), `switch-to-branch`, `setup env` |
 
 A project that uses a refused tool cannot use the guard yet. Details and
 lockfile rules: [Supported package managers](DETAILS.md#supported-package-managers).

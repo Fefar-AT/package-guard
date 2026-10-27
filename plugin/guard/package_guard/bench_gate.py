@@ -193,6 +193,49 @@ def frappe_major(bench) -> int | None:
     return int(version.split(".")[0])
 
 
+# -- developer_mode ------------------------------------------------------------------
+
+DEVELOPER_MODE_FILE = ("sites", "common_site_config.json")
+
+
+def developer_mode(bench) -> tuple:
+    """(on, why) for the bench's `developer_mode`, read as bench reads it.
+
+    Bench reads one place: `sites/common_site_config.json` (`Bench.conf` -> `get_config`; `bench set-config
+    -g` writes it; `install_app` asks `conf.get("developer_mode")`, plain Python truthiness, so the string
+    "0" counts as on). No such file is an empty config, which is off. A file that is there and cannot be
+    read, is not JSON, or is not an object cannot be answered, so it counts as ON: `why` says so."""
+    path = Path(bench).joinpath(*DEVELOPER_MODE_FILE)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False, ""
+    except (OSError, UnicodeDecodeError) as exc:
+        return True, f"{path} cannot be read ({exc.__class__.__name__})"
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return True, f"{path} is not valid JSON"
+    if not isinstance(data, dict):
+        return True, f"{path} is not a JSON object"
+    return bool(data.get("developer_mode")), ""
+
+
+def dev_gaps(coverings, apps) -> list:
+    """[(app name, baseline id, why)] for each of `apps` that an approved baseline covers and whose development
+    dependencies the baseline does not pin (see `baseline.dev_problem`)."""
+    import baseline
+    gaps = []
+    for app in apps:
+        covering = coverings.get(Path(app))
+        if not covering or covering.get("kind") != "baseline":
+            continue
+        why = baseline.dev_problem(covering["baseline"], app)
+        if why:
+            gaps.append((Path(app).name, covering["baseline"]["id"], why))
+    return gaps
+
+
 # -- the env -------------------------------------------------------------------------
 
 def editable_installs(env) -> dict:

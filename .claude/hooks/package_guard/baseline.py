@@ -63,6 +63,7 @@ OWNERS_FILENAME = "git-owners.json"
 AUDIT_CACHE_FILENAME = "audit-cache.json"
 MALWARE_LATCH_FILENAME = "malware-latch.json"
 
+_JOINT_KEYS = {"git_url", "commit", "names", "version", "release"}
 IDENTITY_KEYS = ("schema_version", "kind", "app", "base", "manifests", "python", "js", "legacy")
 # Never part of the identity: they change between a proposal and its approval and
 # with the date of the query.
@@ -253,6 +254,21 @@ def shape_problems(doc) -> list:
         compile_ = python.get("compile")
         need(isinstance(compile_, dict) and compile_.get("no_build") is True,
              "python.compile.no_build is not true")
+        joint_with = compile_.get("joint_with") if isinstance(compile_, dict) else None
+        need(joint_with is None or (isinstance(joint_with, list) and all(
+            isinstance(j, dict) and set(j) in ({"git_url", "commit"}, _JOINT_KEYS) and isinstance(j["git_url"], str)
+            and _REPO_URL.match(j["git_url"]) and isinstance(j["commit"], str) and _COMMIT.match(j["commit"])
+            and (set(j) == {"git_url", "commit"} or (
+                isinstance(j["names"], list) and all(isinstance(n, str) and n for n in j["names"])
+                and isinstance(j["version"], str) and isinstance(j["release"], str)))
+            for j in joint_with)),
+             "python.compile.joint_with is not a list of {git_url, commit, names, version, release}")
+        dev = python.get("dev")
+        need(dev is None or (isinstance(dev, dict) and set(dev) == {"pinned", "names", "reason"}
+                             and isinstance(dev["pinned"], bool) and isinstance(dev["reason"], str)
+                             and isinstance(dev["names"], list) and all(isinstance(n, str) and n for n in dev["names"])
+                             and (dev["pinned"] or dev["reason"])),
+             "python.dev is not {pinned, names, reason} (a reason is required when pinned is false)")
     js = doc.get("js")
     if not isinstance(js, dict) or not isinstance(js.get("locks"), list):
         problems.append("js.locks is not a list")
@@ -905,8 +921,30 @@ def usable_problems(root, doc: dict, now=None, owners=None, malware_only=False) 
     why = owner_problem(doc["app"]["git_url"], allowed)
     if why:
         problems.append(why)
+    clashes = pin_conflicts(doc["python"]["pins"])
+    if clashes:
+        problems.append("it contradicts itself: " + "; ".join(f"{n} is pinned to {a} and to {b}" for n, a, b in clashes[:4])
+                        + f" (planned by an earlier release). Plan the app again: the new plan is one resolution and "
+                        f"gets a new id; approve that, and the old one can be revoked (`cli.py baseline revoke {doc['id']}`)")
     problems += audit_problems(root, doc, now, malware_only)
     return problems
+
+
+def pin_conflicts(pins) -> list:
+    """[(name, version, other version)] for one package pinned two ways where both apply: in the same
+    constraint file (runtime or build; development pins go into the runtime file) and with markers that can
+    hold at once (as `bench_config` unions them)."""
+    runtime = lambda section: "build" if section == "build" else "runtime"
+    found = []
+    for i, pin in enumerate(pins):
+        for other in pins[i + 1:]:
+            if (normalize_py(other["name"]) == normalize_py(pin["name"]) and other["version"] != pin["version"]
+                    and runtime(other["section"]) == runtime(pin["section"])
+                    and (not other.get("markers") or not pin.get("markers") or other["markers"] == pin["markers"])):
+                item = (normalize_py(pin["name"]), *sorted([pin["version"], other["version"]]))
+                if item not in found:
+                    found.append(item)
+    return sorted(found)
 
 
 def audit_problems(root, doc: dict, now=None, malware_only=False) -> list:
@@ -1530,6 +1568,52 @@ def build_lines(doc: dict) -> list:
     return lines
 
 
+def dev_problem(doc: dict, app_dir=None) -> str:
+    """Why `bench` installing this app's development dependencies (it does when `developer_mode` is on) is not
+    covered by the baseline: a plain sentence, or "" when it is covered.
+
+    A baseline planned by this release records it (`python.dev`). One planned before has pins of section "dev"
+    when the app had development dependencies (v1.12.1 pinned them), so those are covered; one with none
+    covers the app only if the app declares none, which the app's own files (their digests are the
+    baseline's) say. A file that cannot be read counts as not covered."""
+    python = doc["python"]
+    record = python.get("dev")
+    if isinstance(record, dict):
+        return "" if record.get("pinned") is True else (record.get("reason") or "no reason was recorded")
+    if any(p["section"] == "dev" for p in python["pins"]):
+        return ""
+    if app_dir is None:
+        return "the baseline does not say whether the development dependencies are pinned"
+    app_dir = Path(app_dir)
+    try:
+        data = tomllib.loads((app_dir / "pyproject.toml").read_text(encoding="utf-8")) \
+            if (app_dir / "pyproject.toml").is_file() else {}
+        tool = data.get("tool") if isinstance(data.get("tool"), dict) else {}
+        bench = tool.get("bench") if isinstance(tool.get("bench"), dict) else {}
+        declared = bool(bench.get("dev-dependencies")) or (app_dir / "dev-requirements.txt").is_file()
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return "the app's development dependencies cannot be read"
+    return ("the baseline was planned before development dependencies were pinned, and the app declares some"
+            if declared else "")
+
+
+def _joint_lines(python: dict) -> list:
+    lines = []
+    for mate in python["compile"].get("joint_with") or []:
+        text = (f"  resolved together with the requirements of {mate['git_url']} at {mate['commit']}"
+                " (its packages are not in this list unless this app needs them too)")
+        if "release" in mate:
+            names = ", ".join(mate["names"]) or "none declared"
+            text += f"\n    that app: version {mate['version'] or 'unknown'}; distribution name(s) {names} (left out as local code); "
+            if mate["release"] == "none":
+                text += ("WARNING: that commit is neither on the release branch for its version nor a release tag. "
+                         "Its requirements shaped these pins; check the commit before approving.")
+            else:
+                text += f"that commit is on its release ({mate['release']})."
+        lines.append(text)
+    return lines
+
+
 def prompt_text(doc: dict, owners=None) -> str:
     """The approval prompt, in the order a person needs to decide."""
     app = doc["app"]
@@ -1550,6 +1634,24 @@ def prompt_text(doc: dict, owners=None) -> str:
         "Python pins: " + (", ".join(f"{n} {s}" for s, n in sorted(sections.items())) or "none")
         + f"; locked JS packages: {js_count}; git entries: {len(python['git']) + len(js_git)}",
     ]
+    lines += _joint_lines(python)
+    if python["excluded_local_names"]:
+        lines.append("Left out of the resolution as local apps (never installed from a registry): "
+                     + ", ".join(python["excluded_local_names"]))
+    dev = python.get("dev")
+    dev_count = sections.get("dev", 0)
+    if not isinstance(dev, dict) and not dev_count:
+        pass    # a baseline planned before the record existed: nothing to say
+    elif isinstance(dev, dict) and not dev["names"]:
+        lines.append("Development dependencies (installed when developer_mode is on): the app declares none")
+    elif dev_problem(doc) == "":
+        lines.append("Development dependencies (installed when developer_mode is on): pinned, "
+                     f"{dev_count} pins, part of this baseline")
+    else:
+        lines.append("Development dependencies (installed when developer_mode is on): NOT pinned by this baseline: "
+                     + dev_problem(doc) + " While developer_mode is on, Package Guard refuses the bench commands "
+                     "that install apps; turn developer_mode off for the install. These packages also cannot be installed "
+                     "into this bench at all: bench-config writes a constraint no release satisfies for each.")
     for git in python["git"]:
         lines.append(f"  git (Python): {git['name']} from {git['owner']}/{git['repo']} at {git['commit']}")
     for git in js_git:
@@ -1800,8 +1902,8 @@ def custom_range_pins(root, apps, local_names, runtime, build):
 
 def config_input(root, bench, toolchain=(), no_symlinks=False, now=None):
     """The `bench_config.ConfigInput` for `bench`, built from the approved
-    baselines of its apps: the union of their pins (run and dev into
-    the runtime constraint, build into the build constraint, markers kept), the
+    baselines of its apps: the union of their pins (run and dev into the runtime constraint, build into the
+    build constraint, markers kept), the
     names whose build from source a person allowed, the local app pins and the
     local names that are not present.
 
@@ -1825,7 +1927,11 @@ def config_input(root, bench, toolchain=(), no_symlinks=False, now=None):
             raise BaselineError(f"apps/{app.name} is an upstream app no approved baseline covers "
                                 f"({'; '.join(uncovered[app.name][:2])}); plan one: `cli.py baseline plan --app apps/{app.name}`")
     runtime, build, allowed, other = [], [], set(), set(normalize_py(n) for n in FRAPPE_APP_NAMES)
+    dev_blocked = set()
     for _name, doc in sorted(covered.items()):
+        record = doc["python"].get("dev")
+        if isinstance(record, dict) and record.get("pinned") is False:
+            dev_blocked |= {normalize_py(n) for n in record["names"]}
         for pin in doc["python"]["pins"]:
             item = bc.Pin(normalize_py(pin["name"]), pin["version"], pin.get("markers") or "", doc["id"])
             (build if pin["section"] == "build" else runtime).append(item)
@@ -1859,8 +1965,8 @@ def config_input(root, bench, toolchain=(), no_symlinks=False, now=None):
     config = bc.ConfigInput(
         runtime=tuple(runtime), build=tuple(build), unpinned=tuple(unpinned),
         requirement_names=tuple(sorted({normalize_py(p.name) for p in (*runtime, *build, *toolchain)}
-                                       | declared_names | allowed | approved)),
-        toolchain=toolchain,
+                                       | declared_names | allowed | approved | dev_blocked)),
+        toolchain=toolchain, dev_blocked=tuple(sorted(dev_blocked)),
         allowed_builds=tuple(sorted(allowed)), local_apps=tuple(sorted(local)),
         other_local_names=tuple(sorted(other - present)), no_symlinks=no_symlinks)
     try:
@@ -1875,6 +1981,14 @@ def _clash_message(text, covered) -> str:
     which one to plan again (the later approved), and how."""
     ids = list(dict.fromkeys(re.findall(r"bl-[0-9a-f]{12}", text)))
     by_id = {doc["id"]: (name, doc) for name, doc in covered.items()}
+    if len(ids) == 1 and len(re.findall(r"bl-[0-9a-f]{12}", text)) > 1 and ids[0] in by_id:
+        # one baseline against itself: planning it again with the same release gives the same id; only a
+        # plan from a release that resolves an app as one set gives another
+        return (text.split(": the constraint files")[0] + f". {ids[0]} (apps/{by_id[ids[0]][0]}) contradicts itself: "
+                "it was planned by an earlier release of Package Guard. Ask the user to plan the app again with "
+                f"this release (`cli.py baseline plan --app apps/{by_id[ids[0]][0]}`) and approve the new proposal; "
+                f"it resolves the app as one set, and the old baseline can then be revoked "
+                f"(`cli.py baseline revoke {ids[0]}`).")
     known = [i for i in ids if i in by_id]
     later = max(known, key=lambda i: (by_id[i][1].get("approval") or {}).get("approved_at") or "") if known else None
     advice = ""

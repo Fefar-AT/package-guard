@@ -466,6 +466,16 @@ set of versions fits all of them, the plan says so and names the packages that
 clash. If `bench-config apply` refuses because two baselines you approved earlier
 clash, plan the later app again and approve the new plan.
 
+**`developer_mode`.** With `developer_mode` on (`sites/common_site_config.json`), bench also
+installs each app's development dependencies (test tools such as `hypothesis`) whenever it installs
+an app: `bench setup requirements`, `bench update --requirements` and `bench new-app`. A plan
+resolves that set with the runtime set and the other apps' development sets, and the approval text
+says "pinned" or "NOT pinned". When it is not pinned (Frappe v14 is the known case: frappe and
+ERPNext ask for different `hypothesis` releases), those three commands are refused while
+`developer_mode` is on, or while the file cannot be read. To install, turn it off, run the
+command, and turn it back on: `bench set-config -g developer_mode 0`, the command,
+`bench set-config -g developer_mode 1`. `bench setup requirements --dev` is never run by Claude.
+
 **Run again after you add an app.** `bench new-app` (and `bench get-app`, which
 is yours to run) adds a folder the guard has not written files for. The next
 bench command says a `.yarnrc` or another file is missing: run `bench-config
@@ -566,10 +576,63 @@ it does not use pip. Frappe 16.53.0 and ERPNext 16.52.1 (Python 3.14, Node 24)
 ran on the same lab: plan, approve, apply, `bench setup requirements`, `bench
 build` with ERPNext's `banking/` route, and the site served its login page; the
 typo, fake `frappe` and malware installs were refused on both versions. The
-tests run the whole flow offline on v15. Frappe v14 uses the same steps as v15
-but has not been run on a real bench. Frappe v11 to v13 use older Python and Node: their baselines are planned
-from recorded runs, show many more known bugs, and have not been run on a real
-bench.
+tests run the whole flow offline on v15.
+
+Older versions, run on real benches in Docker (frappe-bench 5.31.1; each:
+plan, approve, apply, `bench setup requirements`, `bench build`, the login page,
+and the typo, fake `frappe`, malware, `setup.py develop` and typo-Yarn
+refusals):
+
+- **v14** (Frappe 14.101.1, ERPNext 14.92.14, Python 3.10): works since this
+  release. Before it, the two baselines could not be approved together.
+- **v13** (13.58.22 / 13.55.2, Python 3.8, Node 14), **v12** (12.28.2 / 12.31.0,
+  Python 3.7, Node 12) and **v11** (11.1.69 / 11.1.77, Python 3.7, Node 10): work,
+  with the notes below. Their baselines show many more known bugs; that is
+  information, not a block. v11 needed the fix of this release: `bench setup
+  requirements` stopped at the first app, because the baseline's date (2020)
+  picked a `setuptools` too old for the editable install bench makes. The plan now
+  pins one that can (68.0.0 on Python 3.7), shows it, and you approve it with the
+  baseline. A v11 baseline approved with v1.12.1 must be planned and approved again.
+
+All of this ran on Linux arm64 in Docker. Frappe v15 and v16 also ran on Linux
+x86_64: plan, approve, apply, `bench setup requirements`, `bench build`, the
+refusals and `developer_mode` all passed. Frappe v14 on x86_64 passed everything
+except a complete `bench setup requirements`, which a slow network stopped
+mid-download. Where a note below talks about building from source, x86_64 may
+need less of it.
+
+**Notes for the old versions.**
+
+- **PyPDF2 1.26.0 (v11 to v13).** The current bench installs with `uv`, and `uv`
+  cannot unpack the PyPDF2 1.26.0 source archive (`Invalid tar file`), so
+  `bench init` or `bench setup requirements` stops there. That is a bench problem,
+  not the guard's. Do it yourself, once, in your own terminal: build a wheel
+  (`pip wheel --no-deps pypdf2==1.26.0 -w ~/wheelhouse`) and install it into the
+  bench env (`uv pip install --python env/bin/python ~/wheelhouse/PyPDF2-*.whl`);
+  `bench setup requirements` then goes on. Claude cannot do this for you with
+  `UV_FIND_LINKS`: the guard refuses it, because it changes where `uv` downloads
+  from.
+- **`bench build` on v12 and v13 and node-sass.** Install scripts stay off, so
+  node-sass has no compiled part. `bench build` then prints "You need to install
+  either node-sass or sass", still says it built, and keeps the old CSS. Run the
+  step the plan prints, yourself, once: `cd apps/frappe/node_modules/node-sass &&
+  node scripts/install.js && node scripts/build.js`. On v12 it needs `python2` on
+  the machine. v11's build does not need node-sass.
+- **v11's own pins.** Jinja2 2.11.1 with a newer `markupsafe` fails to import
+  (`cannot import name 'soft_unicode'`), and `pandas` 0.24.2 has metadata `uv`
+  cannot read (`pytz (>=2011k)`), so `get-app erpnext` fails. These are upstream
+  problems. The baseline pins `markupsafe` 2.0.1, which works. For pandas, build
+  the wheel yourself (`pip wheel pandas==0.24.2`), change `pytz (>=2011k)` to
+  `pytz (>=2011)` in its METADATA, and install it with `--no-deps`.
+- **ARM machines and v12.** Rebuilding an old v12 env from nothing can need
+  source builds the plan did not list (`psycopg2-binary` 2.8.4 and `maxminddb`
+  have no wheel for old Python on arm64). The guard then stops with a "no usable
+  wheels" error. This is a known limit and is not fixed; an env that already has
+  those packages is not affected.
+- **`bench setup requirements --dev` is refused.** The apps' development
+  dependencies (test tools such as `hypothesis`) are pinned in the baseline when
+  the apps agree on them; when they do not (v14), installs are refused while
+  `developer_mode` is on (see `developer_mode` above).
 
 ## Turning it down: modes
 

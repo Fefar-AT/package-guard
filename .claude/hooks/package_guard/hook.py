@@ -5206,6 +5206,40 @@ def _unapproved(root, request) -> bool:
         return True
 
 
+def _installs_app(scope) -> bool:
+    """True for the bench verbs that reach `bench.app.install_app`, which installs an app's development
+    dependencies (`install_python_dev_dependencies`) when `developer_mode` is on: `setup requirements` with
+    neither --node nor --python (one of them alone is `Bench.setup.python` / `.node`, which do not),
+    `update --requirements` (= `setup requirements`) and `new-app`. Every other verb that reaches it
+    (`get-app`, `init`, `switch-to-branch`, `migrate-env`, plain `update`, ...) is refused whole."""
+    if scope.verb == "setup-requirements":
+        return not scope.node and not scope.python
+    return scope.verb in ("update-requirements", "new-app")
+
+
+def _developer_mode_denial(scope, bench, coverings, involved) -> str:
+    """The refusal text when `developer_mode` is on (or cannot be read, which counts as on) and the install would
+    also install development dependencies that no approved baseline pins; else ""."""
+    on, unreadable = bench_gate.developer_mode(bench)
+    if not on:
+        return ""
+    gaps = bench_gate.dev_gaps(coverings, involved)
+    if scope.verb == "new-app":
+        gaps.append(("the new app", "", "it does not exist yet, so its development dependencies cannot be checked"))
+    if not gaps:
+        return ""
+    state = (f"{unreadable}, so Package Guard treats developer_mode as on" if unreadable
+             else "developer_mode is on in this bench (sites/common_site_config.json)")
+    return (
+        f"{state}. While it is on, bench also installs the development dependencies (test tools such as hypothesis) "
+        "of every app it installs, from the registry, at whatever release is newest, and the approved baseline does "
+        "not pin them: "
+        + "; ".join(f"{name}{f' ({bid})' if bid else ''}: {why.rstrip('.')}" for name, bid, why in gaps[:4])
+        + ". So this command is not run. To go on, turn developer_mode off for the install, run the command, "
+        "then turn it back on: `bench set-config -g developer_mode 0`, then this command, then "
+        "`bench set-config -g developer_mode 1`. Nothing was installed.")
+
+
 def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=None, notes=None):
     """(denial or None, [PackageRequest] still to review, [{"app", "baseline"}] covered).
 
@@ -5224,6 +5258,17 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
     def deny(code, text):
         return _bench_deny(code, text), [], []
 
+    if scope.verb == "setup-requirements" and scope.dev:
+        # The strict option, and the simple one: `--dev` (and `--node --python`, which bench reads the same way)
+        # is never run here, whatever the baselines pin. With developer_mode on, plain `bench setup
+        # requirements` installs the development set a baseline pins, and refuses (below) when one does not.
+        return deny("PACKAGE_GUARD_UNSUPPORTED", (
+            "`bench setup requirements --dev` (and `--node --python` together, which bench reads the same way) "
+            "installs only the apps' development dependencies (test tools such as hypothesis). Package Guard does "
+            "not run that form. If the approved baselines pin the development dependencies, turning developer_mode "
+            "on (`bench set-config -g developer_mode 1`) makes plain `bench setup requirements` install them, pinned; "
+            "otherwise installing them is a step for the user, in their own terminal. Tell the user."))
+
     problems = bench_gate.read_problems(root)
     if problems:
         return deny("PACKAGE_GUARD_BENCH_CONFIG", "a bench command left something wrong that nobody has resolved yet:\n"
@@ -5233,14 +5278,16 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
     why = bench_config.redirect_problem()
     if why:
         return deny("PACKAGE_GUARD_UNSUPPORTED", why + ".")
-    bench = bench_config.bench_root(cwd)
+    bench, why = bench_config.bench_for_verb(cwd)
     if bench is None:
-        return deny("PACKAGE_GUARD_UNSUPPORTED", f"no Frappe bench (a directory with apps/ and sites/) holds {cwd}; "
-                    "run the command from the bench root or from an app inside it.")
+        return deny("PACKAGE_GUARD_UNSUPPORTED", why.rstrip(".") + ".")
     if not _within(bench, root):
         return deny("PACKAGE_GUARD_UNSUPPORTED", f"the bench at {bench} is outside the project Package Guard protects "
                     f"({os.path.realpath(root)}): its baselines and configuration would be somebody else's. "
                     "Install the guard at the bench root.")
+    why = bench_config.recorded_bench_problem(bench, root)
+    if why:
+        return deny("PACKAGE_GUARD_BENCH_CONFIG", why.rstrip(".") + ".")
     if not env_install:
         try:
             install = bench_gate.read_bench_install(os.environ.get("PATH"), executable=scope.executable,
@@ -5332,6 +5379,10 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
                     + ", ".join(f"{name} ({bid})" for bid, name in absent[:5])
                     + ". An app comes from `bench get-app`, which is the user's command, never from PyPI, so nothing "
                     "here may install the name. Tell the user.")
+    if _installs_app(scope):
+        text = _developer_mode_denial(scope, bench, coverings, involved)
+        if text:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", text)
     unbuilt = bench_gate.unapproved_builds(docs)
     if unbuilt and not runner:
         return deny("PACKAGE_GUARD_BASELINE_REQUIRED", "a baseline lists packages that build from source at install and "
@@ -5657,7 +5708,7 @@ def _bench_gate(parsed, event, root, command):
         extras += more
         covered += found
     if covered:
-        bench = bench_config.bench_root(cwd)
+        bench = bench_config.bench_for_verb(cwd)[0]
     if bench is not None:
         bench_gate.record_allowed(root, bench, covered, event.get("tool_use_id"), command)
     return None, extras, list(dict.fromkeys(yarn_targets)), list(dict.fromkeys(notes))
