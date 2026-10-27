@@ -32,6 +32,11 @@ is refused by name):
   pnpm yaml/json  see `_PNPM_*`: the pnpm-workspace.yaml and package.json `pnpm`
                   settings, plus pnpm's own global rc and config.yaml.
 
+  .yarnrc         Yarn Classic (v1), see `yarn_classic_config`: the files Yarn 1.22 reads
+                  in its own order, an allow-list of keys (`registry` official only,
+                  `ignore-scripts`, `--install.frozen-lockfile`, display and tuning
+                  options), and the effective scripts-off and frozen-lockfile proofs.
+
 Standard library only.
 """
 from __future__ import annotations
@@ -41,6 +46,7 @@ import os
 import re
 import tomllib
 from pathlib import Path
+from typing import NamedTuple
 
 import pnpm_lock
 import protocols
@@ -252,6 +258,9 @@ def yarn_env_problem(name, value, home=None):
         return None
     if name.upper() == "YARN_RC_FILENAME":
         return "renames the rc file Package Guard reads"
+    classic = _classic_env_problem(name.upper(), value)
+    if classic is not _NOT_CLASSIC:
+        return classic
     value = _ENV_BOOLS.get(str(value).strip().lower(), value)
     home = Path.home() if home is None else home
     return yarn_key_problem(key, value, home, in_project=True)
@@ -335,6 +344,559 @@ def yarn_config_problems(directory, home, environ=None, require_linker=True) -> 
             "defaults to Plug'n'Play, which has no node_modules tree Package Guard can inspect; "
             "add `nodeLinker: node-modules` (the human's to do)")
     return problems
+
+
+# ---------------------------------------------------------------------------
+# Yarn Classic (v1): which Yarn, and the configuration it reads
+#
+# Everything below is read from Yarn 1.22.22's own source (src/rc.js, src/util/rc.js,
+# src/registries/yarn-registry.js, src/registries/base-registry.js, src/config.js,
+# src/cli/index.js), not assumed. The facts the gate rests on:
+#
+#   * `.yarnrc` keys that start `--` are CLI flags: `--install.frozen-lockfile true` becomes
+#     `--frozen-lockfile` for the `install` command only; a key with no `<command>.` applies to
+#     every command. Only a bare `true` pushes a boolean flag. A bare key (`frozen-lockfile
+#     true`) is an option no command reads.
+#   * `ignore-scripts` is OR-ed: `config.ignoreScripts = flag || Boolean(option)`. The flag
+#     comes from the command line or a `--...ignore-scripts true` rc key; the option from the
+#     env (`YARN_IGNORE_SCRIPTS`) over the rc files.
+#   * The flag keys are read by `rc.js` from every `.yarnrc` AND `.yarnrc.yml` from the root down
+#     to the working directory, then /etc/yarn/config, /etc/yarnrc, the user files under
+#     ~/.config/yarn, ~/.yarn and ~/.yarnrc, then the file named by YARN_CONFIG; a LATER file
+#     wins, so the user's files beat the project's. The option keys are read by the registry
+#     from the PROJECT ROOT's `.yarnrc` (the nearest ancestor with a package.json: install, add
+#     and remove run there, `findProjectRoot`), then `~/.yarnrc`, then <prefix>/etc/yarnrc, then
+#     each parent's `.yarnrc`; the FIRST file wins, and `.yarnrc.yml` is not among them.
+#   * `yarn-path` / `yarnPath` in any rc file (a `.yml` too) hands the whole command to
+#     another program. `--use-yarnrc` and `--no-default-rc` change which files are read.
+#   * `YARN_<NAME>` (lower-cased, `_` to `-`) sets the option of that name before any rc file.
+# ---------------------------------------------------------------------------
+
+CLASSIC, BERRY = "classic", "berry"
+_NOT_CLASSIC = object()
+
+
+class Flavour(NamedTuple):
+    """Which Yarn a project uses. `kind` is "classic", "berry" or None; `conflict` says why
+    the evidence points both ways; `evidence` lists what was found; `project` is the
+    directory it was found in."""
+    kind: object
+    evidence: tuple
+    conflict: object
+    project: object
+
+
+def classic_enabled() -> bool:
+    import parser as pg_parser  # local: parser imports this module
+    return pg_parser.YARN_CLASSIC_ENABLED
+
+
+def _yarn_project_dir(directory):
+    """The project a shell directory belongs to: the nearest directory at or above it with a
+    package.json or a yarn.lock, else the directory itself."""
+    for candidate in _ancestors(directory):
+        if (candidate / "package.json").is_file() or (candidate / "yarn.lock").is_file():
+            return candidate
+    return Path(os.path.realpath(directory))
+
+
+def _declared_yarn(project):
+    """[(where, version)] for each `yarn` entry of package.json's packageManager and
+    devEngines.packageManager. A pin that names another manager is not Yarn evidence."""
+    data = _package_json(project)
+    if not isinstance(data, dict):
+        return []
+    found = []
+    field = data.get("packageManager")
+    if isinstance(field, str):
+        name, _, version = field.partition("@")
+        if name == "yarn":
+            found.append(("packageManager", version.partition("+")[0]))
+    dev = data.get("devEngines")
+    entries = dev.get("packageManager") if isinstance(dev, dict) else None
+    if isinstance(entries, dict):
+        entries = [entries]
+    for entry in entries if isinstance(entries, list) else ():
+        if isinstance(entry, dict) and entry.get("name") == "yarn":
+            version = entry.get("version")
+            found.append(("devEngines.packageManager", version if isinstance(version, str) else ""))
+    return found
+
+
+def _lock_flavour(path):
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(8192).decode("utf-8", "replace")
+    except OSError:
+        return None
+    lines = ("\n" + head.lstrip("\ufeff")).split("\n")
+    if any(line.strip() == "# yarn lockfile v1" for line in lines if line.startswith("#")):
+        return CLASSIC
+    if any(line.startswith("__metadata:") for line in lines):
+        return BERRY
+    return None
+
+
+# Directories whose `.yarnrc` is one `bench-config apply` wrote and nobody has changed since: the
+# hook fills this at the start of each decision. A `.yarnrc` the guard did not write is not evidence
+# (Berry ignores it too); one the guard wrote for a bench app says which Yarn that app is meant for,
+# which an app with no yarn.lock yet cannot say itself.
+GUARD_YARNRC_DIRS: set = set()
+
+
+def yarn_flavour(directory) -> Flavour:
+    """Classify `directory`'s yarn ONCE: every Classic rule and every Berry rule calls this.
+
+    Evidence: `packageManager` / `devEngines.packageManager` (yarn@1.x is Classic, yarn@2 or
+    later is Berry), a `.yarnrc.yml` in the directory chain (Berry), the header of yarn.lock
+    (`# yarn lockfile v1` is Classic, `__metadata` is Berry). Evidence that points both ways
+    is a conflict. No evidence is not Classic: a `yarn` on PATH may be Berry, which migrates a
+    v1 lock silently. With the Classic switch off nothing is ever Classic."""
+    project = _yarn_project_dir(directory)
+    if not classic_enabled():
+        return Flavour(None, (), None, project)
+    evidence = {CLASSIC: [], BERRY: []}
+    for where, version in _declared_yarn(project):
+        match = re.match(r"^[~^>=<\s]*(\d+)", version or "")
+        if match:
+            major = int(match.group(1))
+            evidence[CLASSIC if major == 1 else BERRY if major >= 2 else CLASSIC].append(
+                f"{where} yarn@{version}")
+    for parent in _ancestors(directory):
+        if (parent / ".yarnrc.yml").is_file():
+            evidence[BERRY].append(f"{parent / '.yarnrc.yml'}")
+            break
+    if os.path.realpath(project) in GUARD_YARNRC_DIRS:
+        evidence[CLASSIC].append(f"{project / '.yarnrc'} is the Classic rc file the guard wrote for this bench")
+    lock = project / "yarn.lock"
+    if lock.is_file():
+        found = _lock_flavour(lock)
+        if found:
+            evidence[found].append(f"{lock} is a {'Classic v1' if found == CLASSIC else 'Berry'} lock")
+    both = tuple(evidence[CLASSIC] + evidence[BERRY])
+    if evidence[CLASSIC] and evidence[BERRY]:
+        return Flavour(None, both, (
+            f"Evidence of Yarn Classic ({'; '.join(evidence[CLASSIC])}) conflicts with evidence of "
+            f"Yarn Berry ({'; '.join(evidence[BERRY])}); a Berry binary would migrate a Classic "
+            "lock and install versions nobody reviewed"), project)
+    kind = CLASSIC if evidence[CLASSIC] else BERRY if evidence[BERRY] else None
+    return Flavour(kind, both, None, project)
+
+
+# -- the .yarnrc reader -------------------------------------------------------
+
+def _rc_token(text, pos, path, no):
+    if pos >= len(text):
+        raise ConfigError(f"{path} line {no}: a key with no value")
+    if text[pos] == '"':
+        try:
+            value, length = json.JSONDecoder().raw_decode(text[pos:])
+        except ValueError:
+            raise ConfigError(f"{path} line {no}: an unterminated or invalid quoted string") from None
+        if not isinstance(value, str):
+            raise ConfigError(f"{path} line {no}: a quoted string that is not text")
+        if "\\" in text[pos:pos + length]:
+            # Yarn's quote scanner and JSON disagree about an escaped quote; a real .yarnrc has none.
+            raise ConfigError(f"{path} line {no}: a backslash inside a quoted string")
+        return value, pos + length, True
+    end = pos
+    while end < len(text) and text[end] not in ' \t':
+        end += 1
+    word = text[pos:end]
+    if not word or any(c in word for c in ':,"[]\\'):
+        raise ConfigError(f"{path} line {no}: {word!r} is not a plain word (quote it)")
+    # Yarn's tokenizer reads a bare word only if it starts with a letter, `/`, `.` or `-`; a run of
+    # digits is a number; `true` and `false` are booleans WHERE THEY START, so `trueish` is a
+    # boolean followed by garbage. Anything else fails its native parse, and Yarn then reads the
+    # whole file as YAML, which is not the mapping this reader saw.
+    if word.startswith(("true", "false")) and word not in ("true", "false"):
+        raise ConfigError(f"{path} line {no}: {word!r} starts with a boolean; Yarn reads it as one "
+                          "followed by garbage and then reads the whole file differently (quote it)")
+    if not (re.match(r"[A-Za-z/.\-]", word) or word.isdigit()):
+        raise ConfigError(f"{path} line {no}: {word!r} is not a word Yarn's own reader accepts "
+                          "unquoted (quote it)")
+    return word, end, False
+
+
+def _parse_classic_rc(text, path):
+    """A `.yarnrc` as Yarn's own lockfile parser reads it, restricted to what it writes: one
+    `key value` pair per line, each a bare word or a JSON string, `#` comments, no nesting.
+    A value is `true`/`false` (a boolean), digits (a number) or text; a duplicate key (Yarn
+    keeps the last) is refused. Anything else cannot be read the way Yarn reads it."""
+    out = {}
+    for no, raw in enumerate(text.replace("\r\n", "\n").split("\n"), 1):
+        line = raw.strip()
+        if "\r" in raw:
+            raise ConfigError(f"{path} line {no}: a bare carriage return")
+        if line.startswith(("<<<<<<<", "=======", ">>>>>>>")):
+            raise ConfigError(f"{path} line {no}: a merge-conflict marker")
+        if line.startswith("#"):
+            if re.match(r"#\s*yarn lockfile v", line) and line != "# yarn lockfile v1":
+                raise ConfigError(f"{path} line {no}: a lockfile version comment Yarn would reject")
+            continue
+        if not line:
+            continue
+        if raw[:1] in " \t":
+            raise ConfigError(f"{path} line {no}: an indented line (a nested value is not read)")
+        key, pos, key_quoted = _rc_token(line, 0, path, no)
+        if not key_quoted and (key.isdigit() or key in ("true", "false")):
+            raise ConfigError(f"{path} line {no}: a key that Yarn reads as a number or a boolean")
+        if line[pos:pos + 1] != " ":
+            raise ConfigError(f"{path} line {no}: {key!r} is not followed by a value")
+        value, end, quoted = _rc_token(line, pos + 1, path, no)
+        if end != len(line):
+            raise ConfigError(f"{path} line {no}: unexpected text after the value")
+        if not quoted:
+            if value == "true":
+                value = True
+            elif value == "false":
+                value = False
+            elif value.isdigit():
+                value = int(value)
+            elif value[:1].isdigit():
+                raise ConfigError(f"{path} line {no}: {value!r} reads as a number and then garbage; quote it")
+        if key in out:
+            raise ConfigError(f"{path} line {no}: {key!r} appears twice (Yarn keeps the last)")
+        out[key] = value
+    return out
+
+
+def _classic_rc_read(path):
+    """The mapping in one rc file, or None when there is no file. Raises ConfigError."""
+    try:
+        if not path.is_file():
+            return None
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"{path}: cannot be read ({exc.__class__.__name__})") from exc
+    if path.name.endswith(".yml"):
+        # Git for Windows writes CRLF: read it as LF, and refuse a CR that is not part of one.
+        text = text.replace("\r\n", "\n")
+        if "\r" in text:
+            raise ConfigError(f"{path}: a bare carriage return")
+        return parse_yaml_config(text, str(path))
+    return _parse_classic_rc(text, path)
+
+
+def _classic_project_root(cwd):
+    """Where Yarn reads its OPTION keys from: `cli/index.js` runs install, add and remove in
+    `findProjectRoot(cwd)`, the nearest directory at or above the shell's with a package.json
+    (the shell's own when there is none). The `--` flag keys are read from the shell's directory
+    (`rc.js`), so the two chains differ when the shell is below the project."""
+    for candidate in _ancestors(cwd):
+        if (candidate / "package.json").is_file():
+            return candidate
+    return _ancestors(cwd)[0]
+
+
+def _classic_rc_orders(cwd, home, environ):
+    """(args_order, option_order): the rc files in the order Yarn merges each kind of key.
+    `args_order` is lowest precedence first (a later file wins) and starts from the shell's
+    directory; `option_order` is highest first (the first file that sets a key wins) and starts
+    from the project root."""
+    chain = _ancestors(cwd)  # nearest first
+    option_chain = _ancestors(_classic_project_root(cwd))
+    home = Path(home)
+    xdg = environ.get("XDG_CONFIG_HOME")
+    user = [home / ".config" / "yarn" / "config", home / ".config" / "yarn", home / ".yarn" / "config",
+            home / ".yarnrc", home / ".yarnrc.yml"]
+    if xdg:
+        user.insert(0, Path(xdg) / "yarn" / "config")
+    system = [Path("/etc/yarn/config"), Path("/etc/yarnrc"), Path("/etc/yarnrc.yml")]
+    args_order = []
+    for parent in reversed(chain):
+        args_order += [parent / ".yarnrc", parent / ".yarnrc.yml"]
+    args_order += system + user
+    extra = next((v for n, v in environ.items() if n.upper() == "YARN_CONFIG"), None)
+    if extra:
+        args_order.append(Path(extra))
+    prefixes = {environ.get("PREFIX"), "/usr/local", "/usr", "/opt/homebrew"}
+    option_order = [option_chain[0] / ".yarnrc", home / ".yarnrc",
+                    *[Path(p) / "etc" / "yarnrc" for p in sorted(x for x in prefixes if x)],
+                    *[parent / ".yarnrc" for parent in option_chain[1:]]]
+    return args_order, option_order
+
+
+# Settings that matter, and why the ones refused are refused.
+_CLASSIC_REFUSED = {
+    "yarn-path": "hands the whole command to another program before any package is reviewed",
+    "yarnPath": "hands the whole command to another program before any package is reviewed",
+    "yarn-offline-mirror": "installs from a local mirror of tarballs no review saw",
+    "yarn-offline-mirror-pruning": "changes a local mirror of tarballs no review saw",
+    "offline-cache-folder": "installs from a local mirror of tarballs no review saw",
+    "cache-folder": "moves a directory reconciliation reads",
+    "preferred-cache-folder": "moves a directory reconciliation reads",
+    "global-folder": "moves a directory reconciliation reads",
+    "link-folder": "moves a directory reconciliation reads",
+    "modules-folder": "installs somewhere reconciliation does not read",
+    "prefix": "moves where Yarn writes its global files",
+    "cwd": "runs Yarn in another directory than the one that was checked",
+    "proxy": "routes downloads through a proxy",
+    "https-proxy": "routes downloads through a proxy",
+    "cafile": "changes which certificates Yarn trusts",
+    "ca": "changes which certificates Yarn trusts",
+    "cert": "changes which certificates Yarn trusts",
+    "key": "changes which certificates Yarn trusts",
+    "env": "sets the environment of every script",
+    "workspaces-experimental": "enables workspaces, whose members Package Guard does not read",
+    "workspaces-nohoist-experimental": "enables workspaces, whose members Package Guard does not read",
+    "plugnplay-override": "Plug'n'Play has no node_modules tree Package Guard can inspect",
+    "plugnplay-shebang": "Plug'n'Play has no node_modules tree Package Guard can inspect",
+    "plugnplay-blacklist": "Plug'n'Play has no node_modules tree Package Guard can inspect",
+    "unsafe-disable-integrity-migration": "turns off the integrity record Yarn adds to a lock",
+    "yarn-enable-lockfile-versions": "changes how the lock is written",
+    "yarn-link-file-dependencies": "changes how file: dependencies are installed",
+    "experimental-pack-script-packages-in-mirror": "writes built packages into a mirror",
+    "enable-meta-folder": "changes where Yarn writes package metadata",
+}
+# Options with no effect on what is fetched, run or where it lands (value: bool/int/text).
+_CLASSIC_BENIGN = frozenset({
+    "ignore-scripts", "ignore-optional", "ignore-engines", "ignore-platform", "network-concurrency",
+    "network-timeout", "child-concurrency", "no-progress", "disable-self-update-check",
+    "lastUpdateCheck", "save-prefix", "bin-links", "emoji", "silent", "production", "prefer-offline",
+    "scripts-prepend-node-path", "user-agent", "version-tag-prefix", "version-git-tag",
+    "version-commit-hooks", "version-git-sign", "version-git-message", "init-version",
+    "init-license", "init-author-name", "init-author-email", "init-author-url",
+})
+_CLASSIC_BOOL_KEYS = frozenset({"ignore-scripts", "ignore-optional", "ignore-engines", "ignore-platform",
+                                "no-progress", "disable-self-update-check", "bin-links", "emoji",
+                                "silent", "production", "prefer-offline"})
+# `--<flag> true` keys: the flags a `.yarnrc` may preset, and the commands whose flags they are.
+_CLASSIC_FLAG_KEYS = frozenset({
+    "ignore-scripts", "frozen-lockfile", "pure-lockfile", "check-files", "production", "ignore-engines",
+    "ignore-platform", "ignore-optional", "non-interactive", "no-progress", "no-bin-links", "silent", "emoji",
+    "network-concurrency", "network-timeout", "prefer-offline", "offline", "exact", "tilde", "dev",
+    "peer", "optional", "verbose",
+})
+_CLASSIC_FLAG_COMMANDS = frozenset({"install", "add", "remove", "upgrade"})
+_CLASSIC_NUMERIC_FLAGS = frozenset({"network-concurrency", "network-timeout"})
+_FLAG_KEY = re.compile(r"^--(?:(?P<command>[A-Za-z][A-Za-z-]*)\.)?(?P<flag>[a-z][a-z-]*)$")
+_SCOPE_REGISTRY = re.compile(r"^@[A-Za-z0-9._~-]+:registry$")
+
+
+def _classic_key_problem(key, value):
+    """Why one `.yarnrc` key is refused, or None: the ONE rule every Classic rc file is held to."""
+    if _bad_text(value):
+        return "uses ${...} interpolation, which Package Guard cannot resolve"
+    flag = _FLAG_KEY.match(key)
+    if key.startswith("--"):
+        if flag is None:
+            return "is not a flag key Package Guard can read"
+        command, name = flag.group("command"), flag.group("flag")
+        if command is not None and command not in _CLASSIC_FLAG_COMMANDS:
+            return f"presets a flag of `{command}`, which Package Guard does not read"
+        if name not in _CLASSIC_FLAG_KEYS:
+            why = _CLASSIC_REFUSED.get(name)
+            return f"presets `--{name}`" + (f", which {why}" if why else ", a flag Package Guard does not know to be safe")
+        if name in _CLASSIC_NUMERIC_FLAGS:
+            return None if isinstance(value, int) and not isinstance(value, bool) else "must be a number"
+        return None if isinstance(value, bool) else "must be true or false"
+    if key in _CLASSIC_REFUSED:
+        return _CLASSIC_REFUSED[key]
+    if key == "registry" or _SCOPE_REGISTRY.match(key):
+        return None if protocols.is_official_registry(value) else (
+            f"is {_redact(str(value))!r}; only the default registry is supported")
+    if key == "strict-ssl":
+        return None if value is True else "turns TLS verification off"
+    if key in _CLASSIC_BOOL_KEYS:
+        return None if isinstance(value, bool) else "must be true or false"
+    if key in _CLASSIC_BENIGN:
+        return None if isinstance(value, (bool, int, str)) and not _bad_text(value) else "must be a single value"
+    return "is not a setting Package Guard knows to be safe"
+
+
+_CLASSIC_ENV_BENIGN = frozenset({
+    "YARN_SILENT", "YARN_NO_PROGRESS", "YARN_NETWORK_TIMEOUT", "YARN_CHILD_CONCURRENCY",
+    "YARN_IGNORE_ENGINES", "YARN_IGNORE_PLATFORM", "YARN_DISABLE_SELF_UPDATE_CHECK",
+    "YARN_WRAP_OUTPUT", "YARN_PRODUCTION", "YARN_EMOJI",
+})
+
+
+def _classic_env_problem(name, value):
+    """The verdict for a Yarn Classic setting spelled as an environment variable, or
+    `_NOT_CLASSIC` for a name this does not judge (the Berry rule then does)."""
+    if name == "YARN_IGNORE_SCRIPTS":
+        return None if str(value).strip().lower() == "true" else (
+            "undoes the scripts-off proof: Yarn reads it before every `.yarnrc`; only `true` is "
+            "supported")
+    if name == "YARN_REGISTRY":
+        return None if protocols.is_official_registry(value) else (
+            f"is {_redact(str(value))!r}; only the default registry is supported")
+    if name in _CLASSIC_ENV_BENIGN:
+        return None
+    if name in ("YARN_CONFIG", "YARN_IGNORE_PATH"):
+        return "changes which rc files or which Yarn binary runs"
+    return _NOT_CLASSIC
+
+
+class YarnExe(NamedTuple):
+    """The `yarn` a command will run, found without running it. `major` is 1 for Yarn Classic,
+    2 or more for Berry, None when it could not be established; `why` says how, or why not."""
+    major: object
+    version: object
+    path: object
+    why: str
+
+
+def _package_of(real):
+    """(name, version) of the npm package that holds the file `real`, from the nearest package.json
+    above it (up to six directories), or None."""
+    for parent in list(Path(real).parents)[:6]:
+        manifest = parent / "package.json"
+        if manifest.is_file():
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                return None
+            if isinstance(data, dict) and isinstance(data.get("name"), str):
+                return data["name"], data.get("version") if isinstance(data.get("version"), str) else None
+            return None
+    return None
+
+
+def yarn_executable(head, path_value, cwd, pin_version=None) -> YarnExe:
+    """Resolve the `yarn` a command word will run, from the command word and the PATH it searches
+    (the hook's own, or the one the command sets). Symlinks are followed to the package.json of
+    the package that holds the file: `yarn` 1.x is the npm package `yarn`, Berry's is
+    `@yarnpkg/cli-dist`. A Corepack shim runs the release `package.json` pins, so it counts only
+    with an exact `yarn@1.x.y` pin. Nothing is executed. `path_value` None means the PATH is built
+    at run time and cannot be known."""
+    cwd = Path(cwd)
+    name = Path(head).name.lower()
+    name = name[:-4] if name.endswith((".cmd", ".exe", ".ps1")) else name
+    if "/" in head or "\\" in head:
+        found = Path(head) if Path(head).is_absolute() else cwd / head
+        candidates = [found] if found.is_file() else []
+    else:
+        if path_value is None:
+            return YarnExe(None, None, None, "the PATH is built when the command runs")
+        candidates = []
+        for entry in path_value.split(os.pathsep):
+            directory = cwd if entry == "" else (Path(entry) if Path(entry).is_absolute() else cwd / entry)
+            for candidate in (directory / name, directory / (name + ".exe")):
+                if candidate.is_file() and os.access(candidate, os.X_OK):
+                    candidates.append(candidate)
+                    break
+            if candidates:
+                break
+    if not candidates:
+        return YarnExe(None, None, None, f"no `{name}` was found on the PATH")
+    found = candidates[0]
+    real = Path(os.path.realpath(found))
+    owner = _package_of(real)
+    if owner is not None:
+        pkg, version = owner
+        match = re.match(r"^(\d+)\.", version or "")
+        if pkg == "yarn" and match:
+            return YarnExe(int(match.group(1)), version, real, f"{found} is the npm package yarn@{version}")
+        if pkg in ("@yarnpkg/cli-dist", "@yarnpkg/cli") and match:
+            return YarnExe(int(match.group(1)), version, real, f"{found} is Yarn Berry {version}")
+        if pkg == "corepack":
+            if pin_version and re.match(r"^1\.\d+\.\d+$", pin_version):
+                return YarnExe(1, pin_version, real, f"{found} is a Corepack shim and package.json pins yarn@{pin_version}")
+            return YarnExe(None, None, real, f"{found} is a Corepack shim and package.json does not pin yarn@1.x.y")
+        return YarnExe(None, None, real, f"{found} belongs to the package {pkg!r}, not to yarn")
+    try:
+        head_text = real.read_bytes()[:2048].decode("utf-8", "replace")
+    except OSError:
+        head_text = ""
+    if "corepack" in head_text:
+        if pin_version and re.match(r"^1\.\d+\.\d+$", pin_version):
+            return YarnExe(1, pin_version, real, f"{found} is a Corepack shim and package.json pins yarn@{pin_version}")
+        return YarnExe(None, None, real, f"{found} is a Corepack shim and package.json does not pin yarn@1.x.y")
+    return YarnExe(None, None, real, f"{found} is not inside a package whose package.json says which yarn it is")
+
+
+class ClassicConfig(NamedTuple):
+    problems: list            # what the rc files and the environment would do that is refused
+    scripts_off: bool         # dependency and root lifecycle scripts are proven off
+    scripts_reason: str       # how, or why not
+    frozen: bool              # `--frozen-lockfile` is proven (flag or `--install.frozen-lockfile true`)
+    frozen_reason: str
+
+
+def yarn_classic_config(cwd, home, environ=None, command="install", flags=(), trust_rc=True,
+                        untrusted_why="") -> ClassicConfig:
+    """The effective Yarn Classic configuration for `command` run in `cwd`, computed in Yarn's
+    own order (see the block comment above), not assumed. `flags` are the command line's own
+    (`--ignore-scripts`, `--frozen-lockfile`): a flag beats every file.
+
+    `trust_rc` is False when the `yarn` that will run is not known to be Yarn Classic: a Berry
+    binary ignores every Classic rc key and environment variable, so only the two flags count
+    (Berry rejects both and installs nothing). The rc files are still scanned for what they
+    would redirect."""
+    environ = os.environ if environ is None else environ
+    problems, scripts_off, frozen = [], None, None
+    args_order, option_order = _classic_rc_orders(cwd, home, environ)
+    loaded = {}
+    for path in dict.fromkeys(args_order + option_order):
+        try:
+            data = _classic_rc_read(path)
+        except ConfigError as exc:
+            problems.append(f"{exc}; Package Guard reads only plain `key value` lines in a .yarnrc")
+            loaded[path] = None
+            continue
+        if data is None:
+            continue
+        loaded[path] = data
+        for key, value in data.items():
+            reason = _classic_key_problem(key, value)
+            if path.name.endswith(".yml"):
+                # Yarn reads only `--` flag keys and `yarnPath` from a .yarnrc.yml in Classic mode.
+                reason = reason if key.startswith("--") or key in ("yarnPath", "yarn-path") else None
+            if reason:
+                problems.append(f"{path}: `{key}` {reason}")
+
+    def args_value(name):
+        found, seen = None, False
+        for path in args_order:
+            data = loaded.get(path)
+            if not data:
+                continue
+            for key in (f"--{name}", f"--{command}.{name}"):
+                if key in data:
+                    found, seen = data[key], True
+        return found if seen else None
+
+    # scripts: the flag (command line, or a `--[command.]ignore-scripts true` rc key) OR the
+    # option (the environment over the first rc file that sets it).
+    env_scripts = next((v for n, v in environ.items() if n.upper() == "YARN_IGNORE_SCRIPTS"), None)
+    option = None
+    if env_scripts is not None:
+        option = str(env_scripts).strip().lower() == "true"
+    else:
+        for path in option_order:
+            data = loaded.get(path)
+            if data and "ignore-scripts" in data:
+                option = data["ignore-scripts"] is True
+                break
+    if "--ignore-scripts" in flags:
+        scripts_off, scripts_why = True, "the command carries --ignore-scripts"
+    elif not trust_rc:
+        scripts_off, scripts_why = False, (
+            f"{untrusted_why}, so no .yarnrc or YARN_ variable can be counted: only a "
+            "--ignore-scripts on the command does")
+    elif args_value("ignore-scripts") is True:
+        scripts_off, scripts_why = True, "a .yarnrc presets `--ignore-scripts true` for this command"
+    elif option:
+        scripts_off, scripts_why = True, (
+            "YARN_IGNORE_SCRIPTS=true" if env_scripts is not None else "a .yarnrc sets `ignore-scripts true`")
+    else:
+        scripts_off = False
+        scripts_why = ("YARN_IGNORE_SCRIPTS is set to something other than true, which beats every "
+                       ".yarnrc" if env_scripts is not None else
+                       "neither the command nor the .yarnrc files Yarn reads turn scripts off")
+    if "--frozen-lockfile" in flags:
+        frozen, frozen_why = True, "the command carries --frozen-lockfile"
+    elif not trust_rc:
+        frozen, frozen_why = False, (
+            f"{untrusted_why}, so no .yarnrc can be counted: only a --frozen-lockfile on the command does")
+    elif args_value("frozen-lockfile") is True:
+        frozen, frozen_why = True, "a .yarnrc presets `--install.frozen-lockfile true`"
+    else:
+        frozen, frozen_why = False, ("neither the command nor the .yarnrc files Yarn reads freeze the "
+                                     "lockfile (a bare `frozen-lockfile true` key is ignored by Yarn)")
+    return ClassicConfig(problems, scripts_off, scripts_why, frozen, frozen_why)
 
 
 # ---------------------------------------------------------------------------
@@ -990,7 +1552,11 @@ def pm_config_problems(kind, directory, home, environ, spec_problem=None, requir
     from, run, or install somewhere Package Guard did not check."""
     problems = env_problems(kind, environ, home)
     if kind == "yarn":
-        problems += yarn_config_problems(directory, home, environ, require_linker)
+        flavour = yarn_flavour(directory)
+        if flavour.kind == CLASSIC and flavour.conflict is None:
+            problems += yarn_classic_config(directory, home, environ).problems
+        else:
+            problems += yarn_config_problems(directory, home, environ, require_linker)
     elif kind == "bun":
         problems += bun_config_problems(directory, home, environ)
     elif kind == "pnpm":

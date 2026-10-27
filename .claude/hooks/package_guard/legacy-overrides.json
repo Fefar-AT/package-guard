@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "_comment": "Package metadata uv cannot parse, replaced for one exact version, and only that version: a plan applies an entry only when uv fails on that name and version. The metadata is what the package's own record says, with the one invalid specifier made valid.",
+  "dependency_metadata": [
+    {
+      "name": "pandas",
+      "version": "0.24.2",
+      "requires-dist": ["python-dateutil>=2.5.0", "pytz>=2011.0", "numpy>=1.12.0"],
+      "reason": "pandas 0.24.2 declares `pytz (>=2011k)`, and `2011k` is not a valid version, so uv refuses to resolve the package; pip accepted it. Frappe v11 pins pandas==0.24.2.",
+      "source": "the metadata of pandas 0.24.2 on PyPI, with `2011k` read as `2011.0`"
+    }
+  ]
+}

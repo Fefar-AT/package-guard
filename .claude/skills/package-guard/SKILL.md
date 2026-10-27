@@ -197,13 +197,35 @@ This project runs a Package Guard hook on every Bash command. Any `npm`, `npx`,
    command (run it as its own command first), and a package name built from a
    variable or glob (name the exact package and version).
 
-   `pipx`, `poetry`, `conda`, `corepack`, Yarn Classic and Yarn Plug'n'Play are
-   **refused by the hook**, not merely discouraged in this file. So are Frappe's
-   installing `bench` verbs (`init`, `get-app`, `update`, `setup requirements`,
-   `setup env`, `new-app`, `pip`, `switch-to-branch`, `remove-app`): bench runs
-   `yarn install` with scripts on and pip from Python, out of the hook's sight.
-   Other bench commands (`build`, `start`, `migrate`, site commands) run as
-   usual. **pnpm, Bun and Yarn Berry are gated like npm**, next.
+   `pipx`, `poetry`, `conda`, `corepack` and Yarn Plug'n'Play are
+   **refused by the hook**, not merely discouraged in this file. Yarn Classic
+   (v1) and Frappe's `bench` are gated, not refused. Open Claude at the bench
+   folder, not inside an app. In a bench:
+   - `bench setup requirements`, `bench update --requirements`,
+     `bench new-app`, `bench build` and `bench update --patch --build` run only
+     when every upstream app (`frappe`, `erpnext`, `hrms`) has a baseline the
+     user approved and the guard's installer files hold. Otherwise the denial
+     (`PACKAGE_GUARD_BASELINE_REQUIRED` or `PACKAGE_GUARD_BENCH_CONFIG`) names the
+     command: run the `baseline plan` it gives, then ask the user to approve the
+     proposal in their own terminal. `bench-config apply` is a command you run
+     as the denial words it; the user answers its prompt. You never run
+     `baseline approve` or `git-owners add`; do not retry or reword them.
+   - Your own app's packages are reviewed one by one, like any project; a
+     requirement that names an app of the bench (`frappe`, `erpnext`) is local
+     code and is refused whatever the index offers; never edit the file to get
+     past it, tell the user.
+   - `bench init`, `get-app`, `switch-to-branch`, `setup env`, `migrate-env`, a
+     plain `update`, and the system installers (`bench install`,
+     `setup production`, `setup role`) stay the user's: tell them, do not look
+     for another way. Other bench commands (`start`, `migrate`, site commands)
+     run as usual.
+   - An install into a bench's own Python env is gated like any pip install of
+     an exact version: `<bench>/env/bin/pip install name==version`,
+     `<bench>/env/bin/python -m pip install ...`,
+     `uv pip install ... --python <bench>/env/bin/python` and
+     `bench pip install name==version`, from the bench root or from `apps/<app>`.
+
+   **pnpm, Bun and Yarn Berry are gated like npm**, next.
 
    **pnpm, Bun and Yarn Berry (v1.10.0).** The same rules as npm: every package
    is named with an exact version, reviewed and approved before it is
@@ -212,7 +234,8 @@ This project runs a Package Guard hook on every Bash command. Any `npm`, `npx`,
    change any of it. What differs:
    - Locks. The project needs exactly one manager's lock, and the guard reads
      it in full: `pnpm-lock.yaml` (v9), a text `bun.lock` (a binary `bun.lockb`
-     is refused), or a Berry `yarn.lock` (Classic v1 locks are refused). A fresh
+     is refused), or a Berry `yarn.lock` (a Classic v1 lock is read in full and gated in a bench,
+     see above). A fresh
      project with no dependencies may run its first add without a lock. Root
      `peerDependencies` must be in the lock (pnpm, Bun). It works both ways:
      npm is refused in a project whose lock or `packageManager` belongs to

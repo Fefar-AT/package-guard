@@ -1,5 +1,28 @@
 # Release notes
 
+## v1.12.0
+
+- **Frappe / ERPNext benches now work with the guard** (Frappe v15 and v16
+  verified on a real bench; v14 and v11–v13 not confirmed yet). `bench setup
+  requirements`, `bench update --requirements`, `bench new-app`, `bench build`
+  and `bench pip install name==version` are checked instead of refused, and
+  Yarn Classic (v1) is read in full.
+- **Approve Frappe once per release.** The packages of frappe, erpnext and hrms
+  are approved as one list (a *baseline*) in your own terminal, and the team
+  shares it. Known malware always blocks; known bugs in old packages are shown,
+  never block.
+- **Your own app's packages are still checked one by one**, Python and
+  JavaScript. A typo goes to review; the fake `frappe` or `erpnext` on PyPI, a
+  missing Frappe app pulled from PyPI, or a package pointed at some other
+  download are refused.
+- **bench's own installs are locked down.** `bench-config apply` writes the
+  settings bench's installers read (`env/pip.conf`, `uv.toml`, a `.yarnrc` per
+  app): only what the baselines list, no install scripts, no building from
+  source except your own apps. The guard checks them before every bench install.
+- Still yours to run: `bench init`, `get-app`, a plain `update`,
+  `switch-to-branch`, `setup env`, and the system installers. Open Claude at the
+  bench folder. The steps are in [DETAILS](DETAILS.md#frappe--erpnext).
+
 ## v1.11.0
 
 - **Modes: enforce, warn, off.** A supported way to turn the guard down for a

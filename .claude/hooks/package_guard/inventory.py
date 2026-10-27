@@ -700,9 +700,18 @@ def has_bun_markers(project_dir) -> bool:
     return (Path(project_dir) / "node_modules" / ".bun").is_dir()
 
 
-def has_yarn_markers(project_dir) -> bool:
+def has_berry_markers(project_dir) -> bool:
     return (Path(project_dir) / "node_modules" / ".yarn-state.yml").is_file() or \
         yarn_install_state_present(project_dir)
+
+
+def has_classic_markers(project_dir) -> bool:
+    """`node_modules/.yarn-integrity` is Yarn Classic's install record."""
+    return (Path(project_dir) / "node_modules" / ".yarn-integrity").is_file()
+
+
+def has_yarn_markers(project_dir) -> bool:
+    return has_berry_markers(project_dir) or has_classic_markers(project_dir)
 
 
 # ---------------------------------------------------------------------------

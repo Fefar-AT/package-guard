@@ -47,6 +47,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # the same hole opens for any syntax error or missing file in these four modules.
 try:
     import tomllib  # noqa: E402
+    import baseline  # noqa: E402
+    import bench_config  # noqa: E402
+    import bench_gate  # noqa: E402
+    import legacy  # noqa: E402
     import bun_lock  # noqa: E402,F401
     import disk_guard  # noqa: E402
     import lock_errors  # noqa: E402,F401
@@ -81,11 +85,12 @@ _REQUIRED_CLI_FLAGS = {"--no-project", "--no-config", "--no-python-downloads"}
 # matched only as a word of its own, so `cli.py mode.py` (two file names) is not.
 _GUARD_CLI_HINT = re.compile(
     r"package_guard/cli\.py\s+(?:(?:approve|decline|undecline|revoke|reconcile|audit)\b"
-    r"|mode(?![\w.\-]))")
+    r"|(?:mode|baseline|git-owners|bench-config)(?![\w.\-]))")
 # A plugin's guard lives wherever the plugin is installed, so any cli.py named
 # with one of those verbs counts.
 _PLUGIN_CLI_HINT = re.compile(
-    r"cli\.py\s+(?:(?:approve|decline|undecline|revoke|reconcile|audit)\b|mode(?![\w.\-]))")
+    r"cli\.py\s+(?:(?:approve|decline|undecline|revoke|reconcile|audit)\b"
+    r"|(?:mode|baseline|git-owners|bench-config)(?![\w.\-]))")
 # The guard's CLI reached some other way: the people's launcher `pg` given any
 # argument, or run.sh handed cli.py. Neither is a form the checks above can
 # read, so Claude is refused both and pointed at the one it may use. A plain
@@ -400,9 +405,38 @@ def _git_write(sub, args, here, protected, inside, opaque=False, config=()) -> b
     if opaque:
         return True
 
+    # The directories that hold the guard files. A tree that tracks one of them as a file (or
+    # a link, or a submodule) replaces the directory, and the file in it goes with it, which
+    # a diff of the guard files' own paths does not show.
+    ancestors = sorted({Path(*Path(g).parts[:i]).as_posix() for g in guard
+                        for i in range(1, len(Path(g).parts))})
+
+    def replaces(*revs) -> bool:
+        if not ancestors:
+            return False
+        for rev in revs or (None,):
+            if rev is not None and ".." in rev:
+                rev = rev.rsplit("..", 1)[1].lstrip(".") or "HEAD"
+            # One query for each directory: a pathspec that is a directory is listed by what
+            # is inside it, and the entry for the directory itself is what is wanted.
+            for ancestor in ancestors:
+                if rev is None:
+                    listed = _git([*config, "ls-files", "-s", "-z", "--", ancestor], top)
+                else:
+                    listed = _git([*config, "ls-tree", "-z", rev, "--", ancestor], top)
+                if listed is None or listed[0] != 0:
+                    return True
+                for entry in filter(None, listed[1].split("\0")):
+                    meta, _, path = entry.partition("\t")
+                    if path != ancestor:
+                        continue  # (the index lists the files under a directory, not it)
+                    if rev is None or not meta.startswith("040000"):
+                        return True  # a file, a link or a submodule where the directory is
+        return False
+
     def differs(*revs) -> bool:
         result = _git([*config, "diff", "--quiet", *revs, "--", *guard], top)
-        return result is None or result[0] != 0
+        return result is None or result[0] != 0 or replaces(*revs)
 
     def untracked(*extra) -> bool:
         result = _git([*config, "ls-files", "--others", *extra, "--", *guard], top)
@@ -554,6 +588,109 @@ def _git_write(sub, args, here, protected, inside, opaque=False, config=()) -> b
     return True
 
 
+_ARCHIVE_EXTRACTORS = {"tar", "bsdtar", "gtar", "gnutar", "unzip", "7z", "7za", "7zr", "7zz",
+                       "cpio", "pax"}
+
+
+def _short_flags(args) -> str:
+    """The letters of the short-option clusters in `args` (`-xzf` gives `xzf`), before `--`."""
+    letters = ""
+    for a in args:
+        if a == "--":
+            break
+        if a.startswith("-") and not a.startswith("--"):
+            letters += a[1:]
+    return letters
+
+
+def _tree_copy_writes(sources, directory, resolve, tree_overwrites, delete=False) -> bool:
+    """Whether a recursive copy of `sources` into `directory` (the destination operand)
+    can overwrite a recorded installer file. Each source is copied to `directory/<name>`
+    when `directory` is a directory that is there, to `directory` itself when it is not,
+    and as its contents into `directory` when it ends in `/.` (and, for BSD cp and rsync,
+    in `/`: both are tried). A source a remote host holds is not known."""
+    target = resolve(directory)
+    is_dir = os.path.isdir(target)
+    for source in sources:
+        if re.match(r"^[^/]*:", source) and not source.startswith(("/", ".", "~")):
+            return tree_overwrites(os.devnull, target, True)  # `host:path`: contents unknown
+        contents = source.endswith("/.")
+        folded = source[:-2] if contents else source
+        trailing = folded.endswith("/") and not contents
+        src = resolve(folded.rstrip("/") or "/")
+        roots = [target]
+        if not contents and (is_dir or len(sources) > 1):
+            roots = [os.path.join(target, os.path.basename(src))] + ([target] if trailing else [])
+        if any(tree_overwrites(src, root, delete) for root in roots):
+            return True
+    return False
+
+
+def _tree_command_writes(name, args, here, resolve, extraction_covers, tree_overwrites) -> bool:
+    """True when this archive extraction, `ditto` or `rsync` can write a recorded installer
+    file. An archive's members are not read, so extracting into a directory that holds one
+    counts, whatever the archive is; a tree copy is judged by the source that is on disk."""
+    letters = _short_flags(args)
+    operands = [a for a in args if not a.startswith("-")]
+    if name in ("tar", "bsdtar", "gtar", "gnutar"):
+        # `tar xf a.tar` (no dash) is an option bundle too
+        old_style = bool(operands) and not args[0].startswith("-") and "x" in operands[0]
+        if not ("x" in letters or old_style
+                or any(a in ("--extract", "--get") or a.startswith("--extract") for a in args)):
+            return False
+        dirs = [a[2:] for a in args if a.startswith("-C") and len(a) > 2]
+        dirs += [b for a, b in zip(args, args[1:]) if a in ("-C", "--directory")]
+        dirs += [a.split("=", 1)[1] for a in args if a.startswith("--directory=")]
+        return any(extraction_covers(d) for d in (dirs or [here]))
+    if name == "unzip":
+        # unzip's mode flags, as whole option words (`-dDIR` is a directory, not flags)
+        if any(re.fullmatch(r"-[lvtpZcnoqjLUCa]+", a) and set(a[1:]) & set("lvtpZc") for a in args):
+            return False
+        dirs = [b for a, b in zip(args, args[1:]) if a == "-d"] + [
+            a[2:] for a in args if a.startswith("-d") and len(a) > 2]
+        return any(extraction_covers(d) for d in (dirs or [here]))
+    if name.startswith("7z"):
+        verb = operands[0] if operands else ""
+        if verb not in ("x", "e"):
+            return False
+        dirs = [a[2:] for a in args if a.startswith("-o") and len(a) > 2]
+        return any(extraction_covers(d) for d in (dirs or [here]))
+    if name == "cpio":
+        if "i" not in letters and "p" not in letters:
+            return False
+        dirs = [b for a, b in zip(args, args[1:]) if a in ("-D", "--directory")]
+        if "p" in letters and operands:
+            dirs = dirs or [operands[-1]]
+        return any(extraction_covers(d) for d in (dirs or [here]))
+    if name == "pax":
+        if "r" not in letters or "w" in letters:
+            return False
+        return extraction_covers(operands[-1] if operands and "p" in letters else here)
+    if name == "ditto":
+        if "c" in letters and "x" not in letters:
+            return False
+        if len(operands) < 2:
+            return False
+        if "x" in letters:
+            return extraction_covers(operands[-1])
+        # ditto merges each source directory's contents into the destination
+        return _tree_copy_writes([s.rstrip("/") + "/." for s in operands[:-1]], operands[-1],
+                                 resolve, tree_overwrites)
+    if name == "rsync":
+        if len(operands) < 2:
+            return False
+        recursive = any(a in ("--recursive", "--archive", "--dirs") for a in args) or bool(
+            set(letters) & set("rad"))
+        if not recursive:
+            return False
+        delete = any(a.startswith(("--delete", "--remove")) for a in args)
+        destination = operands[-1]
+        if re.match(r"^[^/]*:", destination) and not destination.startswith(("/", ".", "~")):
+            return False  # the destination is a remote host
+        return _tree_copy_writes(operands[:-1], destination, resolve, tree_overwrites, delete)
+    return False
+
+
 def _precise_guard_write(command: str, root, cwd, locked: bool):
     """Return (understood, kind-or-None)."""
     home = str(Path.home())
@@ -564,6 +701,11 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
         source.append(store.plugin_root())
     real_state = [os.path.realpath(p) for p in state]
     real_source = [os.path.realpath(p) for p in source]
+    # The installer files the CLI wrote for a bench (pip.conf, uv.toml, .yarnrc): folded as
+    # NTFS compares names, and only once the CLI has recorded any.
+    installer_files = bench_config.config_paths(root) if pg_parser.FRAPPE_ENABLED else []
+    installer_paths = ([os.path.normpath(str(p)) for p in bench_config.recorded_paths(root)]
+                       if installer_files else [])
     here = os.path.normpath(str(cwd or root))
     stack, moved = [], False
 
@@ -585,6 +727,10 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
             return "source"
         if _hits(target, state, ancestors) or (real and _hits(real, real_state, ancestors)):
             return "state"
+        if installer_files and (
+                _hits(bench_config.fold_path(target), installer_files, ancestors)
+                or (real and _hits(bench_config.fold_path(real), installer_files, ancestors))):
+            return "config"
         return None
 
     def check(words, ancestors=True, base=None):
@@ -601,6 +747,36 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
         if kind_of(target, False):
             return True
         return "above" if kind_of(target, True) else False
+
+    def recorded_under(root_path):
+        """[(recorded file, its path below `root_path` as parts)] for each recorded installer
+        file at or below `root_path`, which a copy onto `root_path` can overwrite."""
+        found = []
+        for recorded in installer_paths:
+            for candidate, base in ((recorded, root_path),
+                                    (os.path.realpath(recorded), os.path.realpath(root_path))):
+                at, under = bench_config.fold_path(candidate), bench_config.fold_path(base)
+                if at == under or at.startswith(under.rstrip(os.sep) + os.sep):
+                    found.append((recorded, Path(candidate).parts[len(Path(base).parts):]))
+                    break
+        return found
+
+    def tree_overwrites(source, root_path, delete=False):
+        """Would copying the tree at `source` onto `root_path` overwrite, or (`delete`: an
+        rsync that removes what the source lacks) remove, a recorded file? True unless the
+        source is a directory on disk that has no such member: what a source that is not
+        there yet holds is not known."""
+        hits = recorded_under(root_path)
+        if not hits:
+            return False
+        if delete or not os.path.isdir(source):
+            return True
+        return any(not parts or os.path.lexists(os.path.join(source, *parts)) for _p, parts in hits)
+
+    def extraction_covers(directory):
+        """An archive's members are not read: extracting into a directory that holds a
+        recorded file may overwrite it."""
+        return bool(recorded_under(resolve(directory)))
 
     try:
         for item in _segments(command):
@@ -636,6 +812,10 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
             name = os.path.basename(words[0])
             args = words[1:]
             operands = [a for a in args if not a.startswith("-")]
+            if installer_paths and (name in _ARCHIVE_EXTRACTORS or name in ("ditto", "rsync")) and (
+                    _tree_command_writes(name, args, here, resolve, extraction_covers,
+                                         tree_overwrites)):
+                return True, "config"
             if name in ("cd", "pushd"):
                 if len(operands) != 1 or len(args) != 1:
                     raise _NotUnderstood
@@ -666,8 +846,8 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                     raise _NotUnderstood
                 saved, here = here, at
                 opaque = opaque_config or any(n.startswith("GIT_") for n in assigned)
-                wrote = _git_write(args[0], args[1:], here, source + state, inside, opaque,
-                                   config)
+                wrote = _git_write(args[0], args[1:], here, source + state + installer_paths,
+                                   inside, opaque, config)
                 here = saved
                 if wrote:
                     return True, "git"
@@ -681,6 +861,10 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                         raise _NotUnderstood
                     continue
                 found = check(operands)
+            elif _venv_creation(name, args) is not None:
+                # `uv venv`, `python -m venv`, `virtualenv`: with `--clear` (or over an existing env) they
+                # remove the guard's `env/pip.conf`, and `--seed` fetches pip and setuptools unreviewed.
+                found = check(_venv_creation(name, args) or [".venv"])
             elif name in _READERS:
                 if name == "find":
                     for i, a in enumerate(args):
@@ -727,6 +911,11 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                 written = [directory] + [os.path.join(directory, os.path.basename(k.rstrip("/")))
                                          for k in kept]
                 found = check(written, ancestors=False)
+                if not found and name == "cp" and installer_paths and any(
+                        a in ("--recursive", "--archive")
+                        or (a.startswith("-") and not a.startswith("--") and set(a[1:]) & set("rRa"))
+                        for a in args):
+                    found = "config" if _tree_copy_writes(kept, directory, resolve, tree_overwrites) else None
                 # A link is an alias: one made TO a guard file or directory
                 # lets a later write reach it under an unprotected name.
                 linking = name == "ln" or (name == "cp" and any(
@@ -756,7 +945,8 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
                 # not after a `cd`, not a command that runs other commands.
                 if piped or inputs or moved or name in _EXECUTORS:
                     raise _NotUnderstood
-                found = _coarse_guard_write(shlex.join(words), locked)
+                found = (_coarse_guard_write(shlex.join(words), locked)
+                         or _coarse_config_write(shlex.join(words), root))
             if found:
                 return True, found
     except _NotUnderstood:
@@ -764,8 +954,65 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
     return True, None
 
 
+_PYTHON_NAME = re.compile(r"(?:python|pypy)[0-9.]*\Z")
+_VENV_VALUE_OPTIONS = {"--python", "-p", "--prompt", "--python-preference", "--index-url", "--index",
+                       "--default-index", "--extra-index-url", "-i", "--find-links", "-f", "--cache-dir",
+                       "--directory", "--project", "--config-file", "--exclude-newer", "--link-mode",
+                       "--python-fetch", "--app-data", "--prompt", "--creator", "--seeder",
+                       "--activators", "--extra-search-dir", "--pip", "--setuptools", "--wheel",
+                       "--try-first-with", "--system-site-packages-dir"}
+
+
+def _venv_creation(name, args):
+    """The operands that name the directory of a virtual environment `uv venv`, `python -m venv` or
+    `virtualenv` would create (every operand: one that is not the target is only checked, it is not
+    mistaken for it), [] when it names none (the tool's default directory), None when this is not one."""
+    if name == "virtualenv":
+        rest = list(args)
+    elif name == "uv":
+        words = [a for a in args if not a.startswith("-")]
+        if not words or words[0] != "venv":
+            return None
+        rest = args[args.index("venv") + 1:]
+    elif _PYTHON_NAME.match(name):
+        at = next((i for i, a in enumerate(args) if a == "-m" or (a.startswith("-") and not a.startswith("--")
+                                                                  and a.endswith("m"))), None)
+        if at is None or at + 1 >= len(args) or args[at + 1] != "venv":
+            return None
+        rest = args[at + 2:]
+    else:
+        return None
+    targets, skip = [], False
+    for word in rest:
+        if skip:
+            skip = False
+        elif word in _VENV_VALUE_OPTIONS:
+            skip = True
+        elif not word.startswith("-"):
+            targets.append(word)
+    return targets
+
+
+def _coarse_config_write(command: str, root):
+    """'config' when a command that this pass cannot read names a file the CLI wrote for an
+    installer and has a writer in it, as `_coarse_guard_write` does for guard state."""
+    if not pg_parser.FRAPPE_ENABLED:
+        return None
+    names = {Path(p).name.casefold() for p in bench_config.recorded_paths(root)}
+    lowered = command.casefold()
+    named = [n for n in names if n in lowered]
+    if not named:
+        return None
+    alternatives = "|".join(re.escape(n) for n in named)
+    if (re.search(r">>?\|?\s*[\"']?\S*(?:%s)" % alternatives, lowered)
+            or _GUARD_STATE_WRITERS.search(command)
+            or (_GUARD_STATE_INLINE.search(command) and _GUARD_STATE_INLINE_WRITE.search(command))):
+        return "config"
+    return None
+
+
 def _guard_write(command: str, root, cwd=None, locked: bool | None = None):
-    """'state', 'source', 'git', or None: what guard file a Bash command writes."""
+    """'state', 'source', 'git', 'config', or None: what guard file a Bash command writes."""
     if locked is None:
         locked = _guard_locked(root)
     # argparse accepts any unambiguous prefix of --uninstall.
@@ -777,7 +1024,7 @@ def _guard_write(command: str, root, cwd=None, locked: bool | None = None):
     understood, found = _precise_guard_write(command, root, cwd, locked)
     if understood:
         return found
-    return _coarse_guard_write(command, locked)
+    return _coarse_guard_write(command, locked) or _coarse_config_write(command, root)
 
 
 def _writes_guard_state(command: str, root=None, cwd=None) -> bool:
@@ -833,7 +1080,11 @@ def _clean_project_cli(tokens, root, cwd) -> bool:
     return os.path.realpath(script) == os.path.realpath(Path(root) / store.CLI_SUFFIX)
 
 
-_CLI_VERBS = ("show", "approve", "decline", "undecline", "revoke", "reconcile", "audit", "mode")
+_CLI_VERBS = ("show", "approve", "decline", "undecline", "revoke", "reconcile", "audit", "mode",
+              "baseline", "git-owners", "bench-config")
+# These two take their raw tokens, like `mode`: a parsed argument list drops every `--flag`,
+# and nothing a person alone may do is told apart by a flag.
+_RAW_TAIL_VERBS = ("mode", "baseline", "git-owners", "bench-config")
 _REVIEW_ID_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 # A path token must mean the same to the shell as to this parser.
 _UNSAFE_PATH_TOKEN = re.compile(r"[$`*?\[\]{}()<>|&;!\n\x00]")
@@ -869,7 +1120,7 @@ def _plugin_cli_call(tokens, root):
         return None
     verb = tokens[6] if len(tokens) > 6 else None
     form = store.cli_command(root, verb if verb in _CLI_VERBS else "<approve|decline>",
-                             "" if verb in ("reconcile", "audit", "mode") else "<review-id> ...")
+                             "" if verb in ("reconcile", "audit") + _RAW_TAIL_VERBS else "<review-id> ...")
 
     def refuse(why):
         return _decision(
@@ -888,7 +1139,7 @@ def _plugin_cli_call(tokens, root):
         return refuse("`--root <project root>` must come directly after the subcommand")
     if not _plain_abs_path(tokens[8]) or os.path.realpath(tokens[8]) != os.path.realpath(str(root)):
         return refuse("`--root` is not this project's root")
-    if verb == "mode":
+    if verb in _RAW_TAIL_VERBS:
         return verb, list(tokens[9:])
     ids = []
     for rid in tokens[9:]:
@@ -1330,11 +1581,28 @@ def _yarn_built_names(directory):
     return names
 
 
+def _git_allowed(root):
+    """The acceptance of a git source in a lock (inside an approved baseline), for `sources.problems_for`:
+    None while the Frappe switch is off, so every such source stays refused."""
+    if not pg_parser.FRAPPE_ENABLED:
+        return None
+    return lambda directory, entry: baseline.git_entries_ok(root, directory, entry)
+
+
+def _git_spec_allowed(root):
+    """The acceptance of a git spec in a manifest; None while the switch is off."""
+    if not pg_parser.FRAPPE_ENABLED:
+        return None
+    return lambda directory, ecosystem, name, spec: baseline.manifest_git_ok(root, directory, ecosystem, name, spec)
+
+
 def _source_problems(parsed, targets, directory, root, **kwargs) -> list:
     """`sources.problems_for` for the shell's directory, as always, and again
     for every project directory an installer reads instead (`targets`): the
     manifest, lock and project configuration it finds there. npm also reads
     that project's .npmrc for the packages a command names."""
+    kwargs.setdefault("git_allowed", _git_allowed(root))
+    kwargs.setdefault("git_spec_allowed", _git_spec_allowed(root))
     problems = list(sources.problems_for(parsed, directory, **kwargs))
     here = os.path.realpath(directory)
     groups = {}
@@ -1696,6 +1964,160 @@ def _outside_project(targets, directory, root) -> dict | None:
     return None
 
 
+_BENCH_ENV_MESSAGE = (
+    "PACKAGE_GUARD_UNSUPPORTED: this installs into a Frappe bench's Python env, but {why}. "
+    "`uv pip ... --python <bench>/env/bin/python` and `bench pip install` are supported "
+    "only inside the bench they name: run the command from that bench's root or from "
+    "`apps/<app>`, or install with `<bench>/env/bin/pip install name==version`.")
+
+
+_BENCH_PIP_DIRECTORY_MESSAGE = (
+    "PACKAGE_GUARD_UNSUPPORTED: `bench pip` changes to the bench root ({root}) before it runs "
+    "pip, so a relative requirements file or a local project (`.`, `-e .`) is read there, "
+    "not in this directory. Run it from the bench root, or name the requirements file by its "
+    "absolute path.")
+
+
+_BENCH_REDIRECT_MESSAGE = (
+    "PACKAGE_GUARD_UNSUPPORTED: `bench pip` is not supported here: {why}. Remove that file, "
+    "or install with `<bench>/env/bin/pip install name==version` from inside the bench.")
+
+
+_BENCH_SOURCE_BUILD_MESSAGE = (
+    "PACKAGE_GUARD_UNSUPPORTED: {flags} names packages to build from source, and inside a Frappe "
+    "bench uv builds nothing from source except the packages a person allowed (`no-build = true` "
+    "in the bench's uv.toml): uv lets a package named there through. Drop the flag; to allow a "
+    "build, tell the user.")
+
+
+_BENCH_DYNAMIC_MESSAGE = (
+    "PACKAGE_GUARD_UNSUPPORTED: `{path}` runs pip or python from a path the shell expands "
+    "when the command runs (a variable, a substitution, a glob), and inside a Frappe bench "
+    "Package Guard cannot tell which env that installs into. Write the literal path: "
+    "`env/bin/pip install name==version`, or `~/frappe-bench/env/bin/pip ...`.")
+
+
+def _bench_env_problem(parsed, cwd) -> dict | None:
+    """Deny an install that names a bench env (`--python <bench>/env/bin/python`,
+    `bench pip`, `<bench>/env/bin/pip`) unless it is the env of the bench the shell's
+    directory is in. The parser read only the shape of the path; this is where it
+    meets the disk."""
+    if (pg_parser.FRAPPE_ENABLED and parsed.source_build_flags
+            and bench_config.bench_root(cwd) is not None):
+        return _decision("deny", _BENCH_SOURCE_BUILD_MESSAGE.format(
+            flags=", ".join(parsed.source_build_flags)))
+    for path in parsed.executables:
+        if bench_config.executable_is_dynamic(path) and bench_config.bench_root(cwd) is not None:
+            return _decision("deny", _BENCH_DYNAMIC_MESSAGE.format(path=path))
+        why = bench_config.executable_problem(path, cwd)
+        if why:
+            return _decision("deny", _BENCH_ENV_MESSAGE.format(why=why))
+    for value in parsed.bench_pythons:
+        if value:
+            why = bench_config.python_in_env_problem(value, cwd)
+        else:
+            redirect = bench_config.redirect_problem()
+            if redirect:
+                return _decision("deny", _BENCH_REDIRECT_MESSAGE.format(why=redirect))
+            root, why = bench_config.env_problem(cwd)
+            if root is not None and os.path.realpath(root) != os.path.realpath(cwd) and any(
+                    (scope.kind == "requirements" and not os.path.isabs(scope.path))
+                    or scope.kind == "build-requires" for scope in parsed.manifests):
+                # `bench` moves to the bench root before it runs pip, so a relative
+                # requirements file or `.` is read there, not where the hook looks.
+                return _decision("deny", _BENCH_PIP_DIRECTORY_MESSAGE.format(root=root))
+        if why:
+            return _decision("deny", _BENCH_ENV_MESSAGE.format(why=why))
+    return None
+
+
+def _bench_app_lines(parsed, targets, cwd) -> list:
+    """[(where, name, bench root)] for every PyPI requirement this command would
+    install, wherever it is written: named on the command line, listed in a
+    requirements file, or declared in the pyproject.toml it installs. `where` is
+    the file and line, or the command."""
+    found = []
+    here = bench_config.bench_root(cwd)
+    for request in parsed.requests:
+        if request.ecosystem == "pypi":
+            found.append(("the command line", request.name, request.display_name, here))
+    for scope, directory in targets:
+        if pg_parser.scope_ecosystem(scope.kind) != "pypi":
+            continue
+        if scope.kind == "requirements":
+            path = Path(scope.path)
+            if not path.is_absolute():
+                path = Path(directory) / path
+            benches = {bench_config.bench_root(directory), bench_config.bench_root(path.parent)}
+            for number, name, line in bench_config.requirements_file_names(path):
+                for bench in benches:
+                    found.append((f"{path}, line {number}", name, line, bench))
+        else:
+            bench = bench_config.bench_root(directory)
+            path = Path(directory) / "pyproject.toml"
+            # A local build with its dependencies off installs only its build requirements.
+            # The other scopes read every list, selected or not (5A and 5C of Codex's P3
+            # review: an extra nobody asked for, a marker that is false here): rare, and
+            # a refusal is the safe error.
+            for where, name in bench_config.pyproject_names(
+                    path, build_only=scope.kind == "build-requires"):
+                found.append((f"{path} ({where})", name, name, bench))
+            if scope.kind == "uv-project":
+                found.extend(_uv_lock_lines(scope, directory, bench))
+    return found
+
+
+def _uv_lock_lines(scope, directory, bench) -> list:
+    """What a uv sync installs beyond the directory's own pyproject.toml: the uv.lock it
+    installs as it stands (a frozen lock is not updated from pyproject.toml, so a stale
+    entry for a bench app is installed), and the manifests of the workspace members and
+    local packages it builds. An unreadable lock is the install gate's to report."""
+    found = []
+    try:
+        for where, name in pg_manifest.uv_lock_names(directory, scope.extras):
+            found.append((where, name, name, bench))
+        for member in pg_manifest.uv_member_directories(directory):
+            path = member / "pyproject.toml"
+            for where, name in bench_config.pyproject_names(path):
+                found.append((f"{path} ({where})", name, name, bench))
+    except pg_manifest.ManifestError:
+        pass
+    return found
+
+
+def _bench_app_name_problem(parsed, targets, cwd) -> dict | None:
+    """A requirement that names an app of the bench is local code, and an index
+    answers it with someone else's package (`frappe` is a placeholder on PyPI):
+    deny, whatever is vetted, before any review."""
+    apps = {}
+    hits = []
+    for where, name, shown, bench in _bench_app_lines(parsed, targets, cwd):
+        if bench is None:
+            continue
+        if bench not in apps:
+            apps[bench] = bench_config.app_names(bench)
+            if pg_parser.FRAPPE_ENABLED:
+                # The known Frappe app names are local in every bench, present or not: PyPI answers
+                # several of them with someone else's package.
+                for known in baseline.FRAPPE_APP_NAMES:
+                    apps[bench].setdefault(bench_config._normalize(known), "a known Frappe app name")
+        if name in apps[bench]:
+            hits.append(f"- {where}: `{shown}` is a local bench app ({apps[bench][name]})")
+    if not hits:
+        return None
+    hits = list(dict.fromkeys(hits))
+    lines = ["PACKAGE_GUARD_UNSUPPORTED: a requirement names a local bench app, and a bench app is "
+             "never installed from PyPI; an index answers its name with an unrelated package "
+             "(PyPI's `frappe` is a placeholder, `frappe==0.0.1`):"]
+    lines += hits[:10]
+    if len(hits) > 10:
+        lines.append(f"- ... and {len(hits) - 10} more")
+    lines.append("Tell the user which requirement this is. Do not edit the file to make the "
+                 "install pass: a bench app is installed from its own directory, by the user "
+                 "or by bench.")
+    return _decision("deny", "\n".join(lines))
+
+
 def _read_manifest(scope, directory):
     """(resolved, unresolved, where) for one ManifestScope."""
     if scope.kind == "npm":
@@ -1791,6 +2213,15 @@ _PIN_HELP = {
         "Let Yarn resolve them, which writes yarn.lock without linking or building anything:",
         "  yarn install --mode=update-lockfile",
         "The lock must record each dependency for exactly the spec package.json declares.",
+    ),
+    "yarn-classic": (
+        "Yarn Classic cannot write yarn.lock without also installing, and an install resolves "
+        "versions nobody reviewed. Each of these goes to review by name and exact version "
+        "first. Once it is approved, remove its line from package.json (a revert, not an "
+        "addition) and add it in the app's own folder, which writes package.json and yarn.lock:",
+        "  yarn add <name>@<exact version> --ignore-scripts",
+        "The lock must have an entry for each dependency under exactly the spec package.json "
+        "declares (`name@spec`).",
     ),
     "requirements": (
         "Let a resolver pin them into a fully-pinned requirements file, which "
@@ -2700,11 +3131,182 @@ def _mode_cli_decision(tail, root) -> dict:
         "back on), exactly as:\n  "
         f"{store.cli_command(root, 'mode', '').rstrip()}")
 
+# What Claude may run of `cli.py baseline` and `cli.py git-owners`. Read from the
+# raw tokens after the verb, never a parsed list that drops `--flags`.
+_BASELINE_ID_TOKEN = re.compile(r"bl-[0-9a-f]{12}\Z")
+_BASELINE_READ_VERBS = ("show", "list", "export")
+
+
+def _baseline_human_only(root, what, tail, verb="baseline") -> dict:
+    """PACKAGE_GUARD_BASELINE_HUMAN_ONLY: the exact command for the
+    person's own terminal, and that Claude does not retry or reword it."""
+    return _decision(
+        "deny",
+        f"PACKAGE_GUARD_BASELINE_HUMAN_ONLY: only the user can do this, in their own terminal ({what}): "
+        f"{store.human_command(root, verb, shlex.join(tail))}. Stop and tell them; do not retry or reword it, "
+        "and do not look for another way.")
+
+
+def _baseline_plan_tokens_problem(tail):
+    """Why `baseline plan`'s tokens are not one of its two forms, or None."""
+    rest, positional, i = tail[1:], [], 0
+    forms = {"--app": 1, "--base": 1, "--python-version": 1}
+    seen = set()
+    while i < len(rest):
+        token = rest[i]
+        if token in forms:
+            if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+                return f"{token} needs a value"
+            if token != "--base" and token in seen:
+                return f"{token} is given twice"
+            if token == "--base" and not _BASELINE_ID_TOKEN.match(rest[i + 1]):
+                return "--base takes a baseline id (bl-<12 hex>)"
+            seen.add(token)
+            i += 2
+        elif token.startswith("-"):
+            return f"{token} is not an option of `baseline plan`"
+        else:
+            positional.append(token)
+            i += 1
+    if "--app" in seen and not positional:
+        return None
+    if "--app" not in seen and len(positional) == 2 and positional[0].startswith("https://"):
+        return None
+    return "name an app (--app apps/<x>) or a GitHub URL and a ref"
+
+
+def _baseline_cli_decision(verb, tail, root) -> dict:
+    """The hook's decision for `cli.py baseline ...` and `cli.py git-owners ...`
+   . `tail` is the raw tokens after the verb,
+    or None when the verb was not directly after cli.py."""
+    def refuse(why):
+        return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: {why}. Package Guard accepts only its own CLI, "
+                                 f"exactly as: {store.cli_command(root, verb, '<subcommand> ...').rstrip()}")
+
+    if tail is None:
+        return refuse("the subcommand must come directly after cli.py")
+    tail = list(tail)
+    if any(_UNSAFE_PATH_TOKEN.search(token) for token in tail):
+        return refuse("a path, ref or id may not carry shell syntax")
+    # The human-only acts, first and whatever the switch says, so the agent is never
+    # told to try them another way.
+    if verb == "git-owners" and tail[:1] in (["add"], ["remove"]):
+        return _baseline_human_only(root, "the git-owners allowlist is a person's to edit", tail, verb)
+    if not pg_parser.FRAPPE_ENABLED:
+        return _decision("deny", "PACKAGE_GUARD_UNSUPPORTED: Frappe baselines are not enabled in this release "
+                                 "of Package Guard yet (planned for v1.12.0).")
+    if verb == "git-owners":
+        if tail == ["list"]:
+            return _decision("allow", "Package Guard: showing the git-owners allowlist.")
+        return refuse("git-owners takes `list`")
+    if not tail:
+        return refuse("`baseline` takes plan, show, list, export, import, approve or revoke")
+    sub, rest = tail[0], tail[1:]
+    if sub == "plan":
+        why = _baseline_plan_tokens_problem(tail)
+        if why:
+            return refuse(why)
+        return _decision("allow", "Package Guard: planning a baseline. It fetches the commit from the app's own "
+                                  "URL and compiles without building; it writes a proposal and approves nothing.")
+    if sub == "list" and not rest:
+        return _decision("allow", "Package Guard: listing baselines.")
+    if sub in ("show", "export") and len(rest) == 1 and _BASELINE_ID_TOKEN.match(rest[0]):
+        return _decision("allow", "Package Guard: read-only baseline display.")
+    if sub == "import" and len(rest) == 1 and not rest[0].startswith("-"):
+        return _decision("allow", "Package Guard: importing a baseline as a proposal. The plan is run again from "
+                                  "its URL and commit; nothing is approved.")
+    if sub in ("approve", "revoke") and len(rest) == 1 and _BASELINE_ID_TOKEN.match(rest[0]):
+        bid = rest[0]
+        if sub == "revoke":
+            try:
+                doc = baseline.load(root, bid)
+            except baseline.BaselineError as exc:
+                return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: cannot revoke - {exc}")
+            return _decision("ask", f"Package Guard: withdraw the approval of baseline {bid} "
+                                    f"({doc['app']['name']} {doc['app']['commit'][:12]}). Nothing is declined; "
+                                    "its commands need a new approved baseline.")
+        try:
+            doc = baseline.load(root, bid, proposal=True)
+        except baseline.BaselineError as exc:
+            return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: cannot approve - {exc}")
+        if doc.get("approvable") is False or doc["evidence"]["osv"]["malware"]:
+            return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: cannot approve - OSV lists malware in {bid}: "
+                                     + "; ".join(doc["evidence"]["osv"]["malware"][:3]))
+        try:
+            owners = baseline.load_owners(root)[0]
+        except baseline.BaselineError as exc:
+            return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: cannot approve - {exc}")
+        why = baseline.owner_problem(doc["app"]["git_url"], owners)
+        if why:
+            return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: cannot approve - {why}")
+        builds = baseline.all_builds(doc)
+        if builds:
+            return _baseline_human_only(
+                root, f"{bid} lists {len(builds)} packages that will be built from source on the person's machine, "
+                      "and only they confirm that list, once, by typing a word", ["approve", bid])
+        return _decision("ask", baseline.prompt_text(doc, owners))
+    return refuse("that is not a form of `baseline` Claude may run")
+
+
+
+def _bench_config_cli_decision(tail, root) -> dict:
+    """The hook's decision for `cli.py bench-config ...`: `check` reads and says whether the installer
+    files hold; `apply` writes them, so the person's prompt is the gate. Only the documented options
+    pass, read from the raw tokens, and the verb is refused while the Frappe switch is off."""
+    def refuse(why):
+        return _decision("deny", f"PACKAGE_GUARD_CLI_REFUSED: {why}. Package Guard accepts only its own CLI, "
+                                 f"exactly as: {store.cli_command(root, 'bench-config', '<apply|check>').rstrip()}")
+
+    if tail is None:
+        return refuse("the subcommand must come directly after cli.py")
+    tail = list(tail)
+    if any(_UNSAFE_PATH_TOKEN.search(token) for token in tail):
+        return refuse("a path or version may not carry shell syntax")
+    if not pg_parser.FRAPPE_ENABLED:
+        return _decision("deny", "PACKAGE_GUARD_UNSUPPORTED: Frappe support is not enabled in this release "
+                                 "of Package Guard yet.")
+    if not tail or tail[0] not in ("apply", "check"):
+        return refuse("`bench-config` takes apply or check")
+    verb, rest, i, toolchain, new_apps = tail[0], tail[1:], 0, [], []
+    while i < len(rest):
+        if rest[i] == "--bench" and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
+            i += 2
+        elif verb == "apply" and rest[i] == "--toolchain" and i + 1 < len(rest) and "==" in rest[i + 1]:
+            toolchain.append(rest[i + 1])
+            i += 2
+        elif verb == "apply" and rest[i] == "--no-symlinks":
+            i += 1
+        elif (verb == "apply" and rest[i] == "--new-app" and i + 1 < len(rest)
+              and bench_config.NEW_APP_NAME.fullmatch(rest[i + 1])):
+            new_apps.append(rest[i + 1])
+            i += 2
+        else:
+            return refuse(f"{rest[i]!r} is not an option of `bench-config {verb}`")
+    if verb == "check":
+        return _decision("allow", "Package Guard: checking the bench's installer files.")
+    chosen = (" The toolchain pins you chose: " + ", ".join(toolchain) + ".") if toolchain else ""
+    if new_apps:
+        chosen += (" It also lets uv build, from source, the app(s) `bench new-app` is about to create: "
+                   + ", ".join(new_apps) + ". Allow this only if that is the name of a new app of yours and "
+                   "not the name of a package from an index.")
+    return _decision("ask", (
+        "Package Guard: write this bench's installer files: env/pip.conf, uv.toml, the constraint files "
+        "under the guard's state directory and a .yarnrc in each yarn directory. They pin what bench's "
+        "installs may fetch to the approved baselines of its upstream apps (a package outside them can "
+        "still install; the guard checks the disk afterwards). It also adds the .yarnrc files to each app "
+        "repository's .git/info/exclude and, where the bench is a git repository, two lines to its "
+        ".gitattributes." + chosen +
+        " A file that is there already and was not written by the guard is never overwritten."))
+
 
 def _handle_cli(call, root, transcript_path=None) -> dict:
     subcommand, review_ids = call
     if subcommand == "mode":
         return _mode_cli_decision(review_ids, root)
+    if subcommand == "bench-config":
+        return _bench_config_cli_decision(review_ids, root)
+    if subcommand in ("baseline", "git-owners"):
+        return _baseline_cli_decision(subcommand, review_ids, root)
     if subcommand == "show":
         return _decision("allow", "Package Guard: read-only review display.")
     if subcommand in ("decline", "undecline", "revoke"):
@@ -2939,8 +3541,16 @@ _NO_LOCK_REMEDY = {
     "yarn": "Create the lock without linking or building anything, as its own "
             "command: `yarn install --mode=update-lockfile`.",
 }
+_NO_LOCK_REMEDY_CLASSIC = (
+    "Yarn Classic cannot create a lock without installing, and an install resolves a tree "
+    "nobody reviewed. Add each dependency by name and exact version, after it is reviewed and "
+    "approved, inside the app's own folder: `yarn add <name>@<exact version> --ignore-scripts` "
+    "(it writes package.json and yarn.lock). Remove a dependency's line from package.json "
+    "first if you wrote it there; or ask the user to run `yarn install --ignore-scripts` "
+    "themselves, outside this session.")
 _PM_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
 _YARN_PIN = re.compile(r"^4\.(\d+)\.\d+$")
+_YARN_CLASSIC_PIN = re.compile(r"^1\.\d+\.\d+$")
 _PM_FIELD = re.compile(r"^(?P<name>[A-Za-z][A-Za-z0-9._-]*)@(?P<version>[^+\s]+)"
                        r"(?:\+(?P<hash>(?:sha1|sha224|sha256|sha384|sha512)\.[0-9A-Fa-f]+))?$")
 
@@ -3006,6 +3616,12 @@ def _manager_pin(directory, kind, pin_required=True):
         declared = _declared_package_managers(directory)
     except ValueError as exc:
         return f"{exc}; a package manager pin that cannot be read cannot be reviewed", None
+    classic = False
+    if kind == "yarn":
+        flavour = pm_config.yarn_flavour(directory)
+        if flavour.conflict:
+            return f"{flavour.conflict}", None
+        classic = flavour.kind == pm_config.CLASSIC
     pins = set()
     for where, name, version in declared:
         if name != kind:
@@ -3017,20 +3633,27 @@ def _manager_pin(directory, kind, pin_required=True):
         if version is None or not _PM_VERSION.match(version):
             return (f"{where} {kind}@{version or '(no version)'} is not an exact version; "
                     "a range, tag or URL names no release Package Guard can review"), None
-        if kind == "yarn":
+        if kind == "yarn" and classic:
+            if _YARN_CLASSIC_PIN.match(version) is None:
+                return (f"{where} yarn@{version}: this project is Yarn Classic (1.x); the pin "
+                        "must be an exact 1.X.Y"), None
+            pins.add(("yarn", version))  # Corepack downloads npm's `yarn` package
+        elif kind == "yarn":
             match = _YARN_PIN.match(version)
             if match is None or int(match.group(1)) < 14:
-                return (f"{where} yarn@{version}: only Yarn Berry 4.14 or newer is supported "
-                        "(Classic, 2.x, 3.x and older 4.x run dependency scripts by default)"), None
+                return (f"{where} yarn@{version}: only Yarn Berry 4.14 or newer, or Yarn Classic "
+                        "1.x, is supported (Berry 2.x, 3.x and older 4.x run dependency scripts "
+                        "by default)"), None
             pins.add(("@yarnpkg/cli-dist", version))
         else:
             pins.add(("pnpm", version))
     if len(pins) > 1:
         return ("packageManager and devEngines.packageManager name different versions: "
                 + ", ".join(sorted(v for _n, v in pins))), None
-    if kind == "yarn" and not pins and pin_required:
-        return ("package.json must pin Yarn with packageManager: \"yarn@4.X.Y\" (X >= 14); "
-                "without it Corepack or a Yarn on PATH decides which release runs"), None
+    if kind == "yarn" and not pins and pin_required and not classic:
+        return ("package.json must pin Yarn with packageManager: \"yarn@4.X.Y\" (X >= 14) for "
+                "Yarn Berry, or have a v1 yarn.lock (Yarn Classic); without evidence of which, "
+                "Corepack or a Yarn on PATH decides which release runs"), None
     return None, (next(iter(pins)) if pins else None)
 
 
@@ -3070,6 +3693,14 @@ def _pm_project_problem(scope, directory):
     cost the human an approval prompt. Reads the lock completely, so a Classic,
     malformed or unreadable one denies here and never reads as an empty tree."""
     kind = scope.kind
+    classic = False
+    if kind == "yarn":
+        flavour = pm_config.yarn_flavour(directory)
+        if flavour.conflict:
+            return _decision(
+                "deny", f"PACKAGE_GUARD_UNSUPPORTED: {flavour.conflict}. One Yarn per project: "
+                "Package Guard will not guess which one runs. Tell the user."), None, None
+        classic = flavour.kind == pm_config.CLASSIC
     present = _lock_files(directory)
     if len(present) > 1:
         names = ", ".join(sorted(n for files in present.values() for n in files))
@@ -3106,7 +3737,7 @@ def _pm_project_problem(scope, directory):
             "deny",
             f"PACKAGE_GUARD_UNSUPPORTED: {directory} has no {pg_manifest.PM_LOCKFILES[kind]}, so "
             f"the tree this {kind} install would put on disk is not known and cannot be checked. "
-            + _NO_LOCK_REMEDY[kind]), None, None
+            + (_NO_LOCK_REMEDY_CLASSIC if classic else _NO_LOCK_REMEDY[kind])), None, None
     note = None
     if kind == "bun":
         if "bun.lock" not in present["bun"]:
@@ -3128,6 +3759,26 @@ def _pm_project_problem(scope, directory):
     problem, pin = _manager_pin(directory, kind)
     if problem:
         return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}."), None, None
+    if classic:
+        # A Classic lock need not be closed (HRMS's root one is not): a spec the install would
+        # reach and the lock has no entry for is resolved by Yarn itself, from the registry, as
+        # whatever is newest in range. Nobody reviewed that.
+        try:
+            unlocked = pg_manifest.classic_unlocked_specs(directory)
+        except pg_manifest.ManifestError as exc:
+            return _decision(
+                "deny",
+                f"PACKAGE_GUARD_ERROR: the lock for yarn in {directory} could not be read ({exc}). "
+                "Nothing was installed; do not edit the lock yourself, tell the user."), None, None
+        if unlocked:
+            shown = "; ".join(f"{spec} (needed by {parent})" for parent, spec in unlocked[:5])
+            more = f" and {len(unlocked) - 5} more" if len(unlocked) > 5 else ""
+            return _decision(
+                "deny",
+                f"PACKAGE_GUARD_UNSUPPORTED: yarn.lock in {directory} has no entry for "
+                f"{len(unlocked)} dependency specs this install would reach: {shown}{more}. Yarn "
+                "would resolve them itself, to versions nobody reviewed. The lock is stale; do "
+                "not edit it yourself, tell the user."), None, None
     if kind == "pnpm":
         problem = _pnpm_env_lock_problem(directory, pin)
         if problem:
@@ -3738,6 +4389,8 @@ def _edit_protected(root) -> list:
     if store.plugin_root():
         paths.append(store.plugin_root())
         paths.append(os.path.normpath(os.environ["CLAUDE_PLUGIN_ROOT"]))
+    if pg_parser.FRAPPE_ENABLED:
+        paths += [str(p) for p in bench_config.recorded_paths(root)]
     return paths
 
 
@@ -3845,6 +4498,12 @@ def _resolve_only_denial(parsed, event, root):
                 denial, _pin, _note = _pm_project_problem(scope, directory)
                 if denial:
                     return denial
+            if kind == "yarn" and pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC:
+                return _decision(
+                    "deny", f"PACKAGE_GUARD_UNSUPPORTED: `yarn install --mode=update-lockfile` is "
+                    f"a Yarn Berry command and {directory} is a Yarn Classic project, which has no "
+                    "way to write a lock without installing. Ask the user to refresh yarn.lock "
+                    "themselves, outside this session.")
             if kind == "yarn":
                 scripts += [f"{Path(directory) / 'package.json'}: `{name}`"
                             for name, _body in pg_manifest.npm_root_lifecycle_scripts(directory)]
@@ -3881,14 +4540,146 @@ def _bun_autoinstall_problem(cwd, directory, root) -> str | None:
 
 
 def _yarn_install_state_problem(directory) -> str | None:
-    """Berry's install state: `yarn run` checks it and refuses to run when stale,
-    and does not install by itself (UNVERIFIED), so a project without one has
-    nothing installed that was reviewed."""
+    """The install state of the project's Yarn: Berry's `yarn run` checks it and refuses to
+    run when stale, and does not install by itself (UNVERIFIED), so a project without one has
+    nothing installed that was reviewed. Classic writes `node_modules/.yarn-integrity`."""
     base = Path(directory)
-    if (base / "node_modules").is_dir() and (base / "node_modules" / ".yarn-state.yml").is_file():
+    if pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC:
+        marker = ".yarn-integrity"
+    else:
+        marker = ".yarn-state.yml"
+    if (base / "node_modules").is_dir() and (base / "node_modules" / marker).is_file():
         return None
-    return ("there is no installed state here (node_modules/.yarn-state.yml): run `yarn install` "
+    return (f"there is no installed state here (node_modules/{marker}): run `yarn install` "
             "first, as its own reviewed command")
+
+
+# Yarn Berry and Yarn Classic share the `yarn` head and differ in which words are builtins. A word
+# that is not a builtin of the project's Yarn runs a package.json script of that name instead,
+# which the gate does not read.
+_YARN_CLASSIC_WORDS = frozenset({
+    "", "install", "add", "upgrade", "remove", "run", "why", "info", "bin", "help", "config",
+    "list", "ls", "outdated", "licenses", "check", "audit", "versions", "cache", "print"})
+_YARN_CLASSIC_ONLY = frozenset({"upgrade", "list", "ls", "outdated", "licenses", "check", "audit",
+                                "versions", "cache"})
+_CLASSIC_ALLOWED_FLAGS = None  # built lazily from the parser's tables
+
+
+def _classic_allowed_flags():
+    global _CLASSIC_ALLOWED_FLAGS
+    if _CLASSIC_ALLOWED_FLAGS is None:
+        _CLASSIC_ALLOWED_FLAGS = (pg_parser.YARN_CLASSIC_FLAGS | pg_parser._YARN_SAVE_FLAGS) \
+            - {"--mode"}
+    return _CLASSIC_ALLOWED_FLAGS
+
+
+def _yarn_word_denial(flavour, word, flags, directory) -> dict | None:
+    """A denial when the verb word or a flag is not one the project's Yarn knows. `flavour` is
+    `pm_config.yarn_flavour(directory)`. Berry's own rules are unchanged; a Classic-only word or
+    flag on Berry, and a Berry-only one on Classic, are refused rather than guessed at."""
+    if flavour.kind == pm_config.CLASSIC:
+        if word and word not in _YARN_CLASSIC_WORDS:
+            return _decision("deny", (
+                f"PACKAGE_GUARD_UNSUPPORTED: `yarn {word}` is not a Yarn Classic command ({directory} "
+                "is a Yarn Classic project): Classic would run a package.json script of that name "
+                "instead, which Package Guard does not read. Use `yarn run <script>`."))
+        bad = [f for f in flags if f not in _classic_allowed_flags()]
+        if bad:
+            return _decision("deny", (
+                f"PACKAGE_GUARD_UNSUPPORTED: {', '.join(bad)} is not a Yarn Classic flag "
+                f"({directory} is a Yarn Classic project)."))
+    elif flavour.kind == pm_config.BERRY or flavour.kind is None:
+        if word in _YARN_CLASSIC_ONLY:
+            return _decision("deny", (
+                f"PACKAGE_GUARD_UNSUPPORTED: `yarn {word}` is a Yarn Classic command, and {directory} "
+                "is not a Yarn Classic project (no v1 yarn.lock, no yarn@1 pin): Yarn would run a "
+                "package.json script of that name instead. Use `yarn run <script>`."))
+        bad = [f for f in flags if f in pg_parser.YARN_CLASSIC_FLAGS - pg_parser.YARN_BERRY_FLAGS]
+        if bad:
+            hint = (" (Yarn Berry has no --ignore-scripts; use --mode=skip-build)"
+                    if "--ignore-scripts" in bad else "")
+            return _decision("deny", (
+                f"PACKAGE_GUARD_UNSUPPORTED: {', '.join(bad)} is a Yarn Classic flag and {directory} "
+                f"is not a Yarn Classic project{hint}."))
+    return None
+
+
+def _yarn_classic_config(scope, directory, cwd, command):
+    """(ClassicConfig, denial) for a Classic command: the effective configuration, computed with
+    what the shell gives the command (an inline YARN_IGNORE_SCRIPTS=true, the PATH it sets) and
+    with the rc files counted only when the `yarn` that will run is shown to be Yarn Classic. A
+    Classic lock does not prove the executable is Classic: a Berry binary on PATH migrates the
+    lock and runs the root scripts, ignoring every Classic rc key. The executable is found, never
+    run (`pm_config.yarn_executable`). A known Berry denies; one that cannot be established leaves
+    only `--frozen-lockfile` and `--ignore-scripts` on the command, which Berry rejects."""
+    facts = dict(scope.env)
+    environ = dict(os.environ)
+    if facts.get("YARN_IGNORE_SCRIPTS") == "true":
+        environ["YARN_IGNORE_SCRIPTS"] = "true"
+    path_value = facts["PATH"] if "PATH" in facts else os.environ.get("PATH", "")
+    pin = None
+    try:
+        pin = next((v for _w, n, v in _declared_package_managers(directory) if n == "yarn" and v), None)
+    except ValueError:
+        pass
+    exe = pm_config.yarn_executable(facts.get("head", "yarn"), path_value, cwd, pin)
+    if exe.major is not None and exe.major != 1:
+        return None, _decision("deny", (
+            f"PACKAGE_GUARD_UNSUPPORTED: {directory} is a Yarn Classic project, but the `yarn` that "
+            f"would run is Yarn {exe.version} ({exe.why}). It would migrate yarn.lock and install "
+            "versions nobody reviewed. Use the project's Yarn Classic, or ask the user."))
+    config = pm_config.yarn_classic_config(cwd, sources.HOME, environ, command, scope.flags,
+                                           trust_rc=exe.major == 1, untrusted_why=
+                                           f"the `yarn` that would run is not shown to be Yarn Classic ({exe.why})")
+    return config, None
+
+
+def _yarn_install_denial(scope, directory, cwd) -> dict | None:
+    """The checks a Yarn install, add or upgrade needs beyond the lock and the pin, once the
+    project's Yarn is known.
+
+    Berry: a Classic-only verb or flag is refused. Classic (v1): the verb is a Classic one, every
+    flag is Classic's, scripts are PROVEN off for this command and the lock is PROVEN frozen for
+    a bare install, from the command line and the `.yarnrc` files and environment Yarn reads in
+    its own order. Cross-flavour proofs never count: Berry's `--mode=skip-build` and
+    `enableScripts: false` mean nothing to Yarn Classic. `add` and `upgrade` rewrite the lock by
+    design, so `--frozen-lockfile` would fail them: it is required of `install` only."""
+    flavour = pm_config.yarn_flavour(directory)
+    denial = _yarn_word_denial(flavour, scope.verb, scope.flags, directory)
+    if denial or flavour.kind != pm_config.CLASSIC or flavour.conflict:
+        return denial
+    command = scope.verb or "install"
+    config, denial = _yarn_classic_config(scope, directory, cwd, command)
+    if denial:
+        return denial
+    if not config.scripts_off:
+        unread = (f" A .yarnrc that Package Guard cannot read the way Yarn does is not counted: "
+                  f"{config.problems[0]}." if config.problems else "")
+        return _decision("deny", (
+            f"PACKAGE_GUARD_UNSUPPORTED: `yarn {scope.verb}`".rstrip() + " would run lifecycle scripts "
+            f"(dependency install scripts and the root's own): {config.scripts_reason}.{unread} Add "
+            "`--ignore-scripts` to the same command. Do not edit .yarnrc or the environment to "
+            "get around this. A package whose script is needed (node-sass on Frappe v11 to v13 downloads "
+            "native code with no checksum) is for the user to build, once, in their own terminal, after "
+            f"the install: {legacy.node_sass_command(directory)} . That is scoped to node-sass; "
+            "`YARN_IGNORE_SCRIPTS=false yarn install` would run every locked package's script and is not "
+            "offered. Claude does not run it."))
+    if command == "install" and not config.frozen:
+        return _decision("deny", (
+            "PACKAGE_GUARD_UNSUPPORTED: `yarn install` without a frozen lockfile may resolve "
+            f"versions nobody reviewed: {config.frozen_reason}. Add `--frozen-lockfile` to the "
+            "same command (`--pure-lockfile` does not stop resolution)."))
+    return None
+
+
+def _yarn_run_denial(run, directory, cwd) -> dict | None:
+    """The same word and flag judgement for a Yarn command that acquires nothing (a runner,
+    `remove`, a read-only verb)."""
+    flavour = pm_config.yarn_flavour(directory)
+    word = run.word or (run.verb if run.verb not in ("manager", "print", "remove") else "")
+    if run.verb == "print":
+        word = "print"
+    return _yarn_word_denial(flavour, word, run.flags, directory)
 
 
 def _manager_pin_denial(kind, directory, root, event, pin_required=True):
@@ -3943,7 +4734,7 @@ def _manager_pin_denial(kind, directory, root, event, pin_required=True):
     return _decision("deny", _render_review_required([dict(report, retry_command=command)], root))
 
 
-def _remove_denial(run, directory, root) -> dict | None:
+def _remove_denial(run, directory, root, cwd=None) -> dict | None:
     """The checks a `pnpm|bun|yarn remove` needs beyond the configuration and pin checks
     every run gets (v1.10.0 hardening, A4). `remove` rewrites package.json and the lock,
     relinks node_modules and runs the root project's lifecycle scripts, and it is the
@@ -3973,6 +4764,18 @@ def _remove_denial(run, directory, root) -> dict | None:
             f"PACKAGE_GUARD_UNSUPPORTED: `{kind} remove` would re-resolve the project, and "
             f"{where.name} and the lock disagree, so it would install something nobody "
             f"reviewed ({listed}). Tell the user; do not edit the lock yourself."))
+    if kind == "yarn" and pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC:
+        # Classic: scripts are off only by Classic's own proofs; Berry's `--mode=skip-build` and
+        # `enableScripts: false` mean nothing to it. `remove` is not frozen (it rewrites the lock).
+        config, denial = _yarn_classic_config(run, directory, cwd or directory, "remove")
+        if denial:
+            return denial
+        if config.scripts_off:
+            return None
+        return _decision("deny", (
+            "PACKAGE_GUARD_UNSUPPORTED: `yarn remove` re-runs the install, with dependency and "
+            f"root lifecycle scripts: {config.scripts_reason}. Add `--ignore-scripts` to the same "
+            "command. Do not edit package.json, .yarnrc or the lock to get around this."))
     if not run.scripts or (kind == "yarn" and pm_config.yarn_scripts_disabled(directory, sources.HOME)):
         return None
     try:
@@ -4019,13 +4822,17 @@ def _run_denial(parsed, event, root):
         if problems:
             return _decision("deny", _render_alternate_source(problems))
         for _scope, directory in targets:
+            if run.kind == "yarn":
+                denial = _yarn_run_denial(run, directory, cwd)
+                if denial:
+                    return denial
             if run.kind in ("pnpm", "yarn"):
                 denial = _manager_pin_denial(run.kind, directory, root, event,
                                              pin_required=run.verb != "print")
                 if denial:
                     return denial
             if run.verb == "remove":
-                denial = _remove_denial(run, directory, root)
+                denial = _remove_denial(run, directory, root, cwd)
                 if denial:
                     return denial
             reason = None
@@ -4093,17 +4900,17 @@ def evaluate(event: dict, root) -> dict | None:
         call = _guard_cli_call(tokens)
         if call:
             if not _clean_project_cli(tokens, root, event.get("cwd")):
-                ids = "" if call[0] == "mode" else " ".join(call[1]) or "<review-id> ..."
+                ids = "" if call[0] in _RAW_TAIL_VERBS else " ".join(call[1]) or "<review-id> ..."
                 return _decision(
                     "deny",
                     "PACKAGE_GUARD_UNSUPPORTED: run this project's own Package Guard CLI, "
                     "with no other `uv` option, exactly as:\n  "
                     f"{store.cli_command(root, call[0] or '<subcommand>', ids).rstrip()}",
                 )
-            if call[0] == "mode":
+            if call[0] in _RAW_TAIL_VERBS:
                 # The raw tokens after the verb; None when the verb is not
                 # directly after cli.py (the parsed call skips `--flags`).
-                call = ("mode", tokens[7:] if tokens[6] == "mode" else None)
+                call = (call[0], tokens[7:] if tokens[6] == call[0] else None)
             return _handle_cli(call, root, event.get("transcript_path"))
 
     # The command names a guard CLI verb but was not recognised as a clean
@@ -4148,6 +4955,13 @@ def evaluate(event: dict, root) -> dict | None:
             "another way to do this: stop and tell the user what you were asked and that this "
             "is theirs to do.",
         )
+    if written == "config":
+        return _decision(
+            "deny",
+            "PACKAGE_GUARD_UNSUPPORTED: this writes a file Package Guard wrote for an installer "
+            "(a bench's pip.conf or uv.toml, a .yarnrc, a constraint file). They pin what bench "
+            "may install and only Package Guard changes them, from an approved baseline. Do not "
+            "look for another way: stop and tell the user what you wanted to change.")
     if written == "state":
         return _decision(
             "deny",
@@ -4265,9 +5079,518 @@ def _with_mode(event: dict, root, command: str, early, advanced) -> dict | None:
     return decision
 
 
+# ---------------------------------------------------------------------------
+# The bench gate (Frappe, behind `parser.FRAPPE_ENABLED`)
+#
+# A `bench` verb that installs packages or runs project code, and an install into a bench's env,
+# run only when every app they touch is covered by an approved baseline (an upstream app) or a
+# fully reviewed manifest (a custom app), the guard's installer files are what they should be and
+# nothing overrides them, the bench itself is a release that was looked at, and no earlier part of
+# the command could have changed what the gate read. Local reads and one recomputation: the one
+# network step, the baseline audit, runs in the CLI (`cli.py audit`) and the hook reads its cache.
+# ---------------------------------------------------------------------------
+
+def _bench_deny(code: str, text: str) -> dict:
+    return _decision("deny", f"{code}: {text}")
+
+
+def _bench_plan_command(root, app_name) -> str:
+    return store.cli_command(root, "baseline", f"plan --app apps/{app_name}").rstrip()
+
+
+def _bench_apply_command(root) -> str:
+    return store.cli_command(root, "bench-config", "apply").rstrip()
+
+
+def _bench_problem_lines(problems, limit=6) -> str:
+    lines = [f"- {p}" for p in problems[:limit]]
+    if len(problems) > limit:
+        lines.append(f"- ... and {len(problems) - limit} more")
+    return "\n".join(lines)
+
+
+def _exclusive_denial(parsed, event, classic=False) -> dict | None:
+    """A bench verb, an env install or a Yarn Classic install must be the only writer of its
+    command and must run in the foreground: an earlier segment that is not a known reader may have
+    changed the manifests after the gate compared them, and a background install is reconciled
+    before it ends."""
+    tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    if tool_input.get("run_in_background"):
+        return _decision(
+            "deny",
+            "PACKAGE_GUARD_UNSUPPORTED: this install would run in the background, so the disk is "
+            "reconciled before it ends and what it installs is not checked. Run it in the "
+            "foreground, as its own command.")
+    if not parsed.exclusive:
+        return _decision(
+            "deny",
+            "PACKAGE_GUARD_UNSUPPORTED: this install follows another command of the same line "
+            "that is not a plain reader, or runs in the background (`&`, `nohup`): the manifests "
+            "could change after the gate compared them, or the install may still be running when "
+            "the disk is read. Run the install as its own command, with nothing before it that "
+            "writes.")
+    return None
+
+
+def _bench_requests(unreviewed, command, app=None):
+    """PackageRequests for the declared dependencies of a custom app that are not exact vetted
+    pins, so the ordinary review path asks for each one. A Python requirement with a range
+    (`flit_core >=3.4,<4`) is reviewed at the newest release the range admits, never at the newest
+    release there is."""
+    requests = []
+    for ecosystem, name, version, _where in unreviewed:
+        spec = f"=={version}" if (version and ecosystem == "pypi") else version
+        if ecosystem == "pypi" and version is None and app is not None:
+            text = bench_config.pyproject_requirement_text(Path(app) / "pyproject.toml", name)
+            pick = vetting.suggest_build_pin(text) if text else None
+            if pick:
+                version, spec = pick[1], f"=={pick[1]}"
+        requests.append(pg_parser.PackageRequest(
+            manager="bench", operation="install", ecosystem=ecosystem,
+            name=name, display_name=name, requested_spec=spec, exact_version=version,
+            registry=pg_parser.NPM_REGISTRY if ecosystem == "npm" else pg_parser.PYPI_REGISTRY,
+            original_command=command))
+    return requests
+
+
+def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=None, notes=None):
+    """(denial or None, [PackageRequest] still to review, [{"app", "baseline"}] covered).
+
+    The order of design section 6, with coverage before the files: the files are recomputed from
+    the baselines of the covered apps, so they cannot be judged until those are known.
+
+    `yarn_targets` (a list, filled in) receives (ManifestScope, directory) for each yarn directory of
+    a CUSTOM app that this verb installs in, so the caller runs on them exactly what a direct
+    `yarn install` there would get: the source check on the lock, the review of every direct
+    dependency, the OSV check of the whole tree, the `.npmrc` chain. An upstream app's lock is the
+    baseline's (its manifest digests are checked above), and gets the same executable and `.npmrc`
+    checks."""
+    env_install = scope.verb == "env-install"
+    runner = scope.verb in ("build", "update-run")
+
+    def deny(code, text):
+        return _bench_deny(code, text), [], []
+
+    problems = bench_gate.read_problems(root)
+    if problems:
+        return deny("PACKAGE_GUARD_BENCH_CONFIG", "a bench command left something wrong that nobody has resolved yet:\n"
+                    + _bench_problem_lines([p.get("text", "?") for p in problems])
+                    + "\nTell the user. After they fix it, `" + store.cli_command(root, "reconcile", "").rstrip()
+                    + "` re-checks it and clears what is gone.")
+    why = bench_config.redirect_problem()
+    if why:
+        return deny("PACKAGE_GUARD_UNSUPPORTED", why + ".")
+    bench = bench_config.bench_root(cwd)
+    if bench is None:
+        return deny("PACKAGE_GUARD_UNSUPPORTED", f"no Frappe bench (a directory with apps/ and sites/) holds {cwd}; "
+                    "run the command from the bench root or from an app inside it.")
+    if not _within(bench, root):
+        return deny("PACKAGE_GUARD_UNSUPPORTED", f"the bench at {bench} is outside the project Package Guard protects "
+                    f"({os.path.realpath(root)}): its baselines and configuration would be somebody else's. "
+                    "Install the guard at the bench root.")
+    if not env_install:
+        try:
+            install = bench_gate.read_bench_install(os.environ.get("PATH"), executable=scope.executable,
+                                                    cwd=cwd)
+        except bench_config.BenchConfigError as exc:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", f"{exc}, so the bench release cannot be checked. Tell the user.")
+        why = bench_gate.version_problem(install)
+        if why:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", f"{why}. Tell the user.")
+        if scope.verb.startswith("update"):
+            try:
+                missing = bench_gate.missing_patches(bench, install)
+            except bench_config.BenchConfigError as exc:
+                return deny("PACKAGE_GUARD_UNSUPPORTED", f"{exc}: `bench update` runs the patches the bench lacks, "
+                            "and what they are cannot be read. Tell the user.")
+            if missing:
+                return deny("PACKAGE_GUARD_UNSUPPORTED", "`bench update` runs the patches of the installed bench that "
+                            f"{bench}/patches.txt does not list, and one of them runs `npm install`: "
+                            + ", ".join(missing) + ". Tell the user; they can run the update themselves.")
+    env = bench / "env"
+    if not (env / "pyvenv.cfg").is_file():
+        return deny("PACKAGE_GUARD_UNSUPPORTED", f"the bench at {bench} has no Python environment in env/ yet; creating it "
+                    "(`bench init`, `bench setup env`) is a step for the user, in their own terminal.")
+
+    apps_all = bench_config.bench_apps(bench)
+    by_name = {Path(a).name: a for a in apps_all}
+    if env_install or runner and not scope.apps:
+        involved = list(apps_all)
+    else:
+        unknown = [n for n in scope.apps if n not in by_name]
+        if unknown:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", f"{', '.join(unknown)} is not an app of the bench at {bench} (its "
+                        "directory in apps/ needs hooks.py, modules.txt and patches.txt).")
+        involved = [by_name[n] for n in scope.apps] if scope.apps else list(apps_all)
+    if scope.verb == "build":
+        involved = [by_name[n] for n in scope.apps if n in by_name]
+    if runner:
+        # Frappe v16's build runs `yarn install --frozen-lockfile` in EVERY app of the bench that has a
+        # `scripts.build` and no node_modules, whatever `--app` names. Such a run is an install of
+        # those apps: coverage, the custom-app review, the recomputed installer files, the lock checks.
+        node_apps = [a for a in apps_all if _builds_with_yarn(a)]
+        if node_apps:
+            runner = False
+            involved = list(dict.fromkeys([*involved, *node_apps]))
+    if scope.node:
+        major = bench_gate.frappe_major(bench)
+        if major is None or major < bench_gate.NODE_YARN_FROM:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", "`bench setup requirements --node` on a Frappe older than "
+                        f"v{bench_gate.NODE_YARN_FROM} (or one whose version is not written down) runs a "
+                        "bench-root `npm install` that Package Guard does not read.")
+
+    names = bench_gate.local_names(bench, apps_all)
+    try:
+        coverings = bench_gate.covering_of(root, apps_all, names)
+    except Exception as exc:  # noqa: BLE001 - what cannot be read is not covered
+        return deny("PACKAGE_GUARD_BASELINE_REQUIRED", f"the baselines could not be read ({exc.__class__.__name__}: {exc}).")
+    extras, covered = [], []
+    need_coverage = [] if runner else involved
+    if env_install:
+        need_coverage = [a for a in apps_all if coverings[Path(a)]["kind"] != "custom"]
+    for app in need_coverage:
+        covering = coverings[Path(app)]
+        label = Path(app).name
+        if covering["kind"] == "baseline":
+            covered.append({"app": str(app), "baseline": covering["baseline"]["id"]})
+        elif covering["kind"] == "upstream-uncovered":
+            return deny("PACKAGE_GUARD_BASELINE_REQUIRED", (
+                f"apps/{label} is not covered by an approved baseline: "
+                + "; ".join(covering["reasons"][:3])
+                + f". A baseline approves an app's whole dependency set once. Run, then ask the user to "
+                f"approve the proposal it prints (advisories in it are information, not a block): "
+                f"{_bench_plan_command(root, label)}. Do not install the app's packages one by one."))
+        else:
+            if covering["refused"]:
+                return deny("PACKAGE_GUARD_UNSUPPORTED", (
+                    f"apps/{label} is a custom app and declares dependencies Package Guard cannot "
+                    "review: " + "; ".join(str(r) for r in covering["refused"][:5]) + "."))
+            extras += _bench_requests(covering["unreviewed"], command, app)
+    docs = bench_gate.baseline_docs(coverings)
+    absent = bench_gate.absent_excluded_names(docs, names)
+    if absent and not runner:
+        return deny("PACKAGE_GUARD_UNSUPPORTED", "a baseline's requirements name an app that is not in this bench: "
+                    + ", ".join(f"{name} ({bid})" for bid, name in absent[:5])
+                    + ". An app comes from `bench get-app`, which is the user's command, never from PyPI, so nothing "
+                    "here may install the name. Tell the user.")
+    unbuilt = bench_gate.unapproved_builds(docs)
+    if unbuilt and not runner:
+        return deny("PACKAGE_GUARD_BASELINE_REQUIRED", "a baseline lists packages that build from source at install and "
+                    "its approval did not allow them: "
+                    + ", ".join(f"{name} ({bid})" for bid, name in unbuilt[:5]) + ". Tell the user.")
+    if not runner:
+        for doc in docs:
+            why = bench_gate.requires_python_problem(doc["python"]["requires_python"], env)
+            if why:
+                return deny("PACKAGE_GUARD_BASELINE_REQUIRED", f"baseline {doc['id']} ({doc['app']['name']}): {why}.")
+
+    # The installer files, recomputed, and what pip, uv and yarn would really read.
+    home = Path.home()
+    config_cwd = bench if not env_install else cwd
+    try:
+        if runner:
+            problems = bench_config.verify_recorded(bench, root, cwd=config_cwd, home=home, environ=os.environ)
+        else:
+            config = bench_gate.config_input(root, bench)
+            problems = bench_config.verify(bench, root, config, cwd=config_cwd, home=home,
+                                           environ=os.environ)
+    except bench_config.BenchConfigError as exc:
+        return deny("PACKAGE_GUARD_BASELINE_REQUIRED" if getattr(exc, "baseline", False)
+                    else "PACKAGE_GUARD_BENCH_CONFIG", f"{exc}. Tell the user.")
+    if problems:
+        return deny("PACKAGE_GUARD_BENCH_CONFIG", (
+            "Package Guard's installer files for this bench are missing, differ from what the "
+            "approved baselines call for, or something overrides them:\n"
+            + _bench_problem_lines(problems)
+            + f"\nRun the command without the override, or ask the user to run `{_bench_apply_command(root)}`. "
+            "Do not set it another way or edit the files."))
+    if not runner:
+        editable = bench_gate.editable_installs(env)
+        for app in involved:
+            for why in bench_gate.local_name_problems(app, names, apps_all, editable):
+                return deny("PACKAGE_GUARD_UNSUPPORTED", why)
+    # Yarn: the flavour, the lock read in full, the pin, for every directory a yarn install runs in.
+    if not env_install:
+        run_dirs = []
+        for app in involved:
+            for directory in _bench_yarn_run_dirs(bench, app):
+                if directory not in [d for _a, d in run_dirs]:
+                    run_dirs.append((Path(app), directory))
+        for app_root, directory in run_dirs:
+            if notes is not None and directory != app_root and not (directory / "node_modules").is_dir() \
+                    and (directory / "yarn.lock").is_file():
+                notes.append(
+                    f"{directory} has no node_modules, and the guard's .yarnrc keeps a script such as "
+                    f"`cd {directory.name} && yarn install` from running, so the build of "
+                    f"{app_root.name} cannot find its tools. Install it first, as its own command, with "
+                    f"{directory} as the working directory: yarn install --frozen-lockfile --ignore-scripts "
+                    "(an app an approved baseline covers needs no review for this).")
+            route, requests = _classic_route(root, directory, command)
+            if route:
+                return route, [], []
+            if requests:
+                extras += requests
+                continue
+            denial, _pin, _note = _pm_project_problem(pg_parser.ManifestScope("yarn"), directory)
+            if denial:
+                return denial, [], []
+            denial = _bench_yarn_executable_denial(directory)
+            if denial:
+                return denial, [], []
+            custom = any(_within(directory, a) and coverings[Path(a)]["kind"] == "custom" for a in involved)
+            if custom and yarn_targets is not None and (
+                    (Path(directory) / "yarn.lock").is_file() or _declares_dependencies(directory, "yarn")):
+                yarn_targets.append((pg_parser.ManifestScope("yarn", verb=_BENCH_YARN), directory))
+            else:
+                problems = sources.npm_config_problems(directory) + sources.yarn_npmrc_problems(directory)
+                if problems:
+                    return _decision("deny", _render_alternate_source(problems)), [], []
+    return None, extras, covered
+
+
+_SHELL_DIR = re.compile(
+    r"""(?:\bcd|\bpushd)\s+(?P<cd>"[^"]+"|'[^']+'|[^\s&;|()]+)"""
+    r"""|--(?:cwd|prefix)(?:=|\s+)(?P<flag>"[^"]+"|'[^']+'|[^\s&;|()]+)""")
+
+
+def _bench_yarn_run_dirs(bench, app) -> list:
+    """The folders of one app that yarn will actually run in when bench (or frappe's build) runs yarn
+    there: the app's root (bench runs `yarn install` in each app root, and Frappe's build runs
+    `yarn install` and `yarn build` there), and every sub-project a script of an app's package.json
+    changes into or points yarn at (`cd banking && yarn install`, `yarn --cwd ui build`), followed
+    through the sub-projects' own scripts. A folder with a package.json that no script names (Frappe's
+    `ui/`) is not one: bench never runs yarn there. A script this reader cannot follow (a variable,
+    a command substitution, `~`, an unreadable package.json) puts every folder of the app that has a
+    yarn.lock back in the set, the stricter answer."""
+    app = Path(app)
+    found, seen, uncertain = [], set(), False
+
+    def visit(folder, depth):
+        nonlocal uncertain
+        manifest = folder / "package.json"
+        if folder in seen or depth > 3 or not manifest.is_file():
+            return
+        seen.add(folder)
+        found.append(folder)
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            uncertain = True
+            return
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        if not isinstance(scripts, dict):
+            return
+        for body in scripts.values():
+            if not isinstance(body, str):
+                continue
+            if re.search(r"\b(?:yarn|npm|pnpm|npx)\b", body) and re.search(r"[$`~]|\\", body):
+                uncertain = True
+                continue
+            here = folder
+            for match in _SHELL_DIR.finditer(body):
+                token = (match.group("cd") or match.group("flag")).strip("\"'")
+                target = Path(os.path.normpath(here / token))
+                if target != app and app not in target.parents:
+                    continue
+                if match.group("cd"):
+                    here = target
+                visit(target, depth + 1)
+
+    visit(app, 0)
+    if uncertain:
+        for directory in bench_config.yarn_dirs(bench)[1:]:
+            directory = Path(directory)
+            if (directory == app or app in directory.parents) and directory not in seen:
+                found.append(directory)
+    return found
+
+
+def _baseline_vouches(root, directory) -> bool:
+    """True when `directory` is inside an app of a Frappe bench that an approved baseline covers
+    (its package.json and yarn.lock files, at every depth, match the baseline by digest, and its
+    audit is fresh and clean), and has a yarn.lock: the baseline, not a review per package,
+    vouches for what the install fetches."""
+    if not pg_parser.FRAPPE_ENABLED:
+        return False
+    try:
+        bench = bench_config.bench_root(directory)
+        if bench is None or not (Path(directory) / "yarn.lock").is_file():
+            return False
+        apps = bench_config.bench_apps(bench)
+        app = next((a for a in apps if _within(directory, a)), None)
+        if app is None:
+            return False
+        names = bench_gate.local_names(bench, apps)
+        covering = bench_gate.covering_of(root, [app], names)[Path(app)]
+    except Exception:  # noqa: BLE001 - what cannot be read vouches for nothing
+        return False
+    return covering.get("kind") == "baseline"
+
+
+# The `verb` of the ManifestScope for a yarn directory a bench verb installs in: the lock, the
+# dependencies and the tree are judged like a direct install's, the command line's own flags (there are
+# none: bench passes them, and the guard's .yarnrc, verified above, stands for them) are not.
+_BENCH_YARN = "bench-yarn"
+
+
+def _builds_with_yarn(app) -> bool:
+    """True when running Frappe's build would run `yarn install` in this app: a `scripts.build` and
+    no node_modules. A package.json that cannot be read counts as one that does."""
+    app = Path(app)
+    if (app / "node_modules").is_dir() or not (app / "package.json").is_file():
+        return False
+    try:
+        data = json.loads((app / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(data, dict):
+        return True
+    scripts = data.get("scripts")
+    return isinstance(scripts, dict) and isinstance(scripts.get("build"), str)
+
+
+_NPM_EXACT = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
+
+
+def _bench_yarn_exe(directory):
+    """The `yarn` bench would run, from the hook's PATH (found, never run)."""
+    pin = None
+    try:
+        pin = next((v for _w, n, v in _declared_package_managers(directory) if n == "yarn" and v), None)
+    except ValueError:
+        pass
+    return pm_config.yarn_executable("yarn", os.environ.get("PATH", ""), directory, pin)
+
+
+def _classic_unlocked_deps(directory):
+    """[(name, spec)] that package.json declares and a Yarn Classic install would have to
+    resolve itself: there is no yarn.lock, or none of its entries is `name@spec`. None when the
+    ordinary lock checks must judge the directory (Berry, a conflict, an unreadable file, or a
+    spec that is not a registry name and version range, which they deny by name)."""
+    if not pm_config.classic_enabled():
+        return None
+    flavour = pm_config.yarn_flavour(directory)
+    if flavour.conflict or flavour.kind == pm_config.BERRY:
+        return None
+    try:
+        specs = pg_manifest._npm_dep_specs(directory)
+        if not specs:
+            return None
+        if (Path(directory) / "yarn.lock").is_file():
+            lock = pg_manifest.yarn_classic_lock.read_yarn_lock(Path(directory) / "yarn.lock")
+            listed = {d for entry in lock.entries for d in entry.descriptors}
+            specs = [(n, s) for n, s in specs if not isinstance(s, str) or f"{n}@{s}" not in listed]
+        elif flavour.kind is None and _bench_yarn_exe(directory).major != 1:
+            return None  # no evidence of Classic and no proof the yarn that runs is one
+    except (pg_manifest.ManifestError, lock_errors.LockReadError):
+        return None
+    if any(not isinstance(s, str) or ":" in s or "/" in s or "@" in s for _n, s in specs):
+        return None
+    return specs
+
+
+def _classic_route(root, directory, command):
+    """(denial or None, [PackageRequest]) for a Yarn Classic directory whose package.json lists
+    dependencies the lock lacks. Each goes to review by name and exact version, the way
+    `npm install x@1.2.3` does (a range is reviewed at the newest settled release it admits).
+    While any is in that state NO verb that runs yarn here is allowed, whatever is vetted: the
+    install would resolve it, and everything under it, itself. Once every one is approved the
+    denial names the Classic route. (None, []) when the directory has no such dependency."""
+    unlocked = _classic_unlocked_deps(directory)
+    if not unlocked:
+        return None, []
+    requests, route = [], []
+    for name, spec in unlocked:
+        exact = spec if _NPM_EXACT.match(spec) else None
+        identity = {"ecosystem": "npm", "name": name, "version": exact, "registry": pg_parser.NPM_REGISTRY}
+        if exact and store.is_vetted(root, identity) and not store.is_declined(root, identity):
+            route.append(f"yarn add {name}@{exact} --ignore-scripts")
+            continue
+        requests.append(pg_parser.PackageRequest(
+            manager="yarn classic", operation="add", ecosystem="npm", name=name, display_name=name,
+            requested_spec=spec, exact_version=exact, registry=pg_parser.NPM_REGISTRY,
+            original_command=command))
+    if requests:
+        return None, requests
+    return _decision("deny", (
+        f"PACKAGE_GUARD_UNSUPPORTED: {directory}/package.json lists dependencies that yarn.lock does "
+        "not have, so a Yarn Classic install would resolve them, and what they bring, by itself. "
+        "They are reviewed and approved. Remove their lines from package.json (a revert, not an "
+        "addition), then add each one in that app's own folder, as its own command; it writes "
+        "package.json and yarn.lock:\n  " + "\n  ".join(route))), []
+
+
+def _bench_yarn_executable_denial(directory) -> dict | None:
+    """The `yarn` bench will run (found on the PATH, never run) must not be a Berry: the Classic
+    rc files that stand for frozen locks and scripts off mean nothing to it, and it would migrate
+    the lock and run the root scripts before anything is reconciled. The same executable check a
+    direct `yarn install` gets (`_yarn_classic_config`)."""
+    if pm_config.yarn_flavour(directory).kind == pm_config.BERRY:
+        return None  # the ordinary Berry checks judge it
+    exe = _bench_yarn_exe(directory)
+    if exe.major != 1:
+        what = (f"is Yarn {exe.version}" if exe.major else "is not shown to be Yarn Classic")
+        return _decision("deny", (
+            f"PACKAGE_GUARD_UNSUPPORTED: bench would run `yarn` in {directory}, and the `yarn` the hook "
+            f"finds {what} ({exe.why}). A Berry or an unknown yarn would ignore the Classic .yarnrc "
+            "bench-config wrote (frozen lock, scripts off), migrate yarn.lock and run every "
+            "dependency's install script. The same rule as a direct `yarn install`: the hook has to see "
+            "Yarn Classic (1.x) on its own PATH. Start Claude Code from a shell where that `yarn` is "
+            "first on the PATH (nvm and volta set it only in the shell), or ask the user."))
+    return None
+
+
+def _bench_executables(parsed, cwd) -> list:
+    """The pip or python executables of the command that are a bench env's own."""
+    return [p for p in parsed.executables if bench_config.env_bin_bench(p, cwd) is not None]
+
+
+def _bench_gate(parsed, event, root, command):
+    """(denial or None, extra requests, yarn targets) for the `bench` scopes of a parse, and for an
+    install into a bench's env."""
+    cwd = event.get("cwd") or root
+    scopes = list(parsed.bench)
+    if parsed.bench_pythons or _bench_executables(parsed, cwd):
+        scopes.append(pg_parser.BenchScope("env-install"))
+    denial = _exclusive_denial(parsed, event)
+    if denial:
+        return denial, [], [], []
+    extras, covered, bench, yarn_targets, notes = [], [], None, [], []
+    for scope in scopes:
+        denial, more, found = _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets, notes)
+        if denial:
+            return denial, [], [], []
+        extras += more
+        covered += found
+    if covered:
+        bench = bench_config.bench_root(cwd)
+    if bench is not None:
+        bench_gate.record_allowed(root, bench, covered, event.get("tool_use_id"), command)
+    return None, extras, list(dict.fromkeys(yarn_targets)), list(dict.fromkeys(notes))
+
+
+def _note_guard_yarnrc(root, cwd) -> None:
+    """Fill `pm_config.GUARD_YARNRC_DIRS` for the bench the shell is in (see there)."""
+    pm_config.GUARD_YARNRC_DIRS.clear()
+    if not pg_parser.FRAPPE_ENABLED:
+        return
+    try:
+        if bench_config.bench_root(cwd) is None:
+            return
+        record = bench_config.read_record(root)
+        changed = {Path(p) for p, _why in bench_config.drift(root)}
+    except (bench_config.BenchConfigError, OSError):
+        return
+    for name in record:
+        path = Path(os.path.abspath(Path(root) / name))
+        if path.name == ".yarnrc" and path not in changed:
+            pm_config.GUARD_YARNRC_DIRS.add(os.path.realpath(path.parent))
+
+
 def _acquisition(event: dict, root, command: str, early, advanced) -> dict | None:
     """The package gate: what the mode turns down."""
     parsed = early if early is not None else pg_parser.parse_command(command)
+    _note_guard_yarnrc(root, event.get("cwd") or root)
     if parsed.kind == "ignore":
         if parsed.resolve_only:
             denial = _resolve_only_denial(parsed, event, root)
@@ -4320,15 +5643,39 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
             "project's .claude/, which holds Package Guard's own files. Use a directory "
             "outside .claude/, written as a literal absolute path.")
     cwd = event.get("cwd") or root
+    bench_targets, bench_notes = [], []
+    # An install into a bench env is one only for the bench the shell is in.
+    denial = _bench_env_problem(parsed, cwd)
+    if denial:
+        return denial
+    if pg_parser.FRAPPE_ENABLED and (parsed.bench or parsed.bench_pythons
+                                     or _bench_executables(parsed, cwd)):
+        denial, extra, bench_targets, bench_notes = _bench_gate(parsed, event, root, command)
+        if denial:
+            return denial
+        if extra:
+            # A custom app's declared dependencies that are not vetted exact pins go through the
+            # review every named package goes through.
+            parsed = dataclasses.replace(parsed, requests=parsed.requests + tuple(extra))
+    if any(r.manager == "yarn" for r in parsed.requests) \
+            and pm_config.yarn_flavour(cwd).kind == pm_config.CLASSIC:
+        # The retry the review prints for a Classic project names Classic's own flags.
+        parsed = dataclasses.replace(parsed, requests=tuple(
+            dataclasses.replace(r, manager="yarn classic") if r.manager == "yarn" else r
+            for r in parsed.requests))
     # Each manifest where its installer finds it, from the shell's directory
     # up (`_scope_directories`); the Python project the command acts on keys
     # its environments. A project the installer finds outside the guard root
     # is refused before anything reads it or opens a review for it.
     targets = [(scope, directory) for scope in parsed.manifests
                for directory in _scope_directories(scope, cwd, root)]
+    targets += [t for t in bench_targets if t not in targets]  # what a bench verb installs, judged as a direct install is
     outside = _outside_project(targets, cwd, root)
     if outside:
         return outside
+    denial = _bench_app_name_problem(parsed, targets, cwd)
+    if denial:
+        return denial
     project = _python_project(parsed, cwd, root)
     # A full record refuses before any review is opened: approving packages
     # for a command that is refused anyway would waste the human's prompt.
@@ -4342,19 +5689,43 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
     # pnpm, Bun and Yarn: one manager per project, the lock read in full, the
     # packageManager pin. Before any review, so a refused shape costs no prompt.
     pm_pins, pm_notes = {}, []
+    routed = set()
     for scope, directory in targets:
         if scope.kind == "npm":
             denial = _npm_project_problem(directory)
             if denial:
                 return denial
+        if scope.kind == "yarn":
+            # A Yarn Classic dependency the lock lacks goes to review by name and exact version,
+            # then to the Classic route; nothing that runs yarn here is allowed meanwhile.
+            denial, requests = _classic_route(root, directory, command)
+            if denial:
+                return denial
+            if requests:
+                parsed = dataclasses.replace(parsed, requests=parsed.requests + tuple(requests))
+                routed.add((scope.kind, os.path.realpath(directory)))
+                continue
         if scope.kind in pg_parser.PM_KINDS:
             denial, pin, note = _pm_project_problem(scope, directory)
             if denial:
                 return denial
+            if (scope.kind == "yarn" and scope.verb != _BENCH_YARN and pg_parser.FRAPPE_ENABLED
+                    and pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC):
+                denial = _exclusive_denial(parsed, event)
+                if denial:
+                    return denial
+            if scope.kind == "yarn" and scope.verb != _BENCH_YARN:
+                denial = _yarn_install_denial(scope, directory, cwd)
+                if denial:
+                    return denial
             pm_pins[(scope.kind, os.path.realpath(directory))] = pin
             if note and note not in pm_notes:
                 pm_notes.append(note)
 
+    targets = [(scope, directory) for scope, directory in targets
+               if (scope.kind, os.path.realpath(directory)) not in routed]
+    vouched = {(scope.kind, os.path.realpath(directory)) for scope, directory in targets
+               if scope.kind == "yarn" and _baseline_vouches(root, directory)}
     # A review vets registry/name@version; refuse when configuration, a
     # lock entry or a manifest spec would make the installer fetch from
     # anywhere else, so an approval always means what it says.
@@ -4468,8 +5839,9 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
         # Any npm install also reconciles the manifest of the project npm
         # finds from the working directory. Those dependencies land on disk
         # without ever being named on the command line, so they need the
-        # same gate.
-        for scope, directory in targets:
+        # same gate. (A yarn folder an approved baseline covers is that baseline's: its direct
+        # dependencies and its tree were reviewed and audited as a unit.)
+        for scope, directory in [t for t in targets if (t[0].kind, os.path.realpath(t[1])) not in vouched]:
             if (scope.kind == "uv-project" and not scope.locked and not scope.relocks
                     and (Path(directory) / "uv.lock").is_file()):
                 return _decision("deny", _UV_UNLOCKED)
@@ -4487,9 +5859,16 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
                 # any other npm package (Q15, D7).
                 resolved = list(resolved) + [(pin[0], pin[1], "packageManager")]
             if unresolved:
-                return _decision("deny", _render_unpinned(unresolved, where, scope.kind,
+                pin_kind = ("yarn-classic" if scope.kind == "yarn" and
+                            pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC
+                            else scope.kind)
+                return _decision("deny", _render_unpinned(unresolved, where, pin_kind,
                                                           _build_pins(unresolved, deadline)))
-            if scope.kind in pg_parser.NPM_FAMILY_KINDS and scope.scripts:
+            if scope.kind in pg_parser.NPM_FAMILY_KINDS and scope.scripts and not (
+                    scope.kind == "yarn"
+                    and pm_config.yarn_flavour(directory).kind == pm_config.CLASSIC):
+                # (A Yarn Classic install has no build allow-list: `_yarn_install_denial` already
+                # proved scripts off for it, or refused.)
                 blocked = _lifecycle_check(directory, root, scope.kind)
                 if blocked:
                     return blocked
@@ -4558,7 +5937,8 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
         return blocked
     # Everything named or declared is vetted; what lands now is
     # the tree under it. One batch call answers "is anything in it malware".
-    blocked, notes = _check_transitives(targets, root)
+    blocked, notes = _check_transitives(
+        [t for t in targets if (t[0].kind, os.path.realpath(t[1])) not in vouched], root)
     if blocked:
         return blocked
     # Recorded before the allow, under the project directory: a record the
@@ -4578,7 +5958,7 @@ def _acquisition(event: dict, root, command: str, early, advanced) -> dict | Non
     # Anything the agent must act on goes in additionalContext, and a material
     # risk is also shown to the user; a routine allow stays quiet.
     advisories = [n for n in audit_notes + notes if "advisories on" in n]
-    context = []
+    context = list(bench_notes)
     if advisories:
         context.append("Package Guard allowed this install, with known advisories: "
                        + " | ".join(advisories) + ". Tell the user about them.")

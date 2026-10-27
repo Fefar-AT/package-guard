@@ -91,6 +91,21 @@ LOCK_DENY = (
     "Edit(.claude/settings.local.json)",
 )
 
+# A Frappe bench target only, and only while the Frappe switch is on (`parser.FRAPPE_ENABLED`):
+# the installer files the guard writes for a bench (`bench_config.apply`) are locked against
+# the file tools like the guard's own. Separate from LOCK_DENY, which every install must have:
+# `--check` asks every project for all of LOCK_DENY, and a project that is not a bench has
+# no such files. The hook's lock on a recorded file is the one that matters; these rules
+# are the file tools' half in an installed project.
+BENCH_LOCK_DENY = (
+    "Edit(**/.yarnrc)",
+    "Edit(**/env/pip.conf)",
+    "Edit(**/uv.toml)",
+)
+BENCH_GITATTRIBUTES_LINES = (
+    ".claude/package-guard/constraints/** text eol=lf",
+)
+
 # Opt-in (--sandbox), installed projects only, like LOCK_DENY: the Claude Code
 # sandbox is the OS-level boundary the hook's text checks cannot be. It stops a
 # Bash write the command text hides (a script file, an interpreter one-liner,
@@ -121,8 +136,15 @@ SANDBOX_DENY_WRITE = (
     ".claude/settings.json",
     ".claude/settings.local.json",
 )
-# The package managers' own caches. npm and uv cannot install without them.
-SANDBOX_ALLOW_WRITE = ("~/.npm", "~/.cache/uv", "~/.cache/pip", "~/Library/Caches/pip")
+# The package managers' own caches. npm and uv cannot install without them. Yarn Classic
+# keeps its cache, global folder and user config under ~/.cache/yarn, ~/.yarn and
+# ~/.config/yarn, and writes `lastUpdateCheck` into ~/.yarnrc after an install; bench caches
+# the apps it fetches under ~/.cache/bench. The guard reads those yarn files on every yarn
+# command, so a sandboxed write to them is checked before the next install.
+SANDBOX_ALLOW_WRITE = (
+    "~/.npm", "~/.cache/uv", "~/.cache/pip", "~/Library/Caches/pip",
+    "~/.cache/yarn", "~/.yarn", "~/.config/yarn", "~/.yarnrc", "~/.cache/bench",
+)
 # Every host is reachable from a sandboxed command. The sandbox honours a bare
 # `*` only in a WebFetch(domain:...) allow rule (Claude Code v2.1.186+); the
 # rule also lets the WebFetch tool reach any host without a prompt.
@@ -173,8 +195,8 @@ MODE_LOCAL_FILES = (".mode.local.json", ".mode-log.jsonl", ".mode-seen.json",
 OLD_MANAGER_CLAUSE = "use `pnpm`/`yarn`/`bun`,"
 NEW_MANAGER_CLAUSE = (
     "use a package manager other than `npm`/`npx`, `pip`, `uv`, `pnpm`, `bun` or "
-    "Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack`, Yarn Classic and "
-    "Yarn Plug'n'Play are refused),")
+    "Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack` and Yarn Plug'n'Play "
+    "are refused; Yarn Classic and `bench` are gated),")
 
 # Plugin projects: the guard's code lives in the plugin, so the section names no
 # file-install hook path. The plugin's own hook enforces the file locks.
@@ -192,8 +214,9 @@ dependency-touching command, invoke the `package-guard` skill and follow it.
 
 Never: hand-edit `package.json` / `pyproject.toml` / lockfiles to add a
 dependency, use a package manager other than `npm`/`npx`, `pip`, `uv`, `pnpm`,
-`bun` or Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack`, Yarn Classic
-and Yarn Plug'n'Play are refused), wrap installs in `sh -c`/`eval`, use any
+`bun` or Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack` and Yarn
+Plug'n'Play are refused; Yarn Classic and `bench` are gated), wrap installs in
+`sh -c`/`eval`, use any
 other installer or wrapper to get packages onto disk, edit the project's
 Package Guard state directory, or disable or uninstall the `package-guard`
 plugin. Package Guard is the only gate in this project; if a Bash denial does
@@ -206,6 +229,9 @@ GITATTRIBUTES_LINES = (
     ".claude/hooks/package_guard/** text eol=lf",
     ".claude/skills/package-guard/** text eol=lf",
     ".claude/agents/package-vetter.md text eol=lf",
+    # what the guard writes for the baselines is LF on every checkout
+    ".claude/package-guard/baselines/** text eol=lf",
+    ".claude/package-guard/git-owners.json text eol=lf",
 )
 
 EMPTY_VETTED = {"schema_version": 1, "packages": []}
@@ -220,6 +246,63 @@ class InstallError(Exception):
 # ---------------------------------------------------------------------------
 # Source side: what the clone provides
 # ---------------------------------------------------------------------------
+
+def _is_bench(target: Path) -> bool:
+    """A Frappe bench root: `apps/` and `sites/` side by side (bench_config.bench_root)."""
+    return (target / "apps").is_dir() and (target / "sites").is_dir()
+
+
+def _frappe_enabled() -> bool:
+    """The Frappe switch, read from the parser this repository installs."""
+    guard = SOURCE / HOOK_DIR
+    if not guard.is_dir():
+        guard = SOURCE / "guard" / "package_guard"
+    try:
+        sys.path.insert(0, str(guard))
+        import parser as pg_parser
+        return bool(pg_parser.FRAPPE_ENABLED)
+    except Exception:  # noqa: BLE001 - an unreadable switch is off
+        return False
+    finally:
+        sys.path.pop(0)
+
+
+def _bench_above(target: Path) -> Path | None:
+    """The bench root whose `apps/` holds `target` (an app repository), or None."""
+    for parent in target.parents:
+        if (parent / "apps").is_dir() and (parent / "sites").is_dir():
+            try:
+                target.relative_to(parent / "apps")
+            except ValueError:
+                continue
+            return parent
+    return None
+
+
+def refuse_app_target(target: Path) -> str | None:
+    """Why the guard is not installed inside an app repository of a Frappe bench, or None.
+
+    Claude Code loads a project's `.claude/` for a session started in that project; whether it loads
+    the bench root's for a session started in `apps/<app>` is not assumed (the plugin, which loads
+    everywhere, is the primary install). A guard inside the app would also never see the bench's
+    baselines and configuration, which live at the root where it is installed. Only while the Frappe
+    switch is on."""
+    if not _frappe_enabled():
+        return None
+    bench = _bench_above(target)
+    if bench is None:
+        return None
+    return (f"{target} is inside the apps/ of the Frappe bench at {bench}: open Claude at the bench root "
+            f"and install there (python3 install.py {bench}), or use the plugin, which loads for every "
+            "project.")
+
+
+def _bench_rows(target: Path) -> tuple[tuple, tuple]:
+    """(deny rules, attribute lines) this target needs for a bench; empty for any other."""
+    if _is_bench(target) and _frappe_enabled():
+        return BENCH_LOCK_DENY, BENCH_GITATTRIBUTES_LINES
+    return (), ()
+
 
 def _guard_settings() -> tuple[dict[str, list], list[str]]:
     """The guard's hook entries per event and its deny rules, from this clone."""
@@ -306,7 +389,7 @@ def _merge_settings(target: Path, sandbox: bool = False) -> list[str]:
 
     permissions = settings.setdefault("permissions", {})
     rules = permissions.setdefault("deny", [])
-    for rule in (*deny, *LOCK_DENY):
+    for rule in (*deny, *LOCK_DENY, *_bench_rows(target)[0]):
         if rule not in rules:
             rules.append(rule)
             changed.append(f"deny rule  {rule}")
@@ -386,6 +469,19 @@ def _sandbox_ok(settings: dict) -> bool:
         if not isinstance(present, list) or not set(entries) <= set(present):
             return False
     return SANDBOX_ALLOW_RULE in _allow_rules(settings)
+
+
+def _sandbox_missing(settings: dict) -> list[str]:
+    """The guard's sandbox entries a settings file lacks (an install from before an entry was
+    added), as `list.path  entry` strings."""
+    sandbox = settings.get("sandbox")
+    sandbox = sandbox if isinstance(sandbox, dict) else {}
+    missing = []
+    for keys, entries in SANDBOX_LISTS:
+        present = _sandbox_list(sandbox, keys, create=False)
+        present = present if isinstance(present, list) else []
+        missing += [f"{'.'.join(keys)}  {entry}" for entry in entries if entry not in present]
+    return missing
 
 
 def _sandbox_present(settings: dict) -> bool:
@@ -509,7 +605,8 @@ def _append_gitattributes(target: Path) -> list[str]:
     path = target / ".gitattributes"
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     present = {line.strip() for line in text.splitlines()}
-    missing = [line for line in GITATTRIBUTES_LINES if line not in present]
+    missing = [line for line in (*GITATTRIBUTES_LINES, *_bench_rows(target)[1])
+               if line not in present]
     if not missing:
         return []
     block = "\n".join([GITATTRIBUTES_HEADER, *missing]) + "\n"
@@ -584,6 +681,9 @@ def check_plugin(target: Path) -> list[tuple[bool, str]]:
     present = set(gitignore.read_text(encoding="utf-8").splitlines()) if gitignore.exists() else set()
     rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the local state files"))
     rows.append(mode_row(target))
+    app_target = refuse_app_target(target)
+    if app_target is not None:
+        rows.append((False, app_target))
     return rows
 
 
@@ -647,13 +747,23 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
         r in settings.get("permissions", {}).get("deny", []) for r in LOCK_DENY
     )
     rows.append((lock_ok, f"{SETTINGS} locks the guard's own files against Edit/Write"))
+    bench_deny, bench_attributes = _bench_rows(target)
+    if bench_deny:
+        rows.append((path.exists() and all(
+            r in settings.get("permissions", {}).get("deny", []) for r in bench_deny),
+            f"{SETTINGS} locks the bench's installer files (pip.conf, uv.toml, .yarnrc)"))
     # A project that opted in (--sandbox now, or any guard entry already there)
     # is held to the whole block; a loosened one fails. Otherwise it is off.
     if sandbox or (path.exists() and _sandbox_present(settings)):
-        rows.append((
-            path.exists() and _sandbox_ok(settings),
-            f"{SETTINGS} turns on the strict sandbox (guard CLI excluded, guard files write-denied)",
-        ))
+        ok = path.exists() and _sandbox_ok(settings)
+        what = f"{SETTINGS} turns on the strict sandbox (guard CLI excluded, guard files write-denied)"
+        missing = _sandbox_missing(settings) if path.exists() else []
+        if not ok and missing:
+            # An install from before an entry existed: say which, and the one command that adds them.
+            what += (f"; missing {len(missing)} entr{'y' if len(missing) == 1 else 'ies'} "
+                     f"({'; '.join(missing[:6])}{'; ...' if len(missing) > 6 else ''}): "
+                     "re-run the installer with --sandbox, which only adds")
+        rows.append((ok, what))
     else:
         rows.append((True, f"{SETTINGS} sandbox off (opt in with --sandbox)"))
 
@@ -671,12 +781,15 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
 
     attributes = target / ".gitattributes"
     present = set(attributes.read_text(encoding="utf-8").splitlines()) if attributes.exists() else set()
-    rows.append((all(l in present for l in GITATTRIBUTES_LINES),
+    rows.append((all(l in present for l in (*GITATTRIBUTES_LINES, *bench_attributes)),
                  ".gitattributes keeps the guard's files LF"))
     runner = target / HOOK_DIR / "run.sh"
     rows.append((not runner.is_file() or b"\r" not in runner.read_bytes(),
                  f"{HOOK_DIR}/run.sh has LF line endings (re-run install to repair)"))
     rows.append(mode_row(target))
+    app_target = refuse_app_target(target)
+    if app_target is not None:
+        rows.append((False, app_target))
     return rows
 
 
@@ -718,7 +831,8 @@ def _remove_file_install(target: Path) -> list[str]:
         settings = _load_json(settings_path, "the guard")
         deny = settings.get("permissions", {}).get("deny")
         if deny is not None:
-            kept = [r for r in deny if r not in LOCK_DENY and not any(
+            kept = [r for r in deny if r not in LOCK_DENY and r not in BENCH_LOCK_DENY
+                    and not any(
                 mark in r for mark in (DENY_MARK, TRUST_DENY_MARK, SEED_DENY_MARK))]
             if len(kept) != len(deny):
                 settings["permissions"]["deny"] = kept
@@ -780,7 +894,7 @@ def uninstall(target: Path) -> list[str]:
     attributes = target / ".gitattributes"
     if attributes.exists():
         lines = attributes.read_text(encoding="utf-8").splitlines()
-        drop = set(GITATTRIBUTES_LINES) | {GITATTRIBUTES_HEADER}
+        drop = set(GITATTRIBUTES_LINES) | set(BENCH_GITATTRIBUTES_LINES) | {GITATTRIBUTES_HEADER}
         kept = [l for l in lines if l.strip() not in drop]
         if len(kept) != len(lines):
             if kept:
@@ -872,6 +986,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.plugin and (args.sandbox or args.uninstall or args.init_user_trust):
         print("install.py: --plugin takes only --check.", file=sys.stderr)
         return 2
+
+    if not (args.check or args.uninstall):
+        refused = refuse_app_target(target)
+        if refused:
+            print(f"install.py: {refused}", file=sys.stderr)
+            return 2
 
     try:
         if args.plugin:

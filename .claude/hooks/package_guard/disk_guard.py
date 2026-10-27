@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import bench_config  # noqa: E402
+import bench_gate  # noqa: E402
 import inventory  # noqa: E402
 import manifest as pg_manifest  # noqa: E402
 import store  # noqa: E402
@@ -71,6 +73,11 @@ MACHINE_GLOBAL = frozenset({
 # which is always allowed.
 PM_REMOVAL_COMMANDS = True
 
+# Whether a Yarn Classic (v1) project counts as a Yarn one here. THIS MIRRORS
+# `parser.YARN_CLASSIC_ENABLED` (a test pins the two together). While it is False a Classic
+# lock names no manager, as before Classic was supported.
+YARN_CLASSIC_DISK = True
+
 # The sources of a project's own direct dependencies that sit outside its node_modules: a
 # finding from one of them carries the project's node_modules path too when the package was
 # also installed there.
@@ -81,11 +88,16 @@ _PM_CACHE_SOURCES = frozenset({inventory.PNPM_STORE, inventory.BUN_CACHE, invent
 # are consulted when no lock exists).
 _PM_LOCKS = {"pnpm-lock.yaml": "pnpm", "bun.lock": "bun", "bun.lockb": "bun"}
 
+# Whether a Frappe bench's env is scanned in full (every distribution, not only what a manifest
+# declares). THIS MIRRORS `parser.FRAPPE_ENABLED`, which this module cannot import, and a test pins
+# the two together. While it is False a bench is reconciled as before.
+BENCH_ENV_DISK = True
+
 
 class Scope(NamedTuple):
     """One manifest and the environment it installs into."""
 
-    kind: str          # "npm" | "uv-project" | "requirements"
+    kind: str          # "npm" | "uv-project" | "requirements" | "bench-env"
     directory: str
     manifest: str
 
@@ -124,6 +136,11 @@ def discover_scopes(project_root, max_depth: int = MAX_SCAN_DEPTH) -> list:
         except OSError:
             continue
         names = {child.name for child in children}
+        if BENCH_ENV_DISK and "apps" in names and "sites" in names \
+                and (directory / "env" / "pyvenv.cfg").is_file():
+            # A bench's apps are repositories of their own, which this walk skips: its env is
+            # read in full instead (every distribution, `bench_gate.env_residue`).
+            scopes.append(Scope("bench-env", str(directory), str(directory / "env")))
         if "package.json" in names:
             scopes.append(Scope("npm", str(directory), str(directory / "package.json")))
         if "uv.lock" in names:
@@ -146,6 +163,11 @@ def discover_scopes(project_root, max_depth: int = MAX_SCAN_DEPTH) -> list:
             # A nested checkout (a git worktree, a vendored repository) is
             # another project with its own guard state.
             if (child / ".git").exists():
+                if BENCH_ENV_DISK and (child / "apps").is_dir() and (child / "sites").is_dir() \
+                        and (child / "env" / "pyvenv.cfg").is_file():
+                    # The gate accepts a bench inside the guard root whether or not it is a git
+                    # checkout, so its env is read in full as well.
+                    scopes.append(Scope("bench-env", str(child), str(child / "env")))
                 continue
             stack.append((child, depth + 1))
     return scopes
@@ -165,14 +187,16 @@ def _berry_lock(path: Path) -> bool:
 def managers_of(directory) -> set:
     """The npm-family managers a project directory shows signs of, from its lock
     files first and its install markers second: a subset of
-    {"npm", "pnpm", "bun", "yarn"}. Yarn Classic is not a member (its locks are
-    refused elsewhere), and an empty set means no sign at all."""
+    {"npm", "pnpm", "bun", "yarn"}. A Yarn Classic (v1) lock counts as "yarn" while
+    `YARN_CLASSIC_DISK` is on; an empty set means no sign at all."""
     directory = Path(directory)
     found = set()
     for name, manager in _PM_LOCKS.items():
         if (directory / name).is_file():
             found.add(manager)
-    if (directory / "yarn.lock").is_file() and _berry_lock(directory / "yarn.lock"):
+    if (directory / "yarn.lock").is_file() and (
+            _berry_lock(directory / "yarn.lock")
+            or (YARN_CLASSIC_DISK and pg_manifest.yarn_classic_lock_file(directory / "yarn.lock"))):
         found.add("yarn")
     if (directory / "package-lock.json").is_file() or (directory / "npm-shrinkwrap.json").is_file():
         found.add("npm")
@@ -182,7 +206,8 @@ def managers_of(directory) -> set:
         found.add("pnpm")
     if inventory.has_bun_markers(directory):
         found.add("bun")
-    if inventory.has_yarn_markers(directory):
+    if inventory.has_berry_markers(directory) or (
+            YARN_CLASSIC_DISK and inventory.has_classic_markers(directory)):
         found.add("yarn")
     return found
 
@@ -212,14 +237,11 @@ def direct_names(scope: Scope) -> set:
 
 
 def _bench_env(directory) -> Path | None:
-    """`<bench>/env` when `directory` is a Frappe bench or an app inside one
-    (`<bench>/apps/<app>`). bench pip-installs there from Python, where no
-    command names it, so it is read like `.venv` (4.)."""
-    for candidate in (Path(directory), *list(Path(directory).parents)[:2]):
-        if ((candidate / "apps").is_dir() and (candidate / "sites").is_dir()
-                and (candidate / "env" / "pyvenv.cfg").is_file()):
-            return candidate / "env"
-    return None
+    """`<bench>/env` when `directory` is a Frappe bench or anywhere inside one
+    (`<bench>/apps/<app>/...`). bench pip-installs there from Python, where no
+    command names it, so it is read like `.venv` (4.). `bench_config` is the one
+    place that says where a bench is."""
+    return bench_config.bench_env(directory)
 
 
 def environments(directory, root=None, current=()) -> list:
@@ -280,7 +302,13 @@ def _node_modules_installed(directory, wanted) -> list:
 
 
 def scope_packages(scope: Scope, root=None, current=()) -> list:
-    """Installed packages of a scope, already intersected with its direct set."""
+    """Installed packages of a scope, already intersected with its direct set. A bench's env is not
+    intersected with anything: it is whatever nothing covers (`bench_gate.env_residue`)."""
+    if scope.kind == "bench-env":
+        installed = inventory.dist_info_packages(scope.manifest)
+        return bench_gate.env_residue(
+            root, scope.directory, installed,
+            lambda package: root is not None and store.is_vetted(root, package.identity))
     wanted = direct_names(scope)
     if not wanted:
         return []
@@ -734,16 +762,21 @@ def _label(finding: dict) -> str:
     return f"{finding['ecosystem']}:{finding['name']}@{finding['version']}"
 
 
-def _finding_managers(finding: dict) -> set:
-    """The managers of the project a node_modules finding sits in: the directory
-    above the first `node_modules` component of its first path. Empty or
-    {"npm"} reads as npm, which is today's behaviour."""
+def _finding_project(finding: dict):
+    """The project directory a node_modules finding sits in: the directory above the first
+    `node_modules` component of its first path, or None."""
     for path in finding.get("paths") or []:
         parts = Path(path).parts
         if "node_modules" in parts:
-            project = Path(*parts[:parts.index("node_modules")]) if parts.index("node_modules") else Path(".")
-            return managers_of(project) or {"npm"}
-    return {"npm"}
+            return Path(*parts[:parts.index("node_modules")]) if parts.index("node_modules") else Path(".")
+    return None
+
+
+def _finding_managers(finding: dict) -> set:
+    """The managers of the project a node_modules finding sits in. Empty or
+    {"npm"} reads as npm, which is today's behaviour."""
+    project = _finding_project(finding)
+    return (managers_of(project) or {"npm"}) if project is not None else {"npm"}
 
 
 def _venv_removal(finding: dict, name: str) -> str:
@@ -810,6 +843,11 @@ def removal_command(finding: dict) -> str:
             # and its build allow-list is satisfied (`hook._remove_denial`). Berry's
             # `--mode=skip-build` and Bun's `--ignore-scripts` turn every script off.
             if manager == "yarn":
+                project = _finding_project(finding)
+                if (YARN_CLASSIC_DISK and project is not None
+                        and pg_manifest.yarn_classic_lock_file(project / "yarn.lock")):
+                    # Yarn Classic: `--ignore-scripts` is the proof the hook looks for on `remove`.
+                    return f"yarn remove {quoted} --ignore-scripts"
                 return f"yarn remove {quoted} --mode=skip-build"
             if manager == "bun":
                 return f"bun remove {quoted} --ignore-scripts"

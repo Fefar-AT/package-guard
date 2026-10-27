@@ -8,6 +8,7 @@ Standard library only.
 from __future__ import annotations
 
 import ast
+import base64
 import configparser
 import json
 import re
@@ -326,6 +327,19 @@ def _age_days(stamp, now: datetime) -> int | None:
     if parsed is None:
         return None
     return max(0, int((now - parsed).total_seconds() // 86400))
+
+
+_SHA1_HEX = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _npm_sha1_artifacts(dist) -> list:
+    """`dist.shasum` (the tarball's sha1, hex) as the `sha1-<base64>` digest a Yarn Classic lock
+    carries for an entry with no sha512 (Frappe v11 to v14), so that a lock naming only a sha1
+    can be compared with what the review saw (D5). Empty when the registry gave none."""
+    shasum = dist.get("shasum") if isinstance(dist, dict) else None
+    if isinstance(shasum, str) and _SHA1_HEX.match(shasum.strip().lower()):
+        return ["sha1-" + base64.b64encode(bytes.fromhex(shasum.strip().lower())).decode()]
+    return []
 
 
 def _text(value) -> str | None:
@@ -901,6 +915,116 @@ HISTORY_TOO_LARGE = ("registry history too large to read: package age, version a
                      "release count unknown")
 
 
+_SEMVER = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?$")
+_PARTIAL = re.compile(r"^v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-[0-9A-Za-z.\-]+)?$")
+
+
+def _stable_triple(version):
+    """(major, minor, patch) of a final release, None for a prerelease or anything else."""
+    match = _SEMVER.match(version) if isinstance(version, str) else None
+    if not match or "-" in version.split("+", 1)[0]:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _partial(text):
+    """(major, minor, patch) with None for a wildcard or a missing part, or False if not a version."""
+    match = _PARTIAL.match(text.strip())
+    if not match:
+        return False
+    parts = tuple(None if g is None or g in "xX*" else int(g) for g in match.groups())
+    if parts[0] is None:
+        return (None, None, None)
+    if parts[1] is None:
+        return (parts[0], None, None)
+    return parts if parts[2] is not None else (parts[0], parts[1], None)
+
+
+def _comparators(token):
+    """[(op, (major, minor, patch))] for one npm range token (^, ~, a bare or x-range, an operator),
+    or None when it is not one this reader knows."""
+    token = token.strip()
+    if token in ("", "*", "x", "X"):
+        return []
+    op = ""
+    for candidate in ("^", "~", ">=", "<=", ">", "<", "="):
+        if token.startswith(candidate):
+            op, token = candidate, token[len(candidate):].strip()
+            break
+    part = _partial(token)
+    if part is False:
+        return None
+    major, minor, patch = part
+    if major is None:
+        return [] if op in ("", "=", "^", "~", ">=", "<=") else None
+    low = (major, minor or 0, patch or 0)
+    if op == "^":
+        if major > 0 or minor is None:
+            high = (major + 1, 0, 0)
+        elif minor > 0 or patch is None:
+            high = (0, minor + 1, 0)
+        else:
+            high = (0, 0, patch + 1)
+        return [(">=", low), ("<", high)]
+    if op == "~":
+        high = (major + 1, 0, 0) if minor is None else (major, minor + 1, 0)
+        return [(">=", low), ("<", high)]
+    if op in ("", "="):
+        if patch is not None:
+            return [("=", low)]
+        high = (major + 1, 0, 0) if minor is None else (major, minor + 1, 0)
+        return [(">=", low), ("<", high)]
+    if op == ">":
+        if patch is not None:
+            return [(">", low)]
+        return [(">=", (major + 1, 0, 0) if minor is None else (major, minor + 1, 0))]
+    if op == "<=":
+        if patch is not None:
+            return [("<=", low)]
+        return [("<", (major + 1, 0, 0) if minor is None else (major, minor + 1, 0))]
+    return [(op, low)]  # >= and <
+
+
+def npm_range_admits(spec, version):
+    """True or False: does the npm range `spec` admit the final release `version`; None when the
+    range is not one this reader knows (a tag, a URL, an alias): the caller then does not narrow."""
+    if not isinstance(spec, str):
+        return None
+    triple = _stable_triple(version)
+    if triple is None:
+        return False
+    for alternative in spec.split("||"):
+        alternative = re.sub(r"\s+-\s+", " - ", alternative.strip())
+        if " - " in alternative:
+            low, _, high = alternative.partition(" - ")
+            first, second = _partial(low), _partial(high)
+            if first is False or second is False or first[0] is None:
+                return None
+            comparators = [(">=", (first[0], first[1] or 0, first[2] or 0))]
+            if second[0] is not None:
+                if second[2] is not None:
+                    comparators.append(("<=", second))
+                elif second[1] is not None:
+                    comparators.append(("<", (second[0], second[1] + 1, 0)))
+                else:
+                    comparators.append(("<", (second[0] + 1, 0, 0)))
+        else:
+            comparators = []
+            joined = re.sub(r"(>=|<=|>|<|=|\^|~)\s+", r"\1", alternative)
+            for token in joined.split():
+                found = _comparators(token)
+                if found is None:
+                    return None
+                comparators += found
+            if not joined.split():
+                found = _comparators("")
+                comparators += found or []
+        if all({">=": triple >= bound, ">": triple > bound, "<=": triple <= bound, "<": triple < bound,
+                "=": triple == bound}[op] for op, bound in comparators):
+            return True
+    return False
+
+
 def _vet_npm(request, mandatory):
     """(version, evidence, provenance, risk, repository, continuity, history)
     for one npm request. `history` is False when the review could not read
@@ -922,6 +1046,19 @@ def _vet_npm(request, mandatory):
     times = meta.get("time") or {}
     cooldown = None
     cooldown_unavailable = None
+    # A range (`^15.0.12`) is reviewed at the newest release it admits, not at `latest`, which the
+    # install will not take.
+    admitted = None
+    if not request.exact_version and request.requested_spec:
+        verdicts = {v: npm_range_admits(request.requested_spec, v) for v in versions}
+        if any(verdict is None for verdict in verdicts.values()) or not verdicts:
+            pass  # not a range this reader knows (a tag, an alias): the latest stands, as before
+        else:
+            admitted = {v for v, ok in verdicts.items() if ok}
+            if not admitted:
+                raise HardDeny(f"no release of '{request.display_name}' satisfies the range "
+                               f"{request.requested_spec}")
+            version = max(admitted, key=_stable_triple)
     if not request.exact_version and isinstance(versions.get(version), dict):
         dist = versions[version].get("dist")
         attested = isinstance(dist, dict) and isinstance(dist.get("attestations"), dict) \
@@ -931,7 +1068,8 @@ def _vet_npm(request, mandatory):
             # cool-down could not judge it.
             cooldown_unavailable = f"the registry lists no publish time for {version}"
         candidates = {v: times.get(v) for v, m in versions.items()
-                      if isinstance(m, dict) and not m.get("deprecated")}
+                      if isinstance(m, dict) and not m.get("deprecated")
+                      and (admitted is None or v in admitted)}
         candidates[version] = times.get(version)
         version, cooldown = _cooled("npm", version, candidates, attested)
     version_meta = versions.get(version)
@@ -1035,6 +1173,7 @@ def _npm_evidence(meta, version, version_meta, versions, times, cooldown, cooldo
         "dependency_count": _count(version_meta.get("dependencies") or {}),
         "release_count": _count(versions),
         "integrity": _text(dist.get("integrity")),
+        "artifacts": _npm_sha1_artifacts(dist),
         "distribution": None,
         "npm_weekly_downloads": None,
         "cooldown": cooldown,
@@ -2571,6 +2710,8 @@ def _retry_command(request, version: str) -> str:
         if tool in ("bun", "bunx"):
             return f"bunx {spec}" if request.operation == "exec" else f"bun add {spec} --ignore-scripts"
         if tool == "yarn":
+            if request.manager == "yarn classic" and request.operation != "exec":
+                return f"yarn add {spec} --ignore-scripts"  # --mode=skip-build is Berry's
             return f"yarn dlx {spec}" if request.operation == "exec" else f"yarn add {spec} --mode=skip-build"
         return f"npx {spec}" if request.operation == "exec" else f"npm install {spec}"
     if request.operation == "tool":

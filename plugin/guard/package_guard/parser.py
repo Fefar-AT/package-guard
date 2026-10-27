@@ -15,6 +15,8 @@ import re
 import shlex
 from dataclasses import dataclass
 
+import bench_config
+import bench_table
 import pm_config
 import protocols
 import shell
@@ -110,6 +112,18 @@ class ManifestScope:
     # `npm_config_ignore_scripts=true`): nothing the lock or the root
     # package.json declares as a script will run.
     scripts: bool = True
+    # yarn only. The verb word as typed after normalising ("", install, add, up,
+    # upgrade) and the flags the command carried (`--frozen-lockfile`,
+    # `--ignore-scripts`, `--mode=skip-build`, ...). Yarn Berry and Yarn Classic share a
+    # head, so the parser cannot tell which one runs: the hook decides that from the
+    # project (`pm_config.yarn_flavour`) and judges the verb and flags against it.
+    verb: str = ""
+    flags: tuple = ()
+    # yarn only: what the shell will give the command that the hook cannot see for itself, as
+    # (name, value) pairs: ("head", the command word as typed), ("PATH", the literal value, or None
+    # when it is built at run time) and ("YARN_IGNORE_SCRIPTS", "true"). The hook resolves the
+    # `yarn` that will run from these, and counts the variable as a scripts-off proof.
+    env: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +153,12 @@ class RunScope:
     # `remove` only: the package names it deletes (they may be the very ones the manifest and
     # the lock disagree about, which the drift check must not hold against the command).
     names: tuple = ()
+    # yarn only: the verb word the command used (`explain`, `npm`, `list`, ...) and the flags it
+    # carried. Berry and Classic share the head and differ in which words are builtins; a word
+    # that is not one in the project's Yarn runs a package.json script of that name instead.
+    word: str = ""
+    flags: tuple = ()
+    env: tuple = ()
 
 
 # The package managers whose manifest is package.json. pnpm, Bun and Yarn each
@@ -155,6 +175,17 @@ PM_MANAGERS = ("pnpm", "pnpx", "pnx", "bun", "bunx", "yarn", "yarnpkg")
 # `bunx --no-install`) rather than return "ignore". Nothing reads these managers'
 # manifests or locks yet; P6 sets this to True once every stage does.
 PNPM_BUN_YARN_ENABLED = True
+
+# THE SWITCH for Frappe support. While it is False, every allow path and every check that
+# exists only for Frappe stays off and the refusals of `bench` and the checks that
+# apply to nothing else are as they were shipped. The last stage sets it to True.
+FRAPPE_ENABLED = True
+
+# THE SWITCH for Yarn Classic (v1), staged as the pnpm/Bun/Yarn one was. While it is False
+# the hook reads a Classic project exactly as before Classic was supported (the Berry reader
+# refuses its lock, the Classic-only flags and verbs are refused here) and `disk_guard`
+# mirrors it (`YARN_CLASSIC_DISK`; a test pins the two together).
+YARN_CLASSIC_ENABLED = True
 
 
 def scope_ecosystem(kind: str) -> str:
@@ -187,6 +218,20 @@ def uses_pnpm_bun_yarn(result) -> bool:
 
 
 @dataclass(frozen=True)
+class BenchScope:
+    """A `bench` verb that installs packages or runs project code, which the hook lets run only
+    when every app it touches is covered and the guard's installer files hold (`bench_gate`).
+    `verb` is one of setup-requirements, update-requirements, update-run, new-app, build;
+    `apps` are the apps it names (empty: every app of the bench)."""
+    verb: str
+    apps: tuple = ()
+    node: bool = False
+    python: bool = False
+    dev: bool = False
+    executable: str = ""    # the word the command named (`bench`, `/opt/x/bin/bench`)
+
+
+@dataclass(frozen=True)
 class ParseResult:
     kind: str               # ignore | package | unsupported
     requests: tuple = ()
@@ -212,6 +257,26 @@ class ParseResult:
     # acquired by them, so the kind stays "ignore" when they are all there is;
     # the hook checks each one (`hook._run_denial`).
     runs: tuple = ()
+    # Installs into a Frappe bench's Python env, which the hook ties to the bench
+    # the shell's directory belongs to (`bench_config.python_in_env_problem`): the
+    # literal `--python` / `-p` of `uv pip` (`env/bin/python`), or `""` for
+    # `bench pip`, which uses the env of the bench it runs in.
+    bench_pythons: tuple = ()
+    # The executable of a `pip` or `python -m pip` install, as written, when it is a path
+    # (`nested/env/bin/pip`, `/srv/bench/env/bin/python`): the hook finds out whether it
+    # is a bench's env, whatever directory the shell is in (`bench_config.executable_problem`).
+    executables: tuple = ()
+    # `bench` verbs this command runs under the hook's bench gate (`BenchScope`).
+    bench: tuple = ()
+    # False when this segment follows one that is not a known reader (a writer, a git verb that
+    # changes the tree, an interpreter) or another package segment, or runs in the background:
+    # the manifests the hook compared may have changed, or the install may still be running when
+    # the disk is read. The hook refuses such a bench, Yarn Classic or env install.
+    exclusive: bool = True
+    # `--no-binary` / `--no-binary-package` among the words of a uv command: they name
+    # packages to build from source, which a bench's `no-build = true` otherwise refuses
+    # (uv exempts a package named there from it). The hook refuses them inside a bench.
+    source_build_flags: tuple = ()
 
     @property
     def manifest_scope(self) -> bool:
@@ -230,7 +295,7 @@ def _ignore() -> ParseResult:
     return ParseResult(kind="ignore")
 
 
-def _manager_run(head, result, verb="manager"):
+def _manager_run(head, result, verb="manager", word=""):
     """pnpm and Yarn run through Corepack: the release `package.json` pins is DOWNLOADED
     and run, whatever the verb (v1.10.0 hardening, A2). Every segment that executes one
     carries a `manager` RunScope so the hook checks that pin and the manager's
@@ -248,7 +313,7 @@ def _manager_run(head, result, verb="manager"):
         return result  # an install reviews the pin; a runner or `remove` checks it
     if not PNPM_BUN_YARN_ENABLED:
         _pm_disabled(f"'{head}'")
-    return dataclasses.replace(result, runs=result.runs + (RunScope(kind, verb),))
+    return dataclasses.replace(result, runs=result.runs + (RunScope(kind, verb, word=word),))
 
 
 def _resolve_only(kind) -> ParseResult:
@@ -344,7 +409,9 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
     # cannot find when no node_modules exists at run time, and a segment of the same line
     # that removes or moves node_modules makes that so after the hook looked.
     command_kinds = []
+    impure = False   # an earlier segment is not a known reader, or was a package segment
     for segment in segments:
+        produced = False
         sub_written, sub_symlink = _check_substitutions(segment, depth)
         loop = _loop_variable(segment.words)
         words = shell.strip_keywords(segment.words)
@@ -379,9 +446,17 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
                     refusals.append(("written", written))
                 if unreadable:
                     refusals.append(("unreadable", unreadable))
-                results.append(result)
+                produced = True
+                results.append(dataclasses.replace(
+                    result, exclusive=not impure and not segment.background
+                    and not _backgrounded(plain)))
         written = written or wrote
         unreadable = unreadable or why
+        if produced or (words and not _header(segment.words)
+                        and not (plain and (plain[0].text in _ASSIGNMENT_BUILTINS
+                                            or _sets_allexport(plain)
+                                            or _only_reads(segment, plain)))):
+            impure = True
 
     if allexport and results:
         raise _Unsupported(_ALLEXPORT_MESSAGE, code="wrapper")
@@ -405,7 +480,20 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
             raise _Unsupported(_WRITTEN_MESSAGE.format(file=what), code="same-command-write")
         raise _Unsupported(_UNREADABLE_MESSAGE.format(what=what), code="unreadable-environment")
 
+    for result in results:
+        if result.bench and not result.exclusive:
+            raise _Unsupported(_EXCLUSIVE_MESSAGE, code="unreadable-environment")
+
     return _merge(results)
+
+
+_EXCLUSIVE_MESSAGE = (
+    "a bench install follows another command of the same line that is not a plain reader (a "
+    "writer, a git verb that changes the tree, an interpreter, another install), or runs in the "
+    "background (`&`, `nohup`): the manifests could change after the gate compared them, or the "
+    "install may still be running when the disk is read. Run it as its own command, in the "
+    "foreground, with nothing before it that writes"
+)
 
 
 _AUTOINSTALL_MESSAGE = (
@@ -416,6 +504,14 @@ _AUTOINSTALL_MESSAGE = (
     "command (`--no-install`, before the script or file name, makes it run only what is "
     "already installed)"
 )
+
+
+_BACKGROUND_WRAPPERS = frozenset({"nohup", "setsid", "disown", "at", "batch", "coproc", "daemonize"})
+
+
+def _backgrounded(plain) -> bool:
+    """The segment starts with a wrapper that detaches what follows it from the shell."""
+    return bool(plain) and _executable(plain[0].text) in _BACKGROUND_WRAPPERS
 
 
 def _only_reads(segment, plain) -> bool:
@@ -926,7 +1022,9 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
 
     if installer is None:
         if head == "bench":
-            _check_bench(words)
+            bench = _check_bench(words, inherited + assignments, command)
+            if bench is not None:
+                return bench
         if head == "virtualenv":
             _check_virtualenv(words[1:])
         if head == "easy_install":
@@ -965,9 +1063,61 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
             for m in result.manifests))
     if installer.get("env") == "uv" and result is not None and result.kind == "package":
         result = _uv_env_effects(result, assignments, inherited, words)
+        flags = _source_build_flags(words)
+        if flags:
+            result = dataclasses.replace(result, source_build_flags=flags)
+    if (result is not None and result.kind == "package" and head in ("pip", "python")
+            and re.search(r"[\\/]", head_word.text)):
+        result = dataclasses.replace(result, executables=(_executable_path(head_word),))
     if result is not None:
         result = _manager_run(head, result)
+        if _PM_NAMES.get(head) == "yarn":
+            result = _yarn_invocation(result, head_word, inherited + assignments)
     return result
+
+
+def _yarn_invocation(result, head_word, assignments):
+    """Attach to every yarn scope what the shell gives the command: the word it was typed as, the
+    PATH it searches, and an inline `YARN_IGNORE_SCRIPTS=true`. The last assignment of a name wins;
+    one that is built at run time or appended to leaves the value unknown (None)."""
+    facts = {"head": head_word.text}
+    for word in assignments:
+        name, value, appends = _assignment(word)
+        if name == "PATH" or name.upper() == "YARN_IGNORE_SCRIPTS":
+            key = "PATH" if name == "PATH" else "YARN_IGNORE_SCRIPTS"
+            known = not (word.dynamic or appends or shell.is_dynamic(value))
+            facts[key] = value if known else None
+    env = tuple(sorted(facts.items(), key=lambda item: item[0]))
+    return dataclasses.replace(
+        result,
+        manifests=tuple(dataclasses.replace(m, env=env) if m.kind == "yarn" else m
+                        for m in result.manifests),
+        runs=tuple(dataclasses.replace(r, env=env) if r.kind == "yarn" else r for r in result.runs))
+
+
+_SOURCE_BUILD_FLAGS = ("--no-binary", "--no-binary-package")
+
+
+def _source_build_flags(words) -> tuple:
+    """The flags that force a source build among the words of a uv command that are uv's
+    own (up to a bare `--`, after which a `uv run` command's words begin)."""
+    found = []
+    for word in words[1:]:
+        if word.text == "--":
+            break
+        name = word.text.partition("=")[0]
+        if name in _SOURCE_BUILD_FLAGS and name not in found:
+            found.append(name)
+    return tuple(found)
+
+
+def _executable_path(word) -> str:
+    """The path of a `pip` / `python` command word, for the hook to tie to a bench. A
+    leading `~/` is the home directory (the hook expands it, as the shell would), unless
+    it was quoted, when it names a directory called `~`. A path the shell would still
+    expand (`$B/env/bin/pip`) is passed as written; the hook refuses it inside a bench."""
+    text = word.text
+    return "./" + text if text.startswith("~") and word.quoted else text
 
 
 # CPython's option parsing (Python/getopt.c, `bBc:dEhiIJm:OPqRsStuvVW:xX:?`, and Python 2's
@@ -1334,9 +1484,28 @@ def _hint_fallback(head, text, why):
     """What a wrapper runs could not be read (an option the grammar does not
     know, a command line built dynamically): refuse when `text` reads as an
     acquisition by the generated hint, ignore it otherwise."""
-    if verbs.ACQUISITION_HINT.search(text):
+    if verbs.ACQUISITION_HINT.search(text) or _wrapped_bench(text):
         raise _wrapper_refusal(head, why)
     return None
+
+
+_BENCH_WORD = re.compile(r"(?:^|\s)(?:\S*/)?bench(?=\s)")
+
+
+def _wrapped_bench(text) -> bool:
+    """Whether the words of a command Package Guard cannot parse run a `bench` verb the gate would
+    not simply let through (`flock /tmp/l bench retry-upgrade`, `script -q /dev/null bench setup
+    requirements`): a refused or gated verb, or `bench pip`. A verb the table does not know is not
+    a hit, so a word that merely reads `bench` (`rg bench src`) is not one. Frappe switch only."""
+    if not FRAPPE_ENABLED:
+        return False
+    for match in _BENCH_WORD.finditer(text):
+        verdict = bench_table.classify(text[match.end():].split())
+        if verdict.action == "scope" or verdict.verb == "pip" and verdict.action == "inert":
+            return True
+        if verdict.action == "refuse" and verdict.code != "unknown-verb":
+            return True
+    return False
 
 
 def _unread_option(head, rest):
@@ -1512,8 +1681,12 @@ def _check_unknown_head(head_word, head, words, assignments, command="", stdin=N
             return None
         if module is not None:
             _refuse_module(*module)
-    for reading in _readings(words, _known_values(assignments), head in verbs.STRING_RUNNERS):
-        if verbs.ACQUISITION_HINT.search(reading):
+    # `bench`'s own verbs were decided by `_check_bench` (a refusal raised, or the table let the verb
+    # run); the hint's `bench <verb>` alternative would refuse the verbs the table allows, so its
+    # words are read without the head, and what a verb carries (`execute ... npm install`) still is.
+    readable = words[1:] if head == "bench" else words
+    for reading in _readings(readable, _known_values(assignments), head in verbs.STRING_RUNNERS):
+        if verbs.ACQUISITION_HINT.search(reading) or (head != "bench" and _wrapped_bench(reading)):
             if dynamic:
                 raise _Unsupported(_DYNAMIC_HEAD_MESSAGE.format(name=head_word.text), code="wrapper")
             raise _Unsupported(_UNKNOWN_HEAD_MESSAGE.format(head=head), code="wrapper")
@@ -1572,6 +1745,7 @@ def _reads_stdin(words, payload_words) -> bool:
 # app code (`retry-upgrade`, `switch-to-develop`), rebuild the env and reinstall every app
 # (`migrate-env`), and run ansible under sudo with `pip install ansible` and apt roles
 # (`install`, `setup role`, `setup production`); `remove` is an alias of `remove-app`.
+# `bench pip` is not here: it is read as a pip install into the bench env.
 _BENCH_INSTALL_VERBS = verbs.BENCH_INSTALL_VERBS
 _BENCH_INSTALL_SETUP = verbs.BENCH_INSTALL_SETUP
 # The click group's own options (bench/commands/__init__.py) and the context flags
@@ -1584,13 +1758,68 @@ _BENCH_UNKNOWN_OPTION = (
     "(`--site`, `--use-feature`, `-v`) or run the verb without it")
 _BENCH_MESSAGE = (
     "`bench {verb}` installs packages out of the hook's sight: bench runs `yarn install` "
-    "with dependency scripts on and `pip install` into the bench env from Python. Frappe / "
-    "bench is not supported by Package Guard yet (planned for v1.12.0). Tell the user; run "
-    "`bench build`, `bench start`, `bench migrate` and site commands as usual.")
+    "with dependency scripts on and `pip install` into the bench env from Python. The bench "
+    "install verbs are not supported by Package Guard yet. Tell the user; run "
+    "`bench build`, `bench start`, `bench migrate` and site commands as usual, and install "
+    "a package into the bench env with `<bench>/env/bin/pip install name==version` or "
+    "`bench pip install name==version`.")
+# What `bench pip` hands to pip and uv that installs nothing. Everything else it
+# can reach (`download`, `wheel`, `config`, uv's `sync` and `compile`) is refused:
+# only `install` maps to `<bench>/env/bin/python -m pip install`.
+_BENCH_PIP_INERT = {"uninstall", "freeze", "list", "show", "check", "tree", "inspect", "help"}
 
 
-def _check_bench(words):
-    """Refuse the bench verbs that acquire packages; leave the rest to run."""
+def _check_bench_env(assignments):
+    """The variables written in front of a bench verb: every family bench's installs read
+    (pip, uv, yarn, npm and bench's own) is held to its table, and the names that swap the
+    program or the interpreter it runs (`PATH` finds `uv` and `yarn`) are refused.
+    The variables that only choose bench's installer, the link mode, the cache or a
+    Docker build are in the table's allow lists, and pass."""
+    table = verbs.BENCH_ENV
+    _check_env(assignments, {"env": list(table["families"])}, "bench")
+    refused = set(table["refuse"]["retarget"])
+    prefixes = tuple(table["refuse_prefixes"]["retarget"])
+    for assignment in assignments:
+        name = _assignment(assignment)[0]
+        if name.upper() in refused or name.upper().startswith(prefixes):
+            raise _Unsupported(
+                f"{name!r} changes which program or interpreter bench's installs run: run the "
+                "bench command without it", code="install-target")
+
+
+def _check_bench_table(words, assignments, command):
+    """The bench verb table (`bench_table`), applied while the Frappe switch is on: a refusal
+    raises, a verb that installs or runs project code returns a `BenchScope` result, `bench pip`
+    is read as the pip command it runs, and every other known verb returns None (it runs)."""
+    texts = [w.text for w in words[1:]]
+    verdict = bench_table.classify(texts)
+    if verdict.action == "refuse":
+        # A literal code at each raise site, which the denial-code test reads.
+        if verdict.code == "foreign-manager":
+            raise _Unsupported(verdict.reason, code="foreign-manager")
+        if verdict.code == "unsupported-flag":
+            raise _Unsupported(verdict.reason, code="unsupported-flag")
+        if verdict.code == "unknown-verb":
+            raise _Unsupported(verdict.reason, code="unknown-verb")
+        raise _Unsupported(verdict.reason, code="unsupported-form")
+    _check_bench_env(assignments)
+    if verdict.action == "scope":
+        return ParseResult(kind="package", bench=(BenchScope(
+            verdict.verb, verdict.apps, verdict.node, verdict.python, verdict.dev,
+            words[0].text),))
+    if verdict.verb == "pip":
+        rest = bench_table._after_group_flags(texts)
+        return _parse_bench_pip(words[len(texts) - len(rest) + 2:], assignments, command)
+    return None
+
+
+def _check_bench(words, assignments=(), command=""):
+    """Refuse the bench verbs that acquire packages; leave the rest to run.
+
+    `bench pip` is the one verb that is read instead of refused (`_parse_bench_pip`). With the
+    Frappe switch on, the whole table of `bench_table` decides instead."""
+    if FRAPPE_ENABLED:
+        return _check_bench_table(words, assignments, command)
     texts = [w.text for w in words[1:]]
     index = 0
     while index < len(texts) and texts[index].startswith("-"):
@@ -1605,8 +1834,12 @@ def _check_bench(words):
         else:
             raise _Unsupported(_BENCH_UNKNOWN_OPTION.format(option=option), code="foreign-manager")
     if index >= len(texts):
-        return
+        return None
     verb = texts[index]
+    if verb == "pip":
+        return _parse_bench_pip(words[index + 2:], assignments, command)
+    if FRAPPE_ENABLED:
+        _check_bench_env(assignments)
     sub = index + 1
     if verb == "setup":
         while sub < len(texts) and texts[sub] == "--":
@@ -1615,6 +1848,34 @@ def _check_bench(words):
             verb == "setup" and sub < len(texts) and texts[sub] in _BENCH_INSTALL_SETUP):
         shown = verb if verb != "setup" else f"setup {texts[sub]}"
         raise _Unsupported(_BENCH_MESSAGE.format(verb=shown), code="foreign-manager")
+    return None
+
+
+def _parse_bench_pip(args, assignments, command) -> ParseResult:
+    """`bench pip <args>` is `<bench>/env/bin/python -m pip <args>`, or, when uv is
+    in use (its default since bench 5.28), `uv pip <args> --python <env python>`
+    (`bench/commands/make.py` `pip`, which execs one or the other). `install` is
+    read as the pip install it is; the verbs that install nothing pass; the rest is
+    refused. Both installers' environment variables are checked, and the hook checks
+    that a bench holds the directory the command runs in (`bench_pythons`)."""
+    _check_bench_env(assignments)
+    if any(word.dynamic for word in args):
+        raise _Unsupported("package identity is built dynamically (a variable, substitution "
+                           "or glob); name the exact package and version instead",
+                           code="dynamic-spec")
+    if any(word.glued_op for word in args):
+        raise _Unsupported("a version range containing '<' or '>' must be quoted, "
+                           "e.g. bench pip install 'requests>=2.0'", code="unquoted-range")
+    texts = [w.text for w in args]
+    if not texts or texts[0] in ("-h", "--help") or texts[0] in _BENCH_PIP_INERT:
+        return _ignore()
+    if texts[0] != "install":
+        raise _Unsupported(f"`bench pip {texts[0]}` is not supported; `bench pip install "
+                           "name==version` is", code="unsupported-form")
+    result = _parse_pip_install(texts[1:], command, manager="bench pip", operation="install")
+    if result.kind == "package":
+        result = dataclasses.replace(result, bench_pythons=("",))
+    return result
 
 
 def _parse_foreign(head, words):
@@ -1651,12 +1912,18 @@ def _consume_globals(installer, words):
     `verb` is `_INERT` when a flag such as `--version` ends the command."""
     globals_ = installer.get("globals") or {}
     index = 1
+    moved = []   # Yarn Classic's install flags written before the verb: they belong after it
     while index < len(words):
         text = words[index].text
         if not text.startswith("-"):
             break
         base = text.partition("=")[0]
         action = globals_.get(base)
+        if action in ("move", "move+arg") and not words[index].dynamic:
+            take = 2 if action == "move+arg" and "=" not in text else 1
+            moved.extend(words[index:index + take])
+            index += take
+            continue
         if action is None and base.startswith(tuple(installer.get("globals_deny_prefixes") or ())):
             # pnpm's `--config.<key>` sets any setting, the registry included.
             raise _Unsupported(f"{base!r} is not supported", code="alternate-source")
@@ -1696,6 +1963,16 @@ def _consume_globals(installer, words):
             code="unknown-verb",
         )
     verb = words[index].text if index < len(words) else None
+    if moved:
+        if verb not in (None, "install", "add", "upgrade", "remove", "up"):
+            raise _Unsupported(
+                f"{moved[0].text!r} before the subcommand is supported only for an install; write "
+                "it after the subcommand", code="unknown-verb")
+        if verb is None:
+            # `yarn --frozen-lockfile --ignore-scripts`: a bare yarn is an install; the empty verb
+            # keeps the slot the handlers read the verb from.
+            return verb, [words[0], shell.Word(text="")] + moved
+        return verb, [words[0], words[index]] + moved + words[index + 1:]
     return verb, [words[0]] + words[index:]
 
 
@@ -1843,7 +2120,8 @@ def _dispatch(installer, head, words, command):
     kind = verbs.classify(installer, canonical)
     if kind == "inert":
         # `help [verb]` only prints, like `--help`; every other inert verb reads the project.
-        return _manager_run(head, None, "print" if canonical == "help" else "manager")
+        return _manager_run(head, None, "print" if canonical == "help" else "manager",
+                            word=canonical if _PM_NAMES.get(head) == "yarn" else "")
     if kind == "unknown":
         if installer.get("unknown_verb") == "ignore":
             return _manager_run(head, None)
@@ -1899,7 +2177,13 @@ def _dispatch(installer, head, words, command):
         texts.append(canonical)  # a bare command (`yarn`) is the empty verb
     if handler_name in _RUN_HANDLERS and _pre_verb_no_install(all_words, words):
         texts.insert(2, "--no-install")  # `bun --no-install run x`
-    return _run_handler(handler, texts, command, head)
+    result = _run_handler(handler, texts, command, head)
+    if _PM_NAMES.get(head) == "yarn":
+        # Yarn Berry and Yarn Classic differ in which words are builtins: carry the word, so
+        # the hook can refuse one that is not a builtin of the project's Yarn (it would run a
+        # package.json script of that name).
+        result = _manager_run(head, result, word=canonical)
+    return result
 
 
 _RUN_HANDLERS = frozenset({"pnpm_run", "pnpm_exec", "yarn_run", "bun_run"})
@@ -1935,7 +2219,15 @@ def _merge(results):
     environments = []
     resolve_only = []
     runs = []
+    bench_pythons = []
+    bench = []
+    executables = []
+    source_build_flags = []
     for result in results:
+        bench.extend(b for b in result.bench if b not in bench)
+        source_build_flags.extend(f for f in result.source_build_flags if f not in source_build_flags)
+        bench_pythons.extend(b for b in result.bench_pythons if b not in bench_pythons)
+        executables.extend(e for e in result.executables if e not in executables)
         resolve_only.extend(k for k in result.resolve_only if k not in resolve_only)
         runs.extend(r for r in result.runs if r not in runs)
         requests.extend(result.requests)
@@ -1943,11 +2235,14 @@ def _merge(results):
             if scope not in manifests:
                 manifests.append(scope)
         environments.extend(e for e in result.environments if e not in environments)
-    if not requests and not manifests:
+    if not requests and not manifests and not bench:
         return ParseResult(kind="ignore", resolve_only=tuple(resolve_only), runs=tuple(runs))
     return ParseResult(kind="package", requests=tuple(requests), manifests=tuple(manifests),
                        environments=tuple(environments), resolve_only=tuple(resolve_only),
-                       runs=tuple(runs))
+                       runs=tuple(runs), bench_pythons=tuple(bench_pythons), bench=tuple(bench),
+                       executables=tuple(executables),
+                       source_build_flags=tuple(source_build_flags),
+                       exclusive=all(r.exclusive for r in results))
 
 
 def _run_handler(name, tokens, command, head):
@@ -2500,6 +2795,222 @@ def _pm_scan(manager, args, verb):
     return specs, scripts, resolve_only
 
 
+# ---------------------------------------------------------------------------
+# Yarn: Berry and Classic (v1) share the `yarn` head
+#
+# The parser cannot see which one runs, so it accepts the union of both flag sets (each
+# one a flag the project's Yarn would itself refuse otherwise) and records what it saw on
+# the scope. `hook._yarn_flavour_denial` judges the verb and the flags against the Yarn the
+# project uses. Flags that would change where packages come from, where they go, or that
+# skip the lock, are refused here whatever the Yarn: they are never safe.
+# ---------------------------------------------------------------------------
+
+# Yarn Classic's own flags (yarn 1.22.22, src/cli/index.js and the install/add/remove commands).
+YARN_CLASSIC_FLAGS = frozenset({
+    "--frozen-lockfile", "--pure-lockfile", "--ignore-scripts", "--offline", "--prefer-offline",
+    "--check-files", "--non-interactive", "--no-progress", "-s", "--silent", "--verbose",
+    "--ignore-engines", "--ignore-platform", "--ignore-optional", "--no-bin-links",
+    "--no-node-version-check", "--production", "--prod", "--emoji", "--network-concurrency",
+    "--network-timeout", "--json",
+})
+# Yarn Berry's (4.x): `--mode` is judged on its value in `_yarn_scan`.
+YARN_BERRY_FLAGS = frozenset({"--immutable", "--immutable-cache", "--check-cache", "--mode",
+                              "-C", "--caret", "--json"})
+# Save-spec flags both know (Berry's `-C --caret` is above; Classic's `upgrade -C` is the same idea).
+_YARN_SAVE_FLAGS = frozenset({"-D", "--dev", "-P", "--peer", "-O", "--optional", "-E", "--exact",
+                              "-T", "--tilde"})
+# Flags that carry a boolean: only the true spelling is accepted (a negation changes what the
+# command does and could undo the proof the hook looks for).
+_YARN_BOOL_FLAGS = YARN_CLASSIC_FLAGS - {"--network-concurrency", "--network-timeout", "--production",
+                                         "--prod", "--emoji"}
+# `--production [prod]` and `--emoji [bool]` read the NEXT word as their value, so a package
+# written after one is not a package to Yarn.
+_YARN_OPTIONAL_VALUE_FLAGS = frozenset({"--production", "--prod", "--emoji"})
+_YARN_VALUE_FLAGS = frozenset({"--network-concurrency", "--network-timeout"})
+_YARN_SOURCE_FLAGS = frozenset({"--registry", "--proxy", "--https-proxy", "--use-yarnrc",
+                                "--no-default-rc", "--config"})
+_YARN_TARGET_FLAGS = frozenset({"--cwd", "--modules-folder", "--link-folder", "--global-folder",
+                                "--cache-folder", "--preferred-cache-folder", "-g", "--global",
+                                "-W", "--ignore-workspace-root-check", "--focus", "-A", "--all",
+                                "--audit"})
+_YARN_REFUSED_WHY = {
+    "--no-lockfile": "it ignores the reviewed lock",
+    "--force": "it refetches and rewrites the lock",
+    "--update-checksums": "it rewrites the lock's checksums from whatever the registry serves",
+    "--flat": "it re-resolves versions interactively",
+    "--pnp": "Plug'n'Play has no node_modules tree Package Guard can inspect",
+    "--enable-pnp": "Plug'n'Play has no node_modules tree Package Guard can inspect",
+    "--disable-pnp": "it changes how the project is linked",
+    "--har": "it writes network traces",
+    "--mutex": "it takes a lock outside this project",
+    "--link-duplicates": "it changes how the tree is written",
+    "--skip-integrity-check": "it skips verifying what is installed",
+}
+# `upgrade`'s own flags (they read differently from `add`'s: `-P` is a pattern there).
+_YARN_UPGRADE_REFUSED = frozenset({"-L", "--latest", "-P", "--pattern", "-S", "--scope"})
+
+
+def _yarn_scan(args, verb):
+    """Classify the arguments of a yarn verb that installs: (specs, scripts, resolve_only,
+    flags). `scripts` is False only for Berry's `--mode=skip-build`; whether Classic's
+    `--ignore-scripts` (recorded in `flags`) counts is the hook's decision, per project."""
+    _refuse_npm_source_args(args)
+    specs, flags, resolve_only, scripts = [], [], False, True
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if not arg.startswith("-") or arg == "-":
+            specs.append(arg)
+            continue
+        base, equals, value = arg.partition("=")
+        if base.startswith("--config."):
+            raise _Unsupported(f"{base!r} sets an installer setting and is not supported",
+                               code="alternate-source")
+        if base in _YARN_SOURCE_FLAGS:
+            raise _Unsupported(f"{base!r} names another registry, proxy or configuration; "
+                               "alternate sources are not supported", code="alternate-source")
+        if base in _YARN_TARGET_FLAGS:
+            raise _Unsupported(f"{base!r} is not supported: it installs somewhere other than "
+                               "this project (a global, workspace or other directory); to use a "
+                               "subdirectory, cd there in its own command first, then run the "
+                               "install", code="install-target")
+        if verb == "upgrade" and base in _YARN_UPGRADE_REFUSED:
+            raise _Unsupported(f"yarn upgrade {base!r} re-resolves packages that are already "
+                               "locked; name one package at an exact version instead",
+                               code="unsupported-flag")
+        if base in _YARN_REFUSED_WHY:
+            raise _Unsupported(f"{base!r} is not supported: {_YARN_REFUSED_WHY[base]}",
+                               code="unsupported-flag")
+        if base == "--mode":
+            mode = value if equals else (args[index] if index < len(args) else "")
+            if mode not in ("skip-build", "update-lockfile"):
+                raise _Unsupported(f"yarn --mode={mode}: only --mode=skip-build and "
+                                   "--mode=update-lockfile are supported", code="unsupported-flag")
+            if not equals:
+                index += 1
+            flags.append(f"--mode={mode}")
+            if mode == "update-lockfile":
+                resolve_only = True  # resolves and writes yarn.lock; skips link and build
+            else:
+                scripts = False
+            continue
+        if base in _YARN_VALUE_FLAGS:
+            if not equals:
+                index += 1  # the flag's value, never a package
+            flags.append(base)
+            continue
+        if base in _YARN_OPTIONAL_VALUE_FLAGS:
+            if equals:
+                if value not in ("true", "false"):
+                    raise _Unsupported(f"{arg!r}: unrecognized value", code="unsupported-flag")
+            elif index < len(args) and not args[index].startswith("-"):
+                raise _Unsupported(f"{base!r} reads the next word ({args[index]!r}) as its value, "
+                                   "not as a package; put the flag last or write "
+                                   f"{base}=true", code="unsupported-flag")
+            flags.append(base)
+            continue
+        if base in _YARN_BOOL_FLAGS or base in _YARN_SAVE_FLAGS or base in YARN_BERRY_FLAGS:
+            if equals and value != "true":
+                raise _Unsupported(f"{arg!r} negates or changes a flag whose true spelling the "
+                                   "gate relies on; write it without a value",
+                                   code="unsupported-flag")
+            flags.append(base)
+            continue
+        plain = f"yarn {verb} <pkg>@<version>".replace("  ", " ")
+        raise _Unsupported(f"unrecognized yarn flag {base!r}; use a plain '{plain}' form",
+                           code="unsupported-flag")
+    return specs, scripts, resolve_only, tuple(dict.fromkeys(flags))
+
+
+def _classic_flags_disabled(flags):
+    """With the Classic switch off, Classic's own flags are refused as they were before."""
+    if YARN_CLASSIC_ENABLED:
+        return
+    for flag in flags:
+        if flag in YARN_CLASSIC_FLAGS - YARN_BERRY_FLAGS:
+            hint = (" (Yarn Berry has no --ignore-scripts; use --mode=skip-build)"
+                    if flag == "--ignore-scripts" else "")
+            raise _Unsupported(f"unrecognized yarn flag {flag!r}{hint}; Yarn Classic is not "
+                               "supported", code="unsupported-flag")
+
+
+def _parse_yarn_install(tokens, original):
+    """bare yarn, install, add, up (Berry), upgrade (Classic)."""
+    verb = tokens[1] if len(tokens) > 1 else ""
+    if verb == "upgrade" and not YARN_CLASSIC_ENABLED:
+        raise _Unsupported("unrecognized yarn subcommand 'upgrade'; use yarn run <script>",
+                           code="unknown-verb")
+    specs, scripts, resolve_only, flags = _yarn_scan(tokens[2:], verb)
+    _classic_flags_disabled(flags)
+    if resolve_only:
+        # `yarn install --mode=update-lockfile`: resolves and writes yarn.lock and skips
+        # linking and building, so there is no `--ignore-scripts` to ask for. The hook reads
+        # the configuration and refuses a root install-time script all the same
+        # (hook._resolve_only_denial).
+        if specs or verb not in ("", "install"):
+            raise _Unsupported("yarn --mode=update-lockfile is supported only as "
+                               "'yarn install --mode=update-lockfile' with no package arguments",
+                               code="unsupported-form")
+        if not PNPM_BUN_YARN_ENABLED:
+            _pm_disabled("'yarn install --mode=update-lockfile'")
+        return _resolve_only("yarn")
+    if specs and verb in ("", "install"):
+        raise _Unsupported(f"'yarn {verb}'".rstrip() + " does not take package arguments",
+                           code="unsupported-form")
+    if verb == "upgrade" and not specs:
+        raise _Unsupported("'yarn upgrade' with no package re-resolves every dependency to a "
+                           "version nobody reviewed; name one package at an exact version "
+                           "(`yarn upgrade <pkg>@<version>`)", code="unsupported-form")
+    scope = ManifestScope("yarn", scripts=scripts, verb=verb, flags=flags)
+    if not specs:
+        return _manifest_only(scope)
+    return _package((_pm_spec_to_request(s, "install", original, "yarn") for s in specs),
+                    manifests=(scope,))
+
+
+def _parse_yarn_global(tokens, original):
+    raise _Unsupported("'yarn global' installs and runs packages outside this project's tree, "
+                       "where nothing is reconciled; to use a global tool, ask the user to "
+                       "install it", code="install-target")
+
+
+def _yarn_readonly_flags(args):
+    for arg in args:
+        base = arg.partition("=")[0]
+        if base in _YARN_SOURCE_FLAGS:
+            raise _Unsupported(f"{base!r} names another registry, proxy or configuration; "
+                               "alternate sources are not supported", code="alternate-source")
+        if base in _YARN_TARGET_FLAGS or base in ("--mode",):
+            raise _Unsupported(f"{base!r} is not supported: it reads somewhere other than this "
+                               "project", code="install-target")
+
+
+def _parse_yarn_readonly(tokens, original):
+    """Yarn Classic's read-only verbs (list, ls, outdated, licenses, check, audit, versions)."""
+    verb = tokens[1] if len(tokens) > 1 else ""
+    if not YARN_CLASSIC_ENABLED:
+        raise _Unsupported(f"unrecognized yarn subcommand {verb!r}; use yarn run <script>",
+                           code="unknown-verb")
+    _refuse_npm_source_args(tokens[2:])
+    _yarn_readonly_flags(tokens[2:])
+    if verb == "licenses" and (len(tokens) < 3 or tokens[2] not in ("list", "ls")):
+        raise _Unsupported("'yarn licenses' is supported only as 'licenses list'",
+                           code="unsupported-form")
+    return _ignore()
+
+
+def _parse_yarn_cache(tokens, original):
+    if not YARN_CLASSIC_ENABLED:
+        raise _Unsupported("unrecognized yarn subcommand 'cache'; use yarn run <script>",
+                           code="unknown-verb")
+    if len(tokens) > 2 and tokens[2] in ("dir", "list"):
+        _yarn_readonly_flags(tokens[3:])
+        return _ignore()
+    raise _Unsupported("'yarn cache' is supported only as 'cache dir' and 'cache list'; "
+                       "'cache clean' deletes what other projects use", code="unsupported-form")
+
+
 def _pm_install(manager):
     def handler(tokens, original):
         verb = tokens[1] if len(tokens) > 1 else ""
@@ -2550,11 +3061,17 @@ def _parse_pm_remove(tokens, original):
     `--ignore-scripts` on `remove` ("Unknown option") and never ran the root postinstall, so
     its scripts stay on: the denial for a root install script is the safe, documented one."""
     manager = _PM_NAMES[_executable(tokens[0])]
-    names, scripts, _resolve = _pm_scan(manager, tokens[2:], "remove")
+    flags = ()
+    if manager == "yarn":
+        names, scripts, _resolve, flags = _yarn_scan(tokens[2:], "remove")
+        _classic_flags_disabled(flags)
+    else:
+        names, scripts, _resolve = _pm_scan(manager, tokens[2:], "remove")
     if not PNPM_BUN_YARN_ENABLED:
         _pm_disabled(f"'{manager} remove'")
     return ParseResult(kind="ignore", runs=(RunScope(
-        manager, "remove", scripts=scripts or manager == "pnpm", names=tuple(names)),))
+        manager, "remove", scripts=scripts or manager == "pnpm", names=tuple(names),
+        word="remove" if manager == "yarn" else "", flags=flags),))
 
 
 def _parse_pm_config(tokens, original):
@@ -2884,6 +3401,19 @@ def _is_local_project(target: str) -> bool:
     return target == "." or target.startswith(("./", ".["))
 
 
+_BENCH_EDITABLE_MESSAGE = (
+    "`-e apps/<app>` installs a bench app together with its whole unpinned dependency set, in one "
+    "step no baseline or review covers. Install an app with `bench setup requirements <app>`, which "
+    "does the same Python install and the yarn install, behind the gate; to add one package to an "
+    "app, name it with an exact version (`env/bin/pip install name==version`)")
+_BENCH_APP_PATH = re.compile(r"(?:\./)?apps/[^/]+/?\Z|/apps/[^/]+/?\Z")
+
+
+def _bench_app_path(target) -> bool:
+    """`apps/erpnext`, `./apps/erpnext`, `/srv/bench/apps/erpnext`: a path to an app directory."""
+    return bool(_BENCH_APP_PATH.search(target))
+
+
 def _parse_pip_install(args, original, manager, operation) -> ParseResult:
     specs = []
     manifests = []
@@ -2907,6 +3437,8 @@ def _parse_pip_install(args, original, manager, operation) -> ParseResult:
                     i += 1
             elif base in ("-e", "--editable"):
                 target = value if has_eq else (args[i + 1] if i + 1 < len(args) else "")
+                if FRAPPE_ENABLED and _bench_app_path(target):
+                    raise _Unsupported(_BENCH_EDITABLE_MESSAGE, code="local-project")
                 if _is_local_project(target):
                     local_project = True
                     local_targets.append(target)
@@ -3196,22 +3728,69 @@ def _parse_uv_version(tokens, original) -> ParseResult:
     return _manifest_only(_uv_project_scope([(name, "") for name in sorted(names)]))
 
 
+def _split_env_python(args):
+    """(env python or None, the other arguments) for `uv pip install` / `sync`.
+
+    uv's `--python` / `-p` can name any interpreter, so only one that is written
+    as a bench env's (`.../env/bin/python`, a literal path) is carried, for the
+    hook to tie to the bench (`bench_config.python_in_env_problem`); any other
+    value is refused as `--python` always was, and so is a path the shell would
+    still change (`~`, `$`, a glob). Attached short forms (`-pPATH`) stay
+    unrecognised and are refused with the rest."""
+    value, rest, index = None, [], 0
+    while index < len(args):
+        arg = args[index]
+        base, equals, attached = arg.partition("=")
+        if base in ("--python", "-p"):
+            if equals:
+                found, step = attached, 1
+            elif index + 1 < len(args):
+                found, step = args[index + 1], 2
+            else:
+                rest.append(arg)
+                index += 1
+                continue
+            if value is not None:
+                raise _Unsupported("`--python` is given twice", code="unsupported-flag")
+            if (not bench_config.ENV_PYTHON.search(found) or _PATH_SURPRISE.search(found)
+                    or _names_guard_dir(found)):
+                raise _Unsupported(
+                    f"`--python {found}` names an interpreter Package Guard cannot tie to a "
+                    "reviewed environment; only a Frappe bench's own `env/bin/python` is "
+                    "supported, so drop `--python` or name that path",
+                    code="unsupported-flag")
+            value = found
+            index += step
+            continue
+        rest.append(arg)
+        index += 1
+    return value, rest
+
+
+def _with_env_python(result, value):
+    return dataclasses.replace(result, bench_pythons=(value,)) if value is not None else result
+
+
 def _parse_uv_pip_install(tokens, original) -> ParseResult:
     # tokens: uv pip install <args>
-    return _parse_pip_install(tokens[3:], original, manager="uv pip", operation="install")
+    value, args = _split_env_python(tokens[3:])
+    result = _parse_pip_install(args, original, manager="uv pip", operation="install")
+    return _with_env_python(result, value)
 
 
 def _parse_uv_pip_sync(tokens, original) -> ParseResult:
     # tokens: uv pip sync <files>
-    for arg in tokens[3:]:
+    value, args = _split_env_python(tokens[3:])
+    for arg in args:
         if arg.startswith("-") and (arg.partition("=")[0] in _PIP_DENY_FLAGS
                                     or _is_uv_source_flag(arg)):
             raise _Unsupported("alternate/direct package sources are not supported for 'uv pip sync'",
                                code="alternate-source")
-    targets = [t for t in tokens[3:] if not t.startswith("-")]
+    targets = [t for t in args if not t.startswith("-")]
     if not targets:
         return _ignore()
-    return _manifest_only(*(ManifestScope("requirements", t) for t in targets))
+    return _with_env_python(_manifest_only(*(ManifestScope("requirements", t) for t in targets)),
+                            value)
 
 
 def _parse_uv_tool_run(tokens, original) -> ParseResult:
@@ -3361,7 +3940,10 @@ HANDLERS = {
     "npx": _parse_npx_verb,
     "pnpm_install": _pm_install("pnpm"),
     "bun_install": _pm_install("bun"),
-    "yarn_install": _pm_install("yarn"),
+    "yarn_install": _parse_yarn_install,
+    "yarn_global": _parse_yarn_global,
+    "yarn_readonly": _parse_yarn_readonly,
+    "yarn_cache": _parse_yarn_cache,
     "pm_remove": _parse_pm_remove,
     "pm_config": _parse_pm_config,
     "pm_audit": _parse_pm_audit,

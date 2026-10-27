@@ -12,6 +12,7 @@ troubleshooting row and the limits.
 - [What you will see](#what-you-will-see)
 - [What changes for you](#what-changes-for-you)
 - [Supported package managers](#supported-package-managers)
+- [Frappe / ERPNext](#frappe--erpnext)
 - [Turning it down: modes](#turning-it-down-modes)
 - [Optional: the sandbox](#optional-the-sandbox)
 - [Commands](#commands)
@@ -133,7 +134,7 @@ evidence sources, install the guard in it, and start Claude.
 
 ```powershell
 sbx create --name myproj claude .
-sbx policy allow network --sandbox myproj "api.osv.dev,api.npmjs.org,hugovk.dev,pypistats.org,api.deps.dev,data.jsdelivr.com,inspector.pypi.io,releases.astral.sh,python-downloads.astral.sh"
+sbx policy allow network --sandbox myproj "api.osv.dev,api.npmjs.org,hugovk.dev,pypistats.org,api.deps.dev,data.jsdelivr.com,inspector.pypi.io,releases.astral.sh,python-downloads.astral.sh,registry.yarnpkg.com,codeload.github.com"
 sbx exec myproj -- sh -c "curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- ."
 sbx run --name myproj
 ```
@@ -145,6 +146,58 @@ project that already carries the guard still needs the `policy allow` and
 `curl` lines: they set up Python 3.11 inside it and leave the project as is. Git for Windows checks out files with CRLF by
 default, and a CRLF `run.sh` blocks every command; the installer adds
 `.gitattributes` lines that keep the guard's files LF.
+
+#### A Frappe bench, and Yarn Classic, in a sandbox
+
+Frappe's JavaScript uses Yarn Classic (1.x), and a bench lives in a folder with
+`apps/` and `sites/`. The guard runs in the sandbox as above; these are the
+differences.
+
+**The hosts.** Yarn Classic downloads every tarball from `registry.yarnpkg.com`,
+and some Frappe locks pin a GitHub tarball on `codeload.github.com`. The command
+under "Then, from the project folder" already lists both. To add them to a
+sandbox you have already made, run this one command (it is the whole list, so it
+is safe to run again):
+
+```powershell
+sbx policy allow network --sandbox myproj "api.osv.dev,api.npmjs.org,hugovk.dev,pypistats.org,api.deps.dev,data.jsdelivr.com,inspector.pypi.io,releases.astral.sh,python-downloads.astral.sh,registry.yarnpkg.com,codeload.github.com"
+```
+
+If a bench step still fails to download, a host is missing: look at your `sbx`
+version's log of blocked requests, add the host with the same command, and tell
+us which one it was.
+
+**What the guard does with a Yarn Classic project.** It reads `yarn.lock` and
+every `.yarnrc` whatever line endings Git for Windows gave them (CRLF is read as
+LF; a stray lone CR is refused). An install must carry `--frozen-lockfile` and
+`--ignore-scripts`. They may instead be set in `.yarnrc`, but only when the guard
+can show that the `yarn` on the command's PATH is Yarn Classic 1.x (it looks at
+where `yarn` points, through links and Corepack shims, and never runs it); a Berry
+`yarn` is refused, and one the guard cannot identify counts only the two flags on
+the command, which Berry rejects. `YARN_IGNORE_SCRIPTS=true` in front of the command
+counts as `--ignore-scripts` under the same condition. A `.yarnrc` that the guard
+cannot read exactly the way Yarn does (for example a value like `trueish`) is not
+counted. A lock that points at a GitHub tarball or a git commit is refused unless a baseline you approved lists it.
+
+**What the kit prints.** When the sandbox's folder is a bench, the kit's start
+step prints the next steps and writes nothing: ask Claude to plan a baseline
+for each app in `apps/`, approve each plan, then ask for `bench-config apply`.
+Open Claude at the bench folder, not inside an app: a session started in
+`apps/<app>` may not load the bench folder's guard. These steps, and the line
+that tells Claude how a bench is installed, are in kits built from a guard that
+supports benches; a kit built from an older one leaves them out.
+
+**What stays yours.** `bench init`, `bench get-app` and `bench update` are run
+by you, inside the sandbox, for example
+`sbx exec myproj -- bench init --frappe-branch version-15 frappe-bench`. The
+guard does not install Python, Node, MariaDB or Redis for you either: put them
+in the sandbox's image, or install them yourself.
+
+**Links on a Windows folder.** Bench's Python environment (`env/`) is made of
+links. Whether the project folder on your PC accepts them inside the sandbox is
+not confirmed yet. To find out, run `ln -s a b` in that folder from the sandbox.
+If it fails, keep the bench on the sandbox's own disk and install the guard
+there. The kit sets `UV_LINK_MODE=copy` so that uv's own copies are quiet.
 
 ### Setup
 
@@ -331,7 +384,8 @@ Packages you already approved install with no prompt and no network call.
 | `uv` cannot create `.venv` on a mount that refuses symlinks | The filesystem, not the guard | Put the environment elsewhere: `UV_PROJECT_ENVIRONMENT=/absolute/path uv sync --locked`. The guard checks that environment like `.venv` |
 
 Claude installs packages with `npm`, `npx`, `pip`, `uv`, `pnpm`, `bun` and Yarn
-Berry 4.14+. `pipx`, `poetry`, `conda` and `corepack` are refused.
+Berry 4.14+, and in a Frappe bench Yarn Classic and `bench`. `pipx`, `poetry`,
+`conda` and `corepack` are refused.
 
 ### Supported package managers
 
@@ -342,7 +396,8 @@ Berry 4.14+. `pipx`, `poetry`, `conda` and `corepack` are refused.
 | `bun`, `bunx` | A text `bun.lock` (not `bun.lockb`) | Scripts off or `trustedDependencies` (even `[]`); `bun install` before `bun run` when there is no `node_modules` |
 | `yarn`, `yarnpkg` | A Berry `yarn.lock`, `packageManager: yarn@4.14.0` or newer, `nodeLinker: node-modules` in `.yarnrc.yml` | `--mode=skip-build` turns scripts off; bare `yarn` is an install |
 | `pip`, `uv` | As before | The guard's own runner is uv with exactly Python 3.11; your project's uv and pip are unchanged |
-| `pipx`, `poetry`, `conda`, `corepack`, Yarn Classic and Plug'n'Play | Not supported | Refused by the hook |
+| `pipx`, `poetry`, `conda`, `corepack` and Plug'n'Play | Not supported | Refused by the hook |
+| Yarn Classic (v1), `bench` | A baseline for each upstream app and the guard's installer files | Gated, not refused: see [Frappe / ERPNext](#frappe--erpnext) |
 
 The same rules apply to every supported manager: exact versions only, each
 reviewed and approved before it installs, one manager per project, no
@@ -360,6 +415,157 @@ cache layouts the disk check reads have not been verified against real
 managers.
 
 ---
+
+## Frappe / ERPNext
+
+
+**What the guard does.**
+
+- The packages of Frappe, ERPNext and HRMS come from their releases, not from
+  Claude. You approve them **once per Frappe release**, as one list (a
+  *baseline*), instead of package by package. The baseline is kept with the
+  project's guard files, so the whole team shares it.
+- The packages your own app adds are checked **one by one**, like any project.
+  A typo such as `reqeusts-toolbelt` goes to review, never straight in.
+- The fake `frappe` or `erpnext` on PyPI is **blocked**, whatever has been
+  approved: those names are apps in your bench, never downloads.
+- Old packages have known bugs. The guard **shows** them when you approve a
+  baseline and does not block on them. Known malware always blocks, on every
+  Frappe version.
+- Install scripts stay off. A package fetched from GitHub is allowed only as a
+  full commit from an owner you allowed (`frappe`, `quilljs`), and only when a
+  baseline you approved lists it.
+- `bench-config apply` writes the files bench's own installs read
+  (`env/pip.conf`, `uv.toml`, a `.yarnrc` in each app), so that
+  `bench setup requirements` installs exactly what the baselines list. The guard
+  checks them before every bench install and refuses if they were changed.
+- The plan text says a baseline "pins and checks this set; it does not prevent
+  a package outside it from installing". That is about the baseline alone. What
+  stops a package outside it is the review: Claude cannot install a package that
+  neither a baseline nor you approved, and a name that does not exist is refused.
+
+**The five commands you run**, in your own terminal, in the bench folder (only
+`baseline approve` and `baseline revoke` are yours alone):
+
+```sh
+sh .claude/hooks/package_guard/pg baseline plan --app apps/frappe   # write a proposal and show it
+sh .claude/hooks/package_guard/pg baseline approve bl-<id>          # approve it: you read the prompt
+sh .claude/hooks/package_guard/pg bench-config apply                # write the installer files (Claude may run it too: you get a prompt)
+sh .claude/hooks/package_guard/pg bench-config check                # do they still hold?
+sh .claude/hooks/package_guard/pg baseline revoke bl-<id>           # take an approval back
+```
+
+Do `plan` and `approve` once for each app in `apps/` that is not your own
+(`frappe`, `erpnext`, `hrms`), then `apply`. Plan again, approve and `apply`
+when you move to a new Frappe release.
+
+A bench has one Python env, and ERPNext runs on Frappe, so the baselines of one
+bench must agree on the packages they share. `baseline plan` therefore works out
+a new app together with the bench's other approved apps, in either order. If no
+set of versions fits all of them, the plan says so and names the packages that
+clash. If `bench-config apply` refuses because two baselines you approved earlier
+clash, plan the later app again and approve the new plan.
+
+**Run again after you add an app.** `bench new-app` (and `bench get-app`, which
+is yours to run) adds a folder the guard has not written files for. The next
+bench command says a `.yarnrc` or another file is missing: run `bench-config
+apply` again.
+
+**Before `bench new-app`.** `bench new-app` installs the app it has just made,
+before the guard could list it, and the guard's `uv.toml` lets uv build only the
+apps it lists. So name the new app first, then let bench create it:
+
+```sh
+sh .claude/hooks/package_guard/pg bench-config apply --new-app myapp
+```
+
+Claude may run this too, with the prompt showing the name; allow it only when
+`myapp` is the name of a new app of yours and not the name of a package from an
+index. Once the app exists the name is dropped and the app is listed like any
+other. If you skip this step, `bench new-app` makes the folder and then fails at
+the install ("Building source distributions for `myapp` is disabled"): run the
+command above and `bench setup requirements`.
+
+The build tool of a new app (`flit-core` in the app bench makes) comes from your
+approved Frappe baseline, so `bench new-app` can build it. Your app's own list
+still counts as one of your packages, so the next `bench setup requirements`
+asks for one review of it, once.
+
+**Which command form.** The `pg` lines above are for you, in your terminal.
+Claude cannot use `pg`; when it needs `bench-config apply` or `baseline plan`
+the hook gives it the exact form to run, `uv run --no-project --no-config
+--no-python-downloads <project>/.claude/hooks/package_guard/cli.py bench-config
+apply`. Either way you answer the prompt for `apply`.
+
+**Yarn must be visible to the guard.** Every bench command that runs Yarn (an
+install, and a build in an app that has a `build` script and no `node_modules`)
+needs Yarn Classic 1.x on the PATH the guard sees, which is the PATH Claude Code
+was started with. nvm and volta often set `yarn` only inside your shell. If the
+guard says the `yarn` it finds "is not shown to be Yarn Classic", start Claude
+Code from a shell where `yarn --version` prints 1.x, then try again.
+
+**The same checks as a plain `yarn install`.** Whatever a bench command runs
+Yarn on in your own apps gets what a direct `yarn install` there gets: the lock
+may name only the npm registry, every direct package is reviewed, the whole
+tree is checked for known malware, and `.npmrc` files (the app, its parents,
+your home folder, the system ones) may not name a proxy, a certificate
+authority, switch TLS checking off or point at another registry. A build that
+would install in an app added after the last `bench-config apply` is refused
+until you apply again.
+
+**Which folders are checked.** Only the folders where Yarn really runs: each
+app's own folder, plus a sub-folder that a script in the app's `package.json`
+runs Yarn in (`cd banking && yarn install`, `yarn --cwd ui build`). A folder with
+a `package.json` that no script names, such as Frappe's `ui/`, is not checked,
+because bench never runs Yarn there. If a script is too dynamic to follow (it
+uses a variable, backticks or `~`), every folder of that app that has a
+`yarn.lock` is checked.
+
+**ERPNext 16 and `banking/`.** ERPNext's build runs `cd banking && yarn build`,
+and its `postinstall` (`cd banking && yarn install`) does not run, because the
+guard keeps install scripts off. So `banking/` has no `node_modules` and the
+build cannot find its tools. When that is the case the guard says so in the
+answer to `bench build` and names the command: with `apps/erpnext/banking` as the
+working directory, as its own command, run `yarn install --frozen-lockfile
+--ignore-scripts`. An approved ERPNext baseline already covers `banking/yarn.lock`,
+so that command is allowed without a review per package. If the lock was
+changed after the approval, the baseline no longer covers it and every package
+is reviewed instead.
+
+**Adding a JavaScript package to your own app.** Your app uses Yarn Classic
+(version 1). A package that `package.json` lists and `yarn.lock` does not have
+goes to review by name and exact version, like `npm install name@1.2.3`; a typo
+that does not exist on npm is refused outright. Nothing that runs `yarn` in that
+app is allowed until the lock has it. After you approve, Claude removes the line
+from `package.json` and adds the package the Classic way, inside the app's
+folder: `yarn add <name>@<exact version> --ignore-scripts`. That writes
+`package.json` and `yarn.lock`.
+
+**What Claude may do.** Run `baseline plan`, `show`, `list` and
+`bench-config check` and `bench-config apply` (you get a prompt and decide);
+run `bench setup requirements`,
+`bench update --requirements`, `bench new-app` and `bench build` once the
+baselines and the installer files hold; install a package into the bench's env
+with an exact version after review (`bench pip install name==1.2.3`).
+
+**What Claude may not do.** Approve a baseline, add a trusted GitHub owner, or
+change the installer files by hand; run `bench init`,
+`get-app`, `update` with anything but `--requirements`, `switch-to-branch`,
+`setup env`, `migrate-env` or the system installers (`bench install`,
+`setup production`, `setup role`): those stay yours. Open Claude at the bench
+folder, not inside an app.
+
+**Versions.** Run on a real bench in the sandbox lab: frappe-bench 5.31.1 with
+Frappe 15.124.0 and ERPNext 15.124.1 (Python 3.11, Node 20, Yarn 1.22.22).
+bench 5.31.1 makes the env with `uv venv` and installs with `uv pip install -e`;
+it does not use pip. Frappe 16.53.0 and ERPNext 16.52.1 (Python 3.14, Node 24)
+ran on the same lab: plan, approve, apply, `bench setup requirements`, `bench
+build` with ERPNext's `banking/` route, and the site served its login page; the
+typo, fake `frappe` and malware installs were refused on both versions. The
+tests run the whole flow offline on v15. Frappe v14 uses the same steps as v15
+but has not been run on a real bench. Frappe v11 to v13 use older Python and Node: their baselines are planned
+from recorded runs, show many more known bugs, and have not been run on a real
+bench.
 
 ## Turning it down: modes
 
@@ -427,10 +633,21 @@ the network open, so there is no list of websites to maintain. It needs Claude
 Code v2.1.186 or later, and on Linux or WSL2 `bubblewrap` and `socat`
 (`sudo apt-get install bubblewrap socat`).
 
+**Already opted in?** The list of writable places grew. After you update the guard,
+`install.py --check` fails on a sandboxed project and names the entries it lacks.
+Run the installer once more with `--sandbox` (`PG_SANDBOX=1 sh
+~/.cache/package-guard/install.sh <project>`): it only adds, and your own entries
+stay.
+
 It still confines every command Claude runs in the project:
 
 - writes outside the project fail, unless the path is added to
-  `sandbox.filesystem.allowWrite` in `.claude/settings.json`;
+  `sandbox.filesystem.allowWrite` in `.claude/settings.json`. The installer lists
+  the package managers' own places: `~/.npm`, `~/.cache/uv`, `~/.cache/pip`,
+  `~/Library/Caches/pip`, and for Yarn Classic and bench `~/.cache/yarn`,
+  `~/.yarn`, `~/.config/yarn`, `~/.yarnrc` and `~/.cache/bench`. The guard reads
+  those Yarn files before every yarn command, so a write to them is checked
+  before the next install;
 - git over SSH fails on macOS, so use HTTPS remotes;
 - Docker does not run inside it;
 - Claude's WebFetch tool can open any website without asking.

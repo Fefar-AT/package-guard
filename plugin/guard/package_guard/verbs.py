@@ -41,6 +41,8 @@ ENV_REASONS = TABLE.get("env_reasons") or {}
 ENVIRONMENT = TABLE.get("environment") or {}
 ENV_SHARED_REFUSE = TABLE.get("env_shared_refuse") or {}
 ENV_REACH = TABLE.get("env_reach") or {}
+# A `bench` head names several families at once and these swap-the-program names.
+BENCH_ENV = TABLE.get("bench_env") or {}
 
 _FILES = TABLE.get("installer_files") or {}
 _FILE_NAMES = {name.casefold() for name in _FILES.get("names", ())}

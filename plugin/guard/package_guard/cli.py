@@ -21,7 +21,9 @@ Standard library only.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 import time
 from concurrent import futures
@@ -44,6 +46,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # would exit 1 with a traceback in the middle of an approval, which reads like a
 # crash rather than a refusal. Nothing has been written at this point.
 try:
+    import baseline  # noqa: E402
+    import bench_config  # noqa: E402
+    import bench_gate  # noqa: E402
     import disk_guard  # noqa: E402
     import manifest as pg_manifest  # noqa: E402
     import mode as pg_mode  # noqa: E402
@@ -61,6 +66,9 @@ USAGE = (
     "usage: cli.py show <review-id>... | cli.py approve <review-id>... | "
     "cli.py decline <review-id>... | cli.py undecline <review-id>... | "
     "cli.py revoke <review-id>... | cli.py reconcile | cli.py audit | "
+    "cli.py baseline plan|show|approve|revoke|list|export|import ... | "
+    "cli.py git-owners list|add|remove ... | "
+    "cli.py bench-config apply|check [--bench <dir>] [--toolchain name==version]... [--no-symlinks] | "
     "cli.py mode [enforce [--project] | warn|off --reason <why> [--project] "
     "[--for 90m|8h|7d | --permanent]] "
     "(optionally `<subcommand> --root <project>` to name the project)"
@@ -298,8 +306,14 @@ def _approve(root, reports) -> int:
     for report in reports:
         identity = report["resolved_identity"]
         evidence = report.get("evidence") or {}
-        artifacts = evidence.get("artifacts") if identity["ecosystem"] == "pypi" else (
-            [evidence["integrity"]] if isinstance(evidence.get("integrity"), str) else None)
+        if identity["ecosystem"] == "pypi":
+            artifacts = evidence.get("artifacts")
+        else:
+            # npm: the registry's SRI integrity and, since Yarn Classic locks name some tarballs
+            # by sha1 only, `dist.shasum` as `sha1-<base64>` (vetting._npm_sha1_artifacts).
+            artifacts = ([evidence["integrity"]] if isinstance(evidence.get("integrity"), str) else []) \
+                + [a for a in (evidence.get("artifacts") or []) if isinstance(a, str)]
+            artifacts = artifacts or None
         added = store.add_vetted(root, identity, review_id=report["review_id"], artifacts=artifacts)
         suffix = "" if added else " (was already vetted)"
         print(f"Approved {_label(identity)} from {identity['registry']}{suffix}")
@@ -353,6 +367,29 @@ def _revoke(root, reports) -> int:
 
 
 def _reconcile(root) -> int:
+    """`reconcile`: the disk, then the problems the post-hook recorded for a bench."""
+    return max(_reconcile_disk(root), _bench_recheck(root))
+
+
+def _bench_recheck(root) -> int:
+    """Ask each problem the post-hook recorded for a bench whether it is still true; the ones that
+    are not are cleared. 1 while any remains."""
+    problems = bench_gate.read_problems(root)
+    if not problems:
+        return 0
+    still = [p for p in problems if bench_gate.still_holds(root, p.get("check"))]
+    if not still:
+        bench_gate.clear_problems(root)
+        print(f"Cleared {len(problems)} recorded bench problem(s): none of them holds any more.")
+        return 0
+    bench_gate._write_json(root, bench_gate.PROBLEMS_FILE, {"schema_version": 1, "problems": still})
+    print(f"{len(still)} recorded bench problem(s) still hold; bench commands stay refused:")
+    for problem in still:
+        print(f"- {problem.get('text', '?')}")
+    return 1
+
+
+def _reconcile_disk(root) -> int:
     """Open a review of every unreviewed package already installed.
 
     This lives in the CLI and not in a hook because it makes network calls.
@@ -467,6 +504,41 @@ def _print_catalog_status() -> None:
 
 
 def _audit(root) -> int:
+    """`audit`: the approved packages, then the approved baselines. Either one
+    finding malware, or a provider that failed, makes the status 1."""
+    status = _audit_vetted(root)
+    return max(status, _audit_baselines(root))
+
+
+def _audit_baselines(root) -> int:
+    """Re-check every approved baseline against OSV, in as many batches as it
+    takes, and write the cache the hook reads. The hook never asks
+    OSV about a baseline: one bench is about 2,000 packages, over its call cap."""
+    docs, problems = baseline.load_approved(root)
+    for problem in problems:
+        print(f"BASELINE UNREADABLE (it covers nothing): {problem}")
+    if not docs:
+        return 1 if problems else 0
+    try:
+        result = baseline.audit_baselines(root, vetting.query_osv_batch, vetting.OSV_BATCH_SIZE)
+    except vetting.ProviderError as exc:
+        print(f"error: the OSV audit of the baselines failed ({exc}); nothing was recorded.", file=sys.stderr)
+        return 1
+    status = 1 if problems else 0
+    calls = result.pop("_calls")
+    for bid in sorted(result):
+        entry = result[bid]
+        print(f"baseline {bid}: {entry['entries']} identities, {entry['advisories']} with advisories "
+              f"(information), {'MALWARE' if entry['malware'] else 'no malware'}")
+        for line in entry["malware"]:
+            status = 1
+            print(f"MALWARE: {line} - the baseline covers nothing until it is revoked and a person approves a new one:")
+            print(f"  {store.cli_command(root, 'baseline', 'revoke ' + bid)}")
+    print(f"{len(result)} baseline(s) checked against OSV in {calls} batch call(s).")
+    return status
+
+
+def _audit_vetted(root) -> int:
     """Re-check every approved version against OSV, live.
 
     The hook runs this same audit before an install, from a cache that is a
@@ -677,6 +749,281 @@ def _mode(root, args) -> int:
     return _mode_down(root, chosen, scope, options)
 
 
+# ---------------------------------------------------------------------------
+# baseline / git-owners (v1.12, P4)
+# ---------------------------------------------------------------------------
+
+def _baseline_seams():
+    """The network and subprocess calls `baseline plan` makes. Tests replace this."""
+    import baseline_plan
+    return baseline_plan.Seams()
+
+
+def _confirm_human(word, message) -> bool:
+    """A person at a terminal types `word`: the model of `mode warn`. Claude's
+    commands have no terminal on stdin, and the hook refuses these verbs from
+    Claude before they get here; this is the second lock."""
+    if not sys.stdin.isatty():
+        print("error: this must be run by a person in their own terminal. Claude's commands, and `!` "
+              "commands in Claude Code, have no terminal to confirm in; open a separate terminal window. "
+              "Nothing was changed.", file=sys.stderr)
+        return False
+    print(message)
+    try:
+        answer = input(f"Type '{word}' to confirm: ")
+    except EOFError:
+        answer = ""
+    if answer.strip() != word:
+        print("error: not confirmed. Nothing was changed.", file=sys.stderr)
+        return False
+    return True
+
+
+def _take_option(args, name, many=False):
+    """(values, remaining args). `--name value` and `--name=value`; raises ValueError
+    when a value is missing, or when a single-valued option is given twice."""
+    values, rest, i = [], [], 0
+    while i < len(args):
+        token = args[i]
+        if token == name:
+            if i + 1 >= len(args):
+                raise ValueError(f"{name} needs a value")
+            values.append(args[i + 1])
+            i += 2
+        elif token.startswith(name + "="):
+            values.append(token[len(name) + 1:])
+            i += 1
+        else:
+            rest.append(token)
+            i += 1
+    if values and not many and len(values) > 1:
+        raise ValueError(f"{name} is given twice")
+    return values, rest
+
+
+def _baseline_usage():
+    return ("usage: cli.py baseline plan --app apps/<x> [--base <id>]... [--python-version 3.10] | "
+            "plan <https://github.com/owner/repo> <ref> | show <id> | list | export <id> | import <file> | "
+            "approve <id> | revoke <id>")
+
+
+def _baseline(root, args) -> int:
+    if not args:
+        print(_baseline_usage(), file=sys.stderr)
+        return 2
+    verb, rest = args[0], list(args[1:])
+    try:
+        if verb == "plan":
+            return _baseline_plan(root, rest)
+        if verb == "show" and len(rest) == 1:
+            return _baseline_show(root, rest[0])
+        if verb == "list" and not rest:
+            return _baseline_list(root)
+        if verb == "export" and len(rest) == 1:
+            doc = baseline.export_document(root, rest[0])
+            print(json.dumps(doc, indent=2, sort_keys=True, ensure_ascii=False))
+            return 0
+        if verb == "import" and len(rest) == 1:
+            return _baseline_import(root, rest[0])
+        if verb == "approve":
+            return _baseline_approve(root, rest)
+        if verb == "revoke" and len(rest) == 1:
+            return _baseline_revoke(root, rest[0])
+    except ValueError as exc:
+        print(f"error: {exc}\n{_baseline_usage()}", file=sys.stderr)
+        return 2
+    except baseline.BaselineError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(_baseline_usage(), file=sys.stderr)
+    return 2
+
+
+def _print_plan(root, result) -> None:
+    doc = result["document"]
+    owners = baseline.load_owners(root)[0]
+    print(baseline.prompt_text(doc, owners))
+    for note in result["notes"]:
+        print(f"NOTE: {note}")
+    print(f"\nProposal {doc['id']} written. A person approves it with:\n  "
+          + store.cli_command(root, "baseline", f"approve {doc['id']}"))
+    if baseline.all_builds(doc):
+        print(f"It lists {len(baseline.all_builds(doc))} packages that build from source at install. A person "
+              "approves it, in their own terminal, with one typed confirmation of the whole list:\n  "
+              + store.human_command(root, "baseline", f"approve {doc['id']}"))
+
+
+def _baseline_plan(root, args) -> int:
+    import baseline_plan
+    bases, args = _take_option(args, "--base", many=True)
+    versions, args = _take_option(args, "--python-version")
+    apps, args = _take_option(args, "--app")
+    unknown = [a for a in args if a.startswith("-")]
+    if unknown:
+        raise ValueError(f"unknown option {unknown[0]!r}")
+    if apps and not args:
+        kwargs = {"app_dir": apps[0]}
+    elif not apps and len(args) == 2:
+        kwargs = {"url": args[0], "ref": args[1]}
+    else:
+        raise ValueError("name an app (--app apps/<x>) or a URL and a ref")
+    seams = _baseline_seams()
+    try:
+        result = baseline_plan.plan(root, seams, base_ids=bases, python_version=versions[0] if versions else None,
+                                    **kwargs)
+    except baseline_plan.PlanError as exc:
+        print(f"error: no proposal was written. {exc}", file=sys.stderr)
+        return 1
+    baseline.save_proposal(root, result["document"])
+    _print_plan(root, result)
+    return 0
+
+
+def _baseline_show(root, bid) -> int:
+    try:
+        doc = baseline.load(root, bid)
+    except baseline.BaselineError:
+        doc = baseline.load(root, bid, proposal=True)
+    print(baseline.summary_text(doc, baseline.load_owners(root)[0]))
+    return 0
+
+
+def _baseline_list(root) -> int:
+    rows = 0
+    for proposal in (False, True):
+        for bid in baseline.list_ids(root, proposals=proposal):
+            try:
+                doc = baseline.load(root, bid, proposal=proposal)
+            except baseline.BaselineError as exc:
+                print(f"{bid}  UNREADABLE ({exc})")
+                rows += 1
+                continue
+            app = doc["app"]
+            state = "approved" if not proposal else ("proposal" if doc.get("approvable", True) else "proposal (malware: unapprovable)")
+            print(f"{bid}  {state:<9}  {app['name']} {app['commit'][:12]}  {app['git_url']}")
+            rows += 1
+    if not rows:
+        print("No baselines.")
+    return 0
+
+
+def _baseline_import(root, path) -> int:
+    """A shared baseline is a proposal, and only a proposal: the plan is run again
+    from the file's URL, commit and compile settings, and the file is accepted
+    only when this machine computes the very same id. A file Claude wrote by hand
+    names a repository and a commit and nothing else it says is believed."""
+    import baseline_plan
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"error: {path} cannot be read ({exc}).", file=sys.stderr)
+        return 1
+    claimed = baseline.proposal_from_import(data)
+    app, compile_ = claimed["app"], claimed["python"]["compile"]
+    seams = _baseline_seams()
+    if compile_["uv"] != seams.uv_version():
+        print(f"error: the file was planned with uv {compile_['uv']} and this machine has uv "
+              f"{seams.uv_version()}: the id covers the compile settings, so the plan would differ. Install the "
+              "same uv, or plan afresh. Nothing was written.", file=sys.stderr)
+        return 1
+    try:
+        result = baseline_plan.plan(root, seams, url=app["git_url"], ref=app["commit"], base_ids=claimed["base"],
+                                    python_version=compile_["python_version"],
+                                    exclude_newer=compile_["exclude_newer"], dir_name=app["dir_name"])
+    except baseline_plan.PlanError as exc:
+        print(f"error: the file could not be re-planned. {exc}", file=sys.stderr)
+        return 1
+    if result["document"]["id"] != claimed["id"]:
+        print(f"error: re-planning {app['git_url']}@{app['commit'][:12]} gives {result['document']['id']}, not "
+              f"{claimed['id']}: the file does not describe that commit's dependency set. Nothing was written.",
+              file=sys.stderr)
+        return 1
+    baseline.save_proposal(root, result["document"])
+    _print_plan(root, result)
+    return 0
+
+
+def _baseline_approve(root, args) -> int:
+    unknown = [a for a in args if a.startswith("-")]
+    if unknown or len(args) != 1:
+        raise ValueError("approve takes one baseline id and no option")
+    doc = baseline.load(root, args[0], proposal=True)
+    if doc.get("approvable") is False or doc["evidence"]["osv"]["malware"]:
+        print(f"error: {doc['id']} cannot be approved: OSV lists malware in it "
+              f"({'; '.join(doc['evidence']['osv']['malware'][:3])}). Nothing was approved.", file=sys.stderr)
+        return 1
+    owners = baseline.load_owners(root)[0]
+    why = baseline.owner_problem(doc["app"]["git_url"], owners)
+    if why:
+        print(f"error: {why}. Nothing was approved.", file=sys.stderr)
+        return 1
+    builds = baseline.all_builds(doc)
+    print(baseline.prompt_text(doc, owners))
+    if builds and not _confirm_human(
+            "build", f"\nThese {len(builds)} packages will be built from source on your machine, and their setup "
+                     "code will run, when the bench installs. Approving confirms exactly this list:\n  "
+                     + "\n  ".join(builds)):
+        return 1
+    # OSV again, after the click: a MAL- that appeared since the plan refuses the write.
+    seams = _baseline_seams()
+    entries = baseline.audit_entries(doc)
+    malware, advisories, checked = [], 0, 0
+    try:
+        for ecosystem, pairs in entries.items():
+            for start in range(0, len(pairs), vetting.OSV_BATCH_SIZE):
+                for pair, ids in seams.osv_batch(ecosystem, pairs[start:start + vetting.OSV_BATCH_SIZE]).items():
+                    checked += 1
+                    advisories += 1 if ids else 0
+                    malware += [f"{ecosystem}:{pair[0]}@{pair[1]} {i}" for i in ids if i.startswith("MAL-")]
+    except vetting.ProviderError as exc:
+        print(f"error: OSV did not answer ({exc}); nothing was approved.", file=sys.stderr)
+        return 1
+    if malware:
+        print(f"error: OSV now lists malware: {'; '.join(malware[:5])}. Nothing was approved.", file=sys.stderr)
+        return 1
+    approved = baseline.approve_document(doc)
+    baseline.write_approved(root, approved)
+    baseline.clear_latch(root, doc["id"])  # a person's approval, after a clean re-query, ends an earlier revocation
+    baseline.record_audit(root, doc["id"], checked, advisories, [])
+    print(f"Approved {doc['id']} ({doc['app']['name']} {doc['app']['commit'][:12]}).")
+    return 0
+
+
+def _baseline_revoke(root, bid) -> int:
+    if not baseline.revoke(root, bid):
+        print(f"error: {bid} is not an approved baseline.", file=sys.stderr)
+        return 1
+    print(f"Revoked {bid}. Its document is a proposal again; nothing is declined.")
+    return 0
+
+
+def _git_owners(root, args) -> int:
+    if args == ["list"]:
+        owners, hosts = baseline.load_owners(root)
+        print("Allowlisted git owners (hosts: " + ", ".join(hosts) + "): " + ", ".join(owners))
+        return 0
+    if len(args) == 2 and args[0] in ("add", "remove") and re.fullmatch(r"[A-Za-z0-9-]+", args[1]):
+        verb, owner = args
+        owners, _hosts = baseline.load_owners(root)
+        near, distance = baseline.nearest_owner(owner, [o for o in owners if o != owner] or owners)
+        message = (f"\nYou are {'ADDING' if verb == 'add' else 'REMOVING'} the git owner {owner!r} "
+                   f"{'to' if verb == 'add' else 'from'} the allowlist.\n"
+                   + (f"Nearest other allowlisted name: {near!r}, {distance} edit(s) away.\n" if near else "")
+                   + ("Baselines of repositories under this owner become possible, and its commits are accepted "
+                      "inside them." if verb == "add" else "Approved baselines of this owner stop covering anything."))
+        if verb == "add" and owner in owners or verb == "remove" and owner not in owners:
+            print(f"Nothing to do: {owner!r} is {'already' if verb == 'add' else 'not'} in the allowlist.")
+            return 0
+        if not _confirm_human(f"{verb} {owner}", message):
+            return 1
+        baseline.save_owners(root, [*owners, owner] if verb == "add" else [o for o in owners if o != owner])
+        print(f"Done. Allowlisted git owners: {', '.join(baseline.load_owners(root)[0])}")
+        return 0
+    print("usage: cli.py git-owners list | add <owner> | remove <owner>", file=sys.stderr)
+    return 2
+
+
+
 def _explicit_root(argv):
     """(argv without `--root <dir>`, root or None). `--root` is accepted only
     directly after the subcommand: the form the hook prints and recognises."""
@@ -694,6 +1041,82 @@ def _explicit_root(argv):
     return argv, None
 
 
+def _bench_config_usage():
+    return ("usage: cli.py bench-config apply [--bench <dir>] [--toolchain name==version]... [--no-symlinks] "
+            "[--new-app <name>]... | "
+            "cli.py bench-config check [--bench <dir>]")
+
+
+def _bench_config(root, args) -> int:
+    """`bench-config apply` writes the installer files that pin what bench's installs may fetch,
+    from the approved baselines of the upstream apps in the bench; `check` says whether they hold."""
+    import dataclasses
+    if not args or args[0] not in ("apply", "check"):
+        print(_bench_config_usage(), file=sys.stderr)
+        return 2
+    verb, rest = args[0], list(args[1:])
+    bench_dir, toolchain, no_symlinks, new_apps, i = None, [], False, [], 0
+    while i < len(rest):
+        token = rest[i]
+        if token == "--bench" and i + 1 < len(rest):
+            bench_dir, i = rest[i + 1], i + 2
+        elif token == "--toolchain" and verb == "apply" and i + 1 < len(rest):
+            name, equals, version = rest[i + 1].partition("==")
+            if not (equals and name and version):
+                print(f"error: --toolchain takes name==version, not {rest[i + 1]!r}", file=sys.stderr)
+                return 2
+            toolchain.append(bench_config.Pin(name, version, "", "toolchain"))
+            i += 2
+        elif token == "--no-symlinks" and verb == "apply":
+            no_symlinks, i = True, i + 1
+        elif token == "--new-app" and verb == "apply" and i + 1 < len(rest):
+            if not bench_config.NEW_APP_NAME.fullmatch(rest[i + 1]):
+                print(f"error: --new-app takes the name of the app `bench new-app` will create (letters, digits, "
+                      f"`_` and `-`), not {rest[i + 1]!r}", file=sys.stderr)
+                return 2
+            new_apps.append(bench_config._normalize(rest[i + 1]))
+            i += 2
+        else:
+            print(f"error: {token!r} is not an option of `bench-config {verb}`\n{_bench_config_usage()}",
+                  file=sys.stderr)
+            return 2
+    bench = bench_config.bench_root(bench_dir or os.getcwd())
+    if bench is None:
+        print("error: no Frappe bench (a directory with apps/ and sites/) holds "
+              f"{bench_dir or os.getcwd()}; use --bench <dir>", file=sys.stderr)
+        return 2
+    try:
+        config = bench_gate.config_input(root, bench)
+        if toolchain:
+            config = dataclasses.replace(config, toolchain=tuple(toolchain))
+        if no_symlinks:
+            config = dataclasses.replace(config, no_symlinks=True)
+        if new_apps:
+            config = dataclasses.replace(config, new_apps=tuple(sorted({*config.new_apps, *new_apps})))
+        if verb == "check":
+            problems = bench_config.verify(bench, root, config, home=Path.home())
+            if not problems:
+                print("The guard's installer files for this bench hold, and nothing overrides them.")
+                return 0
+            print("The installer files for this bench do not hold:")
+            for problem in problems:
+                print(f"- {problem}")
+            return 1
+        result = bench_config.apply(bench, root, config)
+    except bench_config.BenchConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    for path in result.written:
+        print(f"wrote {path}")
+    for note in result.notes:
+        print(f"note: {note}")
+    for path in result.dropped:
+        print(f"no longer recorded: {path} (its app is not in the bench any more; the file itself is left as it is)")
+    if not result.written and not result.dropped:
+        print("Nothing to change: the installer files are what the approved baselines call for.")
+    return 0
+
+
 def main(argv) -> int:
     try:
         argv, explicit = _explicit_root(argv)
@@ -705,6 +1128,18 @@ def main(argv) -> int:
         try:
             return _mode(project(), argv[1:])
         except (store.StoreError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if argv and argv[0] == "bench-config":
+        try:
+            return _bench_config(project(), argv[1:])
+        except (store.StoreError, baseline.BaselineError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if argv and argv[0] in ("baseline", "git-owners"):
+        try:
+            return (_baseline if argv[0] == "baseline" else _git_owners)(project(), argv[1:])
+        except (store.StoreError, baseline.BaselineError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     if argv and argv[0] in _NO_ARGUMENT_COMMANDS:

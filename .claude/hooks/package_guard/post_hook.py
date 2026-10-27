@@ -50,8 +50,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # absent while appearing installed. This one fails OPEN (exit 0)
 # because it is not the gate -- see the module docstring.
 try:
+    import bench_config  # noqa: E402
+    import bench_gate  # noqa: E402
     import disk_guard  # noqa: E402
     import mode as pg_mode  # noqa: E402
+    import parser as pg_parser  # noqa: E402
     import store  # noqa: E402
     import transcript  # noqa: E402
 except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
@@ -75,6 +78,74 @@ def _decision(reason: str) -> dict:
         "reason": reason,
         "hookSpecificOutput": {"hookEventName": "PostToolUse"},
     }
+
+
+def _bench_follow_up(root, event, result) -> str | None:
+    """What a command left wrong in a Frappe bench, as text, or None.
+
+    After a command the hook allowed under the bench gate, each app it was covered by is compared
+    with the manifests ITS BASELINE recorded (never with what the pre-hook read: an earlier segment
+    may have swapped a lock before the gate looked, and a frozen install leaves a swapped lock alone);
+    the installer files are read again; and every bench env is checked to be readable in full. What is
+    found is recorded, and the next bench command is refused until `cli.py reconcile` finds it gone.
+    While the Frappe switch is off (`disk_guard.BENCH_ENV_DISK`) this does nothing."""
+    if not disk_guard.BENCH_ENV_DISK:
+        return None
+    allowed = bench_gate.take_allowed(root, event)
+    if not bench_gate.allowed_matches(allowed, event):
+        allowed = None
+    benches = {Path(s.directory) for s in result.scopes if s.kind == "bench-env"}
+    if allowed and allowed.get("bench"):
+        benches.add(Path(allowed["bench"]))
+    found = []
+    for bench in sorted(benches):
+        mine = allowed if allowed and str(bench) == allowed.get("bench") else None
+        found += bench_gate.after_problems(root, bench, mine)
+    if not found:
+        return None
+    bench_gate.add_problems(root, found, store.utcnow(), ((event.get("tool_input") or {}).get("command")))
+    lines = ["That command left a Frappe bench in a state Package Guard cannot vouch for:"]
+    lines += [f"- {text}" for _kind, text, _check in found[:10]]
+    if len(found) > 10:
+        lines.append(f"- ... and {len(found) - 10} more")
+    lines.append("Bench commands are refused until this is resolved. Tell the user; the fix is theirs "
+                 "(restore the files or re-run bench-config apply), then `cli.py reconcile` confirms it.")
+    return "PACKAGE_GUARD_BENCH_CONFIG: " + "\n".join(lines)
+
+
+_DRIFT_FILE = "config-drift.json"
+
+
+def _drift_report(root, mode) -> str:
+    """The files the CLI wrote for an installer (`env/pip.conf`, `uv.toml`, a `.yarnrc`) that no
+    longer match their recorded digest, as a message; "" when none changed or the same
+    set was already reported. A copy, an archive or git rewrote a file the pre-write lock
+    could not see through, and only the digest shows it. Reported once per set of changed
+    files, not after every later command; the set is forgotten when the files are right."""
+    if not pg_parser.FRAPPE_ENABLED or mode == "off":
+        return ""
+    changed = [f"{path} {why}" for path, why in bench_config.drift(root)]
+    state = Path(root) / ".claude" / "package-guard" / _DRIFT_FILE
+    try:
+        reported = json.loads(state.read_text(encoding="utf-8")).get("reported", [])
+    except (OSError, ValueError, AttributeError):
+        reported = []
+    if changed == reported:
+        return ""
+    try:
+        if changed:
+            state.write_text(json.dumps({"reported": changed}, indent=2) + "\n", encoding="utf-8")
+        elif state.exists():
+            state.unlink()
+    except OSError:
+        pass
+    if not changed:
+        return ""
+    return ("A file Package Guard wrote for an installer changed after that command ran, so the "
+            "installer no longer reads the configuration the guard checked:\n  "
+            + "\n  ".join(changed)
+            + "\nThe command has already run. Do not edit the file back by hand: tell the user, "
+              "who re-applies the bench configuration.")
 
 
 def evaluate(event: dict, root) -> dict | None:
@@ -101,11 +172,27 @@ def evaluate(event: dict, root) -> dict | None:
         command=command,
         session_started=transcript.session_started(event.get("transcript_path")),
     )
+    try:
+        bench_text = _bench_follow_up(root, event, result)
+    except Exception as exc:  # noqa: BLE001 - fails open, see the module docstring
+        print(f"Package Guard post hook: the bench check failed ({exc.__class__.__name__}: {exc}).",
+              file=sys.stderr)
+        bench_text = None
+    drift = _drift_report(root, current)
+    # Both reports are kept: the bench follow-up (not in `off`) and the installer-file drift.
+    notes = "\n\n".join(t for t in ((bench_text if current != "off" else None), drift) if t)
     if not result.new_findings and not caught:
         # Findings that were already open are the PreToolUse gate's job and the
         # Stop hook's. Re-reporting them after every command is noise, and an
         # alert nobody reads is not an alert.
-        return None
+        if not notes:
+            return None
+        if current == "warn":
+            return {"hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": "Package Guard is in warn mode, so this is not a block; "
+                                     "tell the user.\n" + notes}}
+        return _decision(notes)
     # Recorded in every mode, so whatever lands while the guard is down is an
     # open finding once it is back on. Only the reporting follows the mode.
     if current == "off":
@@ -129,6 +216,8 @@ def evaluate(event: dict, root) -> dict | None:
         header=header,
         declined_check=lambda identity: store.is_declined(root, identity),
     )
+    if notes:
+        body += "\n\n" + notes
     if current == "warn":
         return {"hookSpecificOutput": {
             "hookEventName": "PostToolUse",

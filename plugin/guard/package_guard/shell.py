@@ -87,6 +87,8 @@ class Segment:
     substitutions: list = field(default_factory=list)
     # The segment reads the previous one's output: it follows `|` or `|&`.
     piped: bool = False
+    # The segment is followed by a lone `&`: the shell does not wait for it.
+    background: bool = False
 
     def __bool__(self):
         return bool(self.words)
@@ -147,11 +149,12 @@ def segment(command):
         started = False
         glue_next = False
 
-    def flush_segment(piped=False):
+    def flush_segment(piped=False, background=False):
         nonlocal current, pending_redirect
         flush_word()
         pending_redirect = None
         if current.words or current.redirects or current.substitutions:
+            current.background = background
             segments.append(current)
         current = Segment(piped=piped)
 
@@ -253,7 +256,7 @@ def segment(command):
         # --- segment operators ---------------------------------------------
         operator = next((op for op in _SEGMENT_OPS if command.startswith(op, index)), None)
         if operator:
-            flush_segment(piped=operator in ("|", "|&"))
+            flush_segment(piped=operator in ("|", "|&"), background=operator == "&")
             index += len(operator)
             if operator == "\n" and pending_heredocs:
                 index = _read_heredocs(command, index, pending_heredocs)

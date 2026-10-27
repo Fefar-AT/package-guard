@@ -19,13 +19,17 @@ Standard library only.
 """
 from __future__ import annotations
 
+import glob
 import json
+import os
 import re
 import tomllib
 from pathlib import Path
 
 import bun_lock
+import pm_config
 import pnpm_lock
+import yarn_classic_lock
 import yarn_lock
 from lock_errors import LockReadError
 
@@ -300,6 +304,68 @@ def uv_built_directories(directory) -> list:
     return out
 
 
+def uv_lock_names(directory, extras=()) -> list:
+    """[(where, normalized name)] for what a sync of this uv project takes from
+    uv.lock, for the rule that a bench app is never resolved from an index.
+
+    The dependencies each local package the lock records declares (the project
+    and its workspace members; the extras the command selects, dev groups
+    included), and EVERY package locked from a registry, whether or not a root
+    reaches it: a frozen lock is installed as it stands, so a stale entry for
+    `frappe` is installed as surely as a declared one."""
+    data, _missing = _uv_lock_data(directory)
+    found = []
+    for entry in (data or {}).get("package") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+            continue
+        source = entry.get("source")
+        source = source if isinstance(source, dict) else {}
+        label = entry["name"]
+        if _LOCAL_SOURCES & set(source):
+            for name in _uv_root_dependency_names(entry, extras):
+                found.append((f"uv.lock, dependencies of `{label}`", name))
+        elif "registry" in source:
+            found.append((f"uv.lock, `{label}` locked from a registry", _normalize_py(label)))
+    return found
+
+
+def uv_member_directories(directory) -> list:
+    """The directories of the workspace members and local packages of a uv
+    project other than its own: the local paths uv.lock records, and what
+    `[tool.uv.workspace].members` globs match. Each has a pyproject.toml whose
+    dependencies a sync takes."""
+    base = Path(os.path.normpath(directory))
+    found = []
+
+    def add(path):
+        path = Path(os.path.normpath(path))
+        if path != base and path not in found:
+            found.append(path)
+
+    data, _missing = _uv_lock_data(directory)
+    for entry in (data or {}).get("package") or []:
+        source = entry.get("source") if isinstance(entry, dict) else None
+        if isinstance(source, dict):
+            for key in sorted(_LOCAL_SOURCES):
+                if isinstance(source.get(key), str):
+                    add(base / source[key])
+    try:
+        with (base / "pyproject.toml").open("rb") as handle:
+            project = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError, RecursionError):
+        project = {}
+    tool = project.get("tool") if isinstance(project.get("tool"), dict) else {}
+    uv = tool.get("uv") if isinstance(tool.get("uv"), dict) else {}
+    workspace = uv.get("workspace") if isinstance(uv.get("workspace"), dict) else {}
+    members = workspace.get("members")
+    for pattern in members if isinstance(members, list) else ():
+        if isinstance(pattern, str):
+            for match in sorted(glob.glob(str(base / pattern))):
+                if os.path.isdir(match):
+                    add(match)
+    return found
+
+
 def uv_root_is_built(directory) -> bool:
     """True when uv.lock's root is an editable (packaged) project, which uv
     builds -- and so fetches build-system.requires for -- on every sync."""
@@ -487,6 +553,21 @@ def pm_lock_path(directory, kind) -> Path:
     return Path(directory) / PM_LOCKFILES[kind]
 
 
+def yarn_classic_lock_file(path) -> bool:
+    """True when `path` is a Yarn Classic (v1) lock the Classic reader is switched on for. With
+    the switch off every yarn.lock goes to the Berry reader, which refuses a Classic one."""
+    return pm_config.classic_enabled() and pm_config._lock_flavour(Path(path)) == pm_config.CLASSIC
+
+
+def yarn_reader(path):
+    """The module that reads this yarn.lock: Classic's for a v1 lock, else Berry's."""
+    return yarn_classic_lock if yarn_classic_lock_file(path) else yarn_lock
+
+
+def pm_reader(kind, path):
+    return yarn_reader(path) if kind == "yarn" else _PM_READERS[kind]
+
+
 def _pm_read(directory, kind, call):
     """`call(reader_module, lock_path)`, with any lock error as a ManifestError
     and a missing lock an error too: never an empty answer."""
@@ -494,7 +575,7 @@ def _pm_read(directory, kind, call):
     if not path.is_file():
         raise ManifestError(f"{path.name} does not exist")
     try:
-        return call(_PM_READERS[kind], path)
+        return call(pm_reader(kind, path), path)
     except LockReadError as exc:
         raise ManifestError(str(exc)) from exc
 
@@ -527,6 +608,8 @@ def pm_direct_dependencies(directory, kind):
     specs = _npm_dep_specs(directory, peers=kind in PM_PEER_KINDS)
     if not specs:
         return [], []
+    if kind == "yarn" and yarn_classic_lock_file(pm_lock_path(directory, kind)):
+        return _classic_direct_dependencies(directory, specs)
     peer_only, optional = _root_peers(directory) if kind in PM_PEER_KINDS else (set(), set())
     recorded, locked, skip = _pm_read(directory, kind, lambda reader, path: (
         reader.root_specs(path), reader.direct_specs(path),
@@ -550,6 +633,68 @@ def pm_direct_dependencies(directory, kind):
     resolved.sort(key=lambda item: item[0])
     unresolved.sort(key=lambda item: item[0])
     return resolved, unresolved
+
+
+def _classic_direct_dependencies(directory, specs):
+    """`pm_direct_dependencies` for a Yarn Classic lock, which has no root entry to compare:
+    a dependency resolves when `name@spec` (package.json's text, verbatim) is a specifier of a
+    registry entry of that name. Anything else (no such specifier, a stale lock; an alias, a
+    codeload or git source, an unrecognised host) is unresolved."""
+    path = pm_lock_path(directory, "yarn")
+    try:
+        lock = yarn_classic_lock.read_yarn_lock(path)
+    except LockReadError as exc:
+        raise ManifestError(str(exc)) from exc
+    index = {d: e for e in lock.entries for d in e.descriptors}
+    resolved, unresolved = [], []
+    for name, spec in specs:
+        if not isinstance(spec, str):
+            unresolved.append((name, repr(spec)))
+            continue
+        entry = index.get(f"{name}@{spec}")
+        if entry is None:
+            unresolved.append((name, f"{spec} (yarn.lock does not list it, so the lock is stale or "
+                                     "was never made for this spec)"))
+        elif entry.kind != yarn_classic_lock.REGISTRY or entry.name != name:
+            unresolved.append((name, f"{spec} (yarn.lock resolves it to something other than a "
+                                     "registry package of that name)"))
+        else:
+            resolved.append((name, entry.version, "lockfile"))
+    resolved.sort(key=lambda item: item[0])
+    unresolved.sort(key=lambda item: item[0])
+    return resolved, unresolved
+
+
+def classic_unlocked_specs(directory) -> list:
+    """The dependency specs a Yarn Classic install would have to resolve itself, because the
+    lock has no entry for them: [(parent "name@version", "name@range")], in the order met.
+    Walks from package.json's direct dependencies through every entry's `dependencies` and
+    `optionalDependencies`, so a stale part of the lock nothing reaches is not counted
+    (HRMS's root yarn.lock lists 231 dependency lines with no entry; D5: a spec the install
+    would reach and the lock lacks is unresolved)."""
+    path = pm_lock_path(directory, "yarn")
+    try:
+        lock = yarn_classic_lock.read_yarn_lock(path)
+    except LockReadError as exc:
+        raise ManifestError(str(exc)) from exc
+    index = {d: e for e in lock.entries for d in e.descriptors}
+    pending = [("package.json", f"{name}@{spec}") for name, spec in _npm_dep_specs(directory)
+               if isinstance(spec, str)]
+    seen, missing = set(), []
+    while pending:
+        parent, descriptor = pending.pop(0)
+        if descriptor in seen:
+            continue
+        seen.add(descriptor)
+        entry = index.get(descriptor)
+        if entry is None:
+            if parent != "package.json":  # a direct spec the lock lacks is `unresolved`
+                missing.append((parent, descriptor))
+            continue
+        label = f"{entry.name}@{entry.version}"
+        for block in (entry.dependencies, entry.optional_dependencies):
+            pending.extend((label, f"{dep}@{rng}") for dep, rng in block.items())
+    return missing
 
 
 def _root_peers(directory):

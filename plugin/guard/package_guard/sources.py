@@ -31,11 +31,14 @@ import shutil
 import tomllib
 from pathlib import Path
 
+import base64
 import bun_lock
+import manifest as pg_manifest
 import parser as pg_parser
 import pm_config
 import pnpm_lock
 import protocols
+import yarn_classic_lock
 import yarn_lock
 from lock_errors import LockReadError
 
@@ -116,6 +119,87 @@ def _npm_global_rc(environ):
     return Path(prefix) / "etc" / "npmrc"
 
 
+# Yarn Classic reads npm's rc files as well as its own (`rc.js` `findRc("npm", ...)`: `.npmrc` in the
+# working directory and every parent, then /etc/npmrc, /etc/npm/config and the user's
+# ~/.npmrc, ~/.npm/config, ~/.config/npm[/config]), and `npm_config_*` variables. A proxy or a
+# CA it names, or switching TLS verification off, lets whoever runs the proxy replace any download
+# that carries no integrity hash (every git or codeload tarball in a Frappe lock), and a registry
+# redirects the rest. Judged as a deny-list of keys, as `npm_config_problems` judges the registry.
+YARN_NPMRC_REFUSED = {
+    "proxy": "names a proxy the downloads go through",
+    "https-proxy": "names a proxy the downloads go through",
+    "http-proxy": "names a proxy the downloads go through",
+    "noproxy": "changes which downloads go through a proxy",
+    "no-proxy": "changes which downloads go through a proxy",
+    "cafile": "changes which certificate authorities are trusted",
+    "ca": "changes which certificate authorities are trusted",
+    "cert": "changes the certificate Yarn presents",
+    "key": "changes the key Yarn presents",
+    "local-address": "changes which address downloads leave from",
+}
+
+
+def _yarn_npmrc_key_problem(key, value):
+    key = key.strip().lower().replace("_", "-").removesuffix("[]")
+    if key.startswith("//"):  # `//host/:cafile`, `//host/:_authToken`: per-registry settings
+        suffix = key.rpartition(":")[2]
+        return ("a per-registry setting that changes what is trusted"
+                if suffix in ("cafile", "ca", "certfile", "keyfile") else None)
+    if key == "registry" or key.endswith(":registry"):
+        return None if _same_url(value, NPM_REGISTRY) else "redirects npm"
+    if key == "strict-ssl":
+        return None if str(value).strip().lower() in ("true", "1") else "turns TLS verification off"
+    return YARN_NPMRC_REFUSED.get(key)
+
+
+def yarn_npmrc_paths(directory, home, environ) -> list:
+    directory = Path(directory)
+    chain = [directory, *directory.parents]
+    xdg = environ.get("XDG_CONFIG_HOME")
+    user = ([Path(xdg) / "npm" / "config"] if xdg else []) + [
+        home / ".config" / "npm" / "config", home / ".config" / "npm", home / ".npm" / "config", home / ".npmrc"]
+    custom = environ.get("npm_config_userconfig") or environ.get("NPM_CONFIG_USERCONFIG")
+    paths = [p / ".npmrc" for p in chain] + [Path("/etc/npm/config"), Path("/etc/npmrc")] + user
+    if custom:
+        paths.append(Path(custom))
+    paths.append(_npm_global_rc(environ))
+    seen, out = set(), []
+    for path in paths:
+        if path is not None and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def yarn_npmrc_problems(directory, home=None, environ=None) -> list:
+    """What the `.npmrc` chain and `npm_config_*` variables would make Yarn Classic do in
+    `directory`: a proxy, a CA, TLS off, or a registry other than npm's."""
+    home = Path(home) if home is not None else HOME
+    environ = os.environ if environ is None else environ
+    problems = []
+    for path in yarn_npmrc_paths(directory, home, environ):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            why = _yarn_npmrc_key_problem(key, value.strip().strip('"\''))
+            if why:
+                shown = _redact(value.strip()) if ("registry" in key or "proxy" in key) else ""
+                problems.append(f"{path}: `{key.strip()}{'=' + shown if shown else ''}` {why}")
+    for name, value in environ.items():
+        lowered = name.lower()
+        if lowered.startswith("npm_config_"):
+            why = _yarn_npmrc_key_problem(lowered[len("npm_config_"):], value)
+            if why:
+                problems.append(f"environment: {name} {why}")
+    return problems
+
+
 def npm_config_problems(directory, home=None, environ=None, prefixes=("npm_config_",)) -> list:
     home = Path(home) if home is not None else HOME
     environ = os.environ if environ is None else environ
@@ -192,7 +276,7 @@ _PM_LOCK_MODULES = {"pnpm": ("pnpm-lock.yaml", pnpm_lock), "bun": ("bun.lock", b
                     "yarn": ("yarn.lock", yarn_lock)}
 
 
-def pm_lock_problems(kind, directory) -> list:
+def pm_lock_problems(kind, directory, git_allowed=None) -> list:
     """Lock entries a pnpm, Bun or Yarn install would fetch from somewhere other
     than the registry (git, URL, tarball, file, link, workspace, patch, exec,
     portal, jsr), and an unreadable lock, which is a problem and never an empty
@@ -201,6 +285,8 @@ def pm_lock_problems(kind, directory) -> list:
     path = Path(directory) / name
     if not path.is_file():
         return []
+    if kind == "yarn" and pg_manifest.yarn_classic_lock_file(path):
+        return _classic_lock_problems(path, directory, git_allowed)
     try:
         problems = []
         for entry in module.non_registry_entries(path):
@@ -217,9 +303,75 @@ def pm_lock_problems(kind, directory) -> list:
         return [f"{name} cannot be read ({exc})"]
 
 
+_CLASSIC_SOURCE_WHY = {
+    yarn_classic_lock.CODELOAD: (
+        "a GitHub tarball pinned to commit {commit} that nothing in the lock verifies; Package "
+        "Guard refuses it in this release, and a human-approved baseline of the app's lock "
+        "(design D4) is the route that will accept it later"),
+    yarn_classic_lock.GIT: (
+        "a git checkout of commit {commit} that nothing in the lock verifies; Package Guard "
+        "refuses it in this release, and a human-approved baseline of the app's lock "
+        "(design D4) is the route that will accept it later"),
+    yarn_classic_lock.OTHER: (
+        "not the registry tarball registry.yarnpkg.com or registry.npmjs.org serves for that "
+        "name and version, or has no `resolved` URL"),
+}
+
+
+def _classic_lock_problems(path, directory=None, git_allowed=None) -> list:
+    """Entries of a Yarn Classic lock Yarn would fetch from anywhere but the registry's exact
+    tarball URL for that package (a GitHub codeload tarball or git checkout, or an unrecognised
+    host), and an unreadable lock. Never an empty list for an unreadable one.
+
+    `git_allowed(directory, entry)` is the acceptance of a git source inside a baseline (`baseline.git_entries_ok`): it
+    returns None for a codeload or git entry an approved baseline of this app lists, else the
+    reason it is not accepted. Passed only while the Frappe switch is on; without it, every such
+    entry is a problem."""
+    try:
+        entries = yarn_classic_lock.non_registry_entries(path)
+    except LockReadError as exc:
+        return [f"yarn.lock cannot be read ({exc})"]
+    problems = []
+    for entry in entries:
+        if git_allowed is not None and entry.kind in (yarn_classic_lock.CODELOAD, yarn_classic_lock.GIT):
+            refused = git_allowed(directory, entry)
+            if refused is None:
+                continue
+            problems.append(f"yarn.lock: {entry.name}@{entry.version} is a GitHub source pinned to commit "
+                            f"{entry.commit} that no approved baseline accepts: {refused}")
+            continue
+        why = _CLASSIC_SOURCE_WHY[entry.kind].format(commit=entry.commit)
+        problems.append(f"yarn.lock: {entry.name}@{entry.version} is {why} ({_redact(entry.resolved)})")
+    return problems
+
+
+def _classic_lock_artifacts(path):
+    """(ecosystem, name, version, digests, missing) for each registry entry of a Classic lock.
+    The digests are what the lock says the tarball is: its `integrity`, else the sha1 in the
+    URL's fragment as `sha1-<base64>` (the form an approval records `dist.shasum` in)."""
+    try:
+        entries = yarn_classic_lock.read_yarn_lock(path).entries
+    except LockReadError:
+        return []  # pm_lock_problems reports it
+    seen, out = set(), []
+    for entry in entries:
+        if entry.kind != yarn_classic_lock.REGISTRY or (entry.name, entry.version) in seen:
+            continue
+        seen.add((entry.name, entry.version))
+        digests = []
+        if entry.integrity:
+            digests.append(entry.integrity)
+        elif entry.tarball_sha1:
+            digests.append("sha1-" + base64.b64encode(bytes.fromhex(entry.tarball_sha1)).decode())
+        out.append(("npm", entry.name, entry.version, digests, not digests))
+    return out
+
+
 def _pm_lock_artifacts(kind, directory):
     name, module = _PM_LOCK_MODULES[kind]
     path = Path(directory) / name
+    if kind == "yarn" and path.is_file() and pg_manifest.yarn_classic_lock_file(path):
+        return _classic_lock_artifacts(path)
     if kind == "yarn" or not path.is_file():
         return []  # Berry's checksum is a hash of its own cache zip, not npm's digest
     try:
@@ -228,7 +380,7 @@ def _pm_lock_artifacts(kind, directory):
         return []  # pm_lock_problems reports it
 
 
-def npm_manifest_problems(directory) -> list:
+def npm_manifest_problems(directory, git_spec_allowed=None) -> list:
     path = Path(directory) / "package.json"
     if not path.is_file():
         return []
@@ -247,6 +399,9 @@ def npm_manifest_problems(directory) -> list:
         if isinstance(block, dict):
             for name, spec in block.items():
                 problem = npm_spec_problem(name, spec)
+                # A git spec an approved baseline of this app lists is accepted.
+                if problem and git_spec_allowed is not None and git_spec_allowed(directory, "npm", name, spec) is None:
+                    continue
                 if problem:
                     problems.append(problem)
     pending = [data.get("overrides")] if isinstance(data, dict) else []
@@ -339,7 +494,8 @@ def _uv_settings_problems(table, where, directory) -> list:
     if not isinstance(table, dict):
         return problems
     for key in _UV_KEYS:
-        if table.get(key):
+        value = table.get(key)
+        if value and not (key == "index-url" and _same_url(value, PYPI_INDEX)):
             problems.append(f"{where}: `{key}` changes where uv fetches from")
     sources = table.get("sources")
     if isinstance(sources, dict):
@@ -375,7 +531,7 @@ def _pyproject_requirements(pyproject):
     return [d for block in lists if isinstance(block, list) for d in block if isinstance(d, str)]
 
 
-def uv_config_problems(directory, home=None, environ=None) -> list:
+def uv_config_problems(directory, home=None, environ=None, git_spec_allowed=None) -> list:
     home = Path(HOME if home is None else home)
     environ = os.environ if environ is None else environ
     problems = [f"environment: {name} changes where uv fetches from"
@@ -387,6 +543,8 @@ def uv_config_problems(directory, home=None, environ=None) -> list:
             problems += _uv_settings_problems(tool.get("uv"), "pyproject.toml [tool.uv]", directory)
         for dep in _pyproject_requirements(pyproject):
             if _DIRECT_REFERENCE.match(dep):
+                if git_spec_allowed is not None and git_spec_allowed(directory, "pypi", dep, dep) is None:
+                    continue
                 problems.append(f"pyproject.toml: {dep!r} is a direct reference, not the registry")
     for path in (Path(directory) / "uv.toml", home / ".config" / "uv" / "uv.toml"):
         settings = _load_toml(path) if path.is_file() else None
@@ -516,6 +674,15 @@ def artifact_problems(kinds, directory, artifacts_of, pm_kinds=()) -> list:
                             "file it installs; restore the lock's integrity/hash and retry")
             continue
         stray = [d for d in digests if d not in approved]
+        if stray and all(d.startswith("sha1-") for d in stray) and not any(
+                a.startswith("sha1-") for a in approved):
+            # A Yarn Classic lock whose entry is sha1-only (Frappe v11 to v14): the approval was
+            # made before the registry's `dist.shasum` was recorded, so the lock's sha1 cannot
+            # be compared with anything the review saw.
+            problems.append(f"{ecosystem}:{name}@{version} the lock identifies the tarball by sha1 "
+                            "only, and the approval recorded no sha1 to compare it with (it "
+                            "predates that check); revoke and re-review it")
+            continue
         if stray:
             problems.append(f"{ecosystem}:{name}@{version} lock names a file the approval did not "
                             f"see ({stray[0][:24]}...); revoke and re-review it")
@@ -527,7 +694,7 @@ def artifact_problems(kinds, directory, artifacts_of, pm_kinds=()) -> list:
 # ---------------------------------------------------------------------------
 
 def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
-                 environments=None) -> list:
+                 environments=None, git_allowed=None, git_spec_allowed=None) -> list:
     """Every reason the installer `parsed` describes would fetch from somewhere
     other than the identity its review vetted. `environments` are the Python
     environments the install may use, whose pip.conf pip reads."""
@@ -545,10 +712,12 @@ def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
             directory, home, environ,
             prefixes=("npm_config_", "pnpm_config_") if uses_pnpm else ("npm_config_",))
     if "npm" in kinds:
-        problems += npm_manifest_problems(directory) + npm_lock_problems(directory)
+        problems += npm_manifest_problems(directory, git_spec_allowed) + npm_lock_problems(directory)
     pm_kinds = sorted({m.kind for m in parsed.manifests if m.kind in _PM_LOCK_MODULES})
     for kind in pm_kinds:
-        problems += pm_lock_problems(kind, directory)
+        problems += pm_lock_problems(kind, directory, git_allowed)
+    if "yarn" in pg_parser.pm_kinds(parsed) and pm_config.yarn_flavour(directory).kind != pm_config.BERRY:
+        problems += yarn_npmrc_problems(directory, home, environ)
     # Configuration the manager reads itself, for every pnpm, Bun and Yarn the
     # command reaches, including the one-shot runners (`pnpm dlx`, `bunx`,
     # `yarn dlx`: Yarn copies .yarnrc.yml into its temp project).
@@ -558,13 +727,15 @@ def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
     # scope does not say which, so both configurations are checked.
     pypi = "pypi" in ecosystems or kinds & {"requirements", "uv-project", "build-requires"}
     if pypi:
-        uses_uv = any(m.startswith("uv") for m in managers) or kinds & {"uv-project", "build-requires"}
+        # `bench pip` runs uv by default and pip when uv is off or missing.
+        uses_uv = (any(m.startswith("uv") or m == "bench pip" for m in managers)
+                   or kinds & {"uv-project", "build-requires"})
         uses_pip = (any(not m.startswith("uv") for m in managers if m)
                     or kinds & {"requirements", "build-requires"})
         if uses_pip:
             problems += pip_config_problems(directory, home, environ, environments)
         if uses_uv or "requirements" in kinds:
-            problems += uv_config_problems(directory, home, environ)
+            problems += uv_config_problems(directory, home, environ, git_spec_allowed)
     if "uv-project" in kinds:
         problems += uv_lock_problems(directory)
     if artifacts_of is not None:

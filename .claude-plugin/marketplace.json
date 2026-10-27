@@ -9,7 +9,7 @@
       "name": "package-guard",
       "source": "./plugin",
       "description": "Gates every package install behind human approval.",
-      "version": "1.11.0",
+      "version": "1.12.0",
       "author": {
         "name": "Fefar-AT"
       }

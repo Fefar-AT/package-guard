@@ -60,11 +60,27 @@ setup:
           [ -n "$ws" ] || { echo "package-guard kit: WORKSPACE_DIR is not set; guard not installed" >&2; exit 1; };
           [ -f "$ws/.claude/hooks/package_guard/run.sh" ] ||
           sh "${HOME:-/home/agent}/.cache/package-guard/install.sh" "$ws"
+    # A bench is a folder with apps/ and sites/. Only the next steps are printed here:
+    # the files that pin a bench need a baseline that a person has approved.
+    - command:
+        - sh
+        - -c
+        - >-
+          ws="${WORKSPACE_DIR:-}";
+          if [ -d "$ws/apps" ] && [ -d "$ws/sites" ]; then
+          echo "package-guard kit: this folder is a Frappe bench.";
+          echo "  Next: ask Claude to plan a baseline for each app in apps/, approve each plan,";
+          echo "  then ask for bench-config apply. Open Claude at the bench folder, not inside an app.";
+          echo "  bench init, get-app and update are yours: sbx exec <name> -- bench ...";
+          fi
 
 environment:
   variables:
     PG_REPO: "https://github.com/Fefar-AT/package-guard.git"
     PG_REF: "release"
+    # A bench's uv calls write into the mounted project folder, where uv cannot
+    # hard-link from its cache and copies instead: say so, and it stays quiet.
+    UV_LINK_MODE: copy
 
 permissions:
   network:
@@ -102,9 +118,19 @@ permissions:
       - github.com
       - objects.githubusercontent.com
       - release-assets.githubusercontent.com
+      # Yarn Classic, which a Frappe bench uses for its JavaScript: every tarball
+      # a yarn.lock names comes from registry.yarnpkg.com, and some locks pin
+      # GitHub tarballs, which codeload.github.com serves.
+      - registry.yarnpkg.com
+      - codeload.github.com
 
 agentInstructions:
   content: |
     This project runs Package Guard. Before any npm / pip / uv command that
     acquires a package, invoke the `package-guard` skill and follow it. A
     denial that starts with PACKAGE_GUARD_ is expected; never work around it.
+
+    In a Frappe bench (the folder has apps/ and sites/), packages are installed by
+    `bench setup requirements`, after a baseline for each app that a person has
+    approved. `bench init`, `bench get-app` and `bench update` are the person's to
+    run, not yours: ask them.
