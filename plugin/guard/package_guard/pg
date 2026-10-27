@@ -1,0 +1,15 @@
+#!/bin/sh
+# Package Guard's CLI for people, in their own terminal. Short enough to type,
+# or to copy out of a narrow terminal in one piece:
+#
+#   sh .claude/hooks/package_guard/pg mode warn --reason "<why>"
+#
+# It runs cli.py through run.sh, so it gets the same Python 3.11 the hooks use,
+# and cli.py finds the project from its own location, so any directory works.
+# Claude runs the long `uv run ... cli.py` form instead; the hook refuses this
+# launcher from Claude (hook._LAUNCHER_HINT).
+#
+# POSIX sh, LF line endings (see .gitattributes).
+
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+exec sh "$dir/run.sh" "$dir/cli.py" 1 "$@"

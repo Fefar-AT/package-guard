@@ -47,13 +47,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # the same hole opens for any syntax error or missing file in these four modules.
 try:
     import tomllib  # noqa: E402
+    import bun_lock  # noqa: E402,F401
     import disk_guard  # noqa: E402
+    import lock_errors  # noqa: E402,F401
     import manifest as pg_manifest  # noqa: E402
+    import mode as pg_mode  # noqa: E402
+    import pm_config  # noqa: E402
+    import pnpm_lock  # noqa: E402,F401
     import parser as pg_parser  # noqa: E402
     import sources  # noqa: E402
     import store  # noqa: E402
     import transcript  # noqa: E402
     import vetting  # noqa: E402
+    import yarn_lock  # noqa: E402,F401
 except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
     print(
         f"Package Guard: hook modules failed to load ({_exc.__class__.__name__}: {_exc}); "
@@ -70,13 +76,32 @@ _REQUIRED_CLI_FLAGS = {"--no-project", "--no-config", "--no-python-downloads"}
 # be skipped silently — so fail closed instead. Deliberately narrow: 'show' and
 # ordinary reads of the source file (cat/grep) are unaffected. `reconcile` and
 # `audit` are here because an installed project's sandbox excludes them: a
-# wrapped or prefixed form would run outside it.
+# wrapped or prefixed form would run outside it. `mode` is here because only
+# its exact standalone form is told apart from turning the guard down; it is
+# matched only as a word of its own, so `cli.py mode.py` (two file names) is not.
 _GUARD_CLI_HINT = re.compile(
-    r"package_guard/cli\.py\s+(?:approve|decline|undecline|revoke|reconcile|audit)\b")
+    r"package_guard/cli\.py\s+(?:(?:approve|decline|undecline|revoke|reconcile|audit)\b"
+    r"|mode(?![\w.\-]))")
 # A plugin's guard lives wherever the plugin is installed, so any cli.py named
 # with one of those verbs counts.
 _PLUGIN_CLI_HINT = re.compile(
-    r"cli\.py\s+(?:approve|decline|undecline|revoke|reconcile|audit)\b")
+    r"cli\.py\s+(?:(?:approve|decline|undecline|revoke|reconcile|audit)\b|mode(?![\w.\-]))")
+# The guard's CLI reached some other way: the people's launcher `pg` given any
+# argument, or run.sh handed cli.py. Neither is a form the checks above can
+# read, so Claude is refused both and pointed at the one it may use. A plain
+# read (`cat …/pg`) names no argument after it and still runs.
+_LAUNCHER_HINT = re.compile(r"package_guard/pg(?![\w.\-])\s+\S|run\.sh\s+\S*cli\.py")
+# The shell removes quotes and backslashes before it runs anything, so
+# `'…/cli.py' approve`, `cli.py \mode` and `cli.py m''ode` are the same calls.
+_SHELL_QUOTING = re.compile(r"[\"'\\]")
+
+
+def _names_cli_verb(command: str, plugin: bool) -> bool:
+    """The command text names a state-changing guard CLI verb, read as written
+    and again with the shell's quoting removed. Text only: a verb built from a
+    variable is out of reach, as for every hint here."""
+    hint = _PLUGIN_CLI_HINT if plugin else _GUARD_CLI_HINT
+    return bool(hint.search(command) or hint.search(_SHELL_QUOTING.sub("", command)))
 
 # Guard state -- vetted.json, declined.json, the reports, the identity
 # catalogs -- is written only by the guard CLI behind its prompts. In a project
@@ -808,7 +833,7 @@ def _clean_project_cli(tokens, root, cwd) -> bool:
     return os.path.realpath(script) == os.path.realpath(Path(root) / store.CLI_SUFFIX)
 
 
-_CLI_VERBS = ("show", "approve", "decline", "undecline", "revoke", "reconcile", "audit")
+_CLI_VERBS = ("show", "approve", "decline", "undecline", "revoke", "reconcile", "audit", "mode")
 _REVIEW_ID_TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 # A path token must mean the same to the shell as to this parser.
 _UNSAFE_PATH_TOKEN = re.compile(r"[$`*?\[\]{}()<>|&;!\n\x00]")
@@ -821,7 +846,8 @@ def _plain_abs_path(token: str) -> bool:
 def _plugin_cli_call(tokens, root):
     """A plugin's guard CLI call: None when these tokens are not one, a refusal
     decision when they look like one but are not exactly the permitted form, else
-    (subcommand, [review ids]).
+    (subcommand, [review ids]) -- for `mode`, (mode, [the raw tokens after
+    --root X]), which `_mode_cli_decision` reads.
 
     The form, and nothing else:
       uv run <the three flags> <abs path of THIS guard's cli.py> <verb> --root <abs project root> [ids]
@@ -843,7 +869,7 @@ def _plugin_cli_call(tokens, root):
         return None
     verb = tokens[6] if len(tokens) > 6 else None
     form = store.cli_command(root, verb if verb in _CLI_VERBS else "<approve|decline>",
-                             "" if verb in ("reconcile", "audit") else "<review-id> ...")
+                             "" if verb in ("reconcile", "audit", "mode") else "<review-id> ...")
 
     def refuse(why):
         return _decision(
@@ -862,6 +888,8 @@ def _plugin_cli_call(tokens, root):
         return refuse("`--root <project root>` must come directly after the subcommand")
     if not _plain_abs_path(tokens[8]) or os.path.realpath(tokens[8]) != os.path.realpath(str(root)):
         return refuse("`--root` is not this project's root")
+    if verb == "mode":
+        return verb, list(tokens[9:])
     ids = []
     for rid in tokens[9:]:
         if verb in ("reconcile", "audit") or not _REVIEW_ID_TOKEN.match(rid):
@@ -976,6 +1004,16 @@ _UV_UNLOCKED = (
 
 _SCRIPTS_OFF_HINT = ("or install with scripts off: add `--ignore-scripts` to the same "
                      "command")
+# Yarn Berry has no --ignore-scripts (the parser refuses it); its flag is --mode=skip-build.
+_SCRIPTS_OFF_FLAG = {"npm": "--ignore-scripts", "pnpm": "--ignore-scripts",
+                     "bun": "--ignore-scripts", "yarn": "--mode=skip-build"}
+
+
+def _scripts_off_hint(manager="npm") -> str:
+    if manager == "npm":
+        return _SCRIPTS_OFF_HINT
+    return ("or install with scripts off: add "
+            f"`{_SCRIPTS_OFF_FLAG[manager]}` to the same command")
 
 
 # A root lifecycle script reaches code through `npm run <x>` (and
@@ -990,6 +1028,20 @@ _SCRIPT_INTERPRETERS = re.compile(
     r"python(?:\d+(?:\.\d+)?)?)$")
 _INLINE_CODE_FLAGS = {"-e", "-c", "-p", "--eval", "--print", "-r", "--require", "--import"}
 _SCRIPT_DEPTH = 8
+
+# What each manager's command word means inside a lifecycle script body: the
+# verbs that run a script of the same package.json, and the flags that move the
+# command to another package (a body this reader cannot follow).
+_RUN_MANAGERS = {"npm": "npm", "pnpm": "pnpm", "yarn": "yarn", "yarnpkg": "yarn", "bun": "bun"}
+_RUN_VERBS = {"npm": _NPM_RUN, "pnpm": {"run", "run-script"}, "yarn": {"run"}, "bun": {"run"}}
+_RUN_FIXED = {"npm": _NPM_RUN_FIXED, "pnpm": _NPM_RUN_FIXED, "yarn": {}, "bun": {}}
+_RUN_MOVES = {
+    "npm": {"--prefix", "-C", "--workspace", "-w", "--workspaces", "-ws"},
+    "pnpm": {"--dir", "-C", "--filter", "-F", "--filter-prod", "-r", "--recursive", "-w",
+             "--workspace-root", "--workspace", "--parallel"},
+    "yarn": {"--cwd", "-A", "--all", "-W"},
+    "bun": {"--cwd", "--filter", "--workspaces"},
+}
 
 
 def _script_steps(body: str):
@@ -1040,31 +1092,41 @@ def _script_problem(name, body, scripts, root, chain, depth=0):
             continue
         command = os.path.basename(words[0])
         args = words[1:]
+        manager = _RUN_MANAGERS.get(command)
+        bun_run = False
+        if manager == "bun":
+            # `bun run <script>` follows the script. Anything else Bun takes (a file,
+            # `bun test`, `bun x.ts`) runs code from a file and stays "runs-file".
+            names = [a for a in args if not a.startswith("-")]
+            bun_run = (len(names) >= 2 and names[0] == "run" and not piped
+                       and not pg_parser._is_bun_file(names[1])
+                       and not any(a.split("=", 1)[0] in _INLINE_CODE_FLAGS for a in args))
         if piped and _SCRIPT_INTERPRETERS.match(command):
             return "runs-file", chain
-        if _SCRIPT_INTERPRETERS.match(command) and (
+        if not bun_run and _SCRIPT_INTERPRETERS.match(command) and (
                 command == "make" or any(not a.startswith("-") for a in args)
                 or any(a.split("=", 1)[0] in _INLINE_CODE_FLAGS for a in args)):
             return "runs-file", chain
         if "/" in words[0] and not words[0].startswith("node_modules/.bin/"):
             return "runs-file", chain
-        if command != "npm":
+        if manager is None:
             continue
-        if any(a in ("--prefix", "-C", "--workspace", "-w", "--workspaces", "-ws")
-               or a.startswith(("--prefix=", "--workspace=")) for a in args):
+        if any(a.split("=", 1)[0] in _RUN_MOVES[manager] for a in args):
             return "unresolved", chain
         verbs = [a for a in args if not a.startswith("-")]
         if not verbs:
             continue
         verb = verbs[0]
-        if verb in _NPM_RUN:
+        if verb in _RUN_VERBS[manager]:
             if len(verbs) < 2:
                 continue  # `npm run` alone lists the scripts
             targets = [verbs[1]]
-        elif verb in _NPM_RUN_FIXED:
-            targets = [_NPM_RUN_FIXED[verb]]
+        elif verb in _RUN_FIXED[manager]:
+            targets = [_RUN_FIXED[manager][verb]]
             if targets == ["restart"] and "restart" not in scripts:
                 targets = ["stop", "start"]
+        elif manager == "yarn" and verb in ("workspace", "workspaces"):
+            return "unresolved", chain
         else:
             continue
         for target in targets:
@@ -1094,41 +1156,47 @@ def _root_scripts(directory) -> dict:
         if isinstance(scripts, dict) else {}
 
 
-def _render_script_problem(kind, chain) -> str:
+def _render_script_problem(kind, chain, manager="npm") -> str:
     (first, body), path = chain[0], " -> ".join(
         f"`scripts.{n}`" + (f" (`{b}`)" if b is not None else " (missing)") for n, b in chain[1:])
     via = f", which leads to {path}" if path else ""
     head = f"PACKAGE_GUARD_UNSUPPORTED: package.json `scripts.{first}` runs `{body}`{via}"
+    flag = _SCRIPTS_OFF_FLAG[manager]
     if kind == "acquires":
-        return (f"{head}. npm executes it during this install and it acquires packages. Run "
+        return (f"{head}. {manager} executes it during this install and it acquires packages. Run "
                 "that acquisition as its own command first so it is reviewed (pin it to an exact "
-                f"version in the script), {_SCRIPTS_OFF_HINT}.")
+                f"version in the script), {_scripts_off_hint(manager)}.")
     if kind == "runs-file":
-        return (f"{head}. npm executes it during this install, and it runs code from a file, an "
+        return (f"{head}. {manager} executes it during this install, and it runs code from a file, an "
                 "inline interpreter or a pipe into a shell, which Package Guard cannot read, so "
                 "it cannot tell what that code acquires. Install with scripts off: add "
-                "`--ignore-scripts` to the same command. Then tell the user that this script did "
+                f"`{flag}` to the same command. Then tell the user that this script did "
                 "not run; whether to run it is theirs to decide.")
-    return (f"{head}. npm executes it during this install, and Package Guard cannot resolve that "
+    return (f"{head}. {manager} executes it during this install, and Package Guard cannot resolve that "
             "script in this package.json (missing, a cycle, more than "
             f"{_SCRIPT_DEPTH} levels deep, unreadable, or another directory). Install with "
-            "scripts off: add `--ignore-scripts` to the same command, and tell the user.")
+            f"scripts off: add `{flag}` to the same command, and tell the user.")
 
 
-def _lifecycle_check(directory, root):
+def _lifecycle_check(directory, root, kind="npm"):
     """With scripts on, `npm install` / `npm ci` run code the
     gate would otherwise never see: the root package.json's own lifecycle
     scripts, the sibling scripts they reach through `npm run`, and install
     scripts of locked packages. A root script that acquires packages must
     acquire only exact vetted versions; one that runs a file the gate cannot
     read is refused; a locked package that runs an install script must itself
-    be vetted."""
-    lifecycle = pg_manifest.npm_root_lifecycle_scripts(directory)
+    be vetted. pnpm, Bun and Yarn follow the same rules for the root; which
+    dependencies may build is each manager's own allow-list (design 6)."""
+    if kind == "yarn" and pm_config.yarn_scripts_disabled(directory, sources.HOME):
+        return None  # `enableScripts: false` stops the root's and every dependency's scripts
+    lifecycle = pg_manifest.npm_root_lifecycle_scripts(directory, kind)
     scripts = _root_scripts(directory) if lifecycle else {}
     for name, body in lifecycle:
         found = _script_problem(name, body, scripts, root, [])
         if found:
-            return _decision("deny", _render_script_problem(*found))
+            return _decision("deny", _render_script_problem(*found, manager=kind))
+    if kind != "npm":
+        return _dependency_builds_check(directory, root, kind)
     unreviewed = []
     for name, version in pg_manifest.npm_install_script_packages(directory):
         identity = {"ecosystem": "npm", "name": name, "version": version,
@@ -1143,6 +1211,123 @@ def _lifecycle_check(directory, root):
             f"`npm install --no-save {unreviewed[0]}` (it goes through the normal review), "
             f"{_SCRIPTS_OFF_HINT}."))
     return None
+
+
+_ADD_VERB = {"pnpm": "pnpm add", "bun": "bun add", "yarn": "yarn add"}
+
+
+def _build_denial(kind, text, remedy) -> dict:
+    return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {text} {remedy}")
+
+
+def _dependency_builds_check(directory, root, kind, removing=False):
+    """The dependency build scripts a pnpm, Bun or Yarn install would run.
+
+    None of the three locks says reliably which locked package has an install
+    script, so the rule never depends on that flag. Each manager has an explicit
+    allow-list; the install is allowed when scripts are off, or when the
+    allow-list exists (so the manager's default, which Package Guard cannot
+    enumerate, does not apply) and every locked package on it is a reviewed exact
+    version. Fail closed: an entry or setting that cannot be read denies."""
+    off = _scripts_off_hint(kind)
+    if removing and kind != "yarn":
+        # `remove` has no scripts-off flag to offer: pnpm rejects `--ignore-scripts` on it and
+        # Bun's is unverified, so the way out is the human's.
+        off = ("or ask the user to remove the package themselves outside this session: this "
+               "command has no flag that turns dependency scripts off")
+    home = sources.HOME
+    try:
+        tree = pg_manifest.pm_locked_tree(directory, kind)
+        if kind == "pnpm":
+            settings = pm_config.pnpm_build_settings(directory, home)
+            if settings.bad:
+                return _build_denial(kind, "pnpm's build settings cannot be read: "
+                                     + "; ".join(settings.bad[:5]) + ".", off + ".")
+            if settings.danger:
+                return _build_denial(
+                    kind, "`dangerouslyAllowAllBuilds` lets every dependency run its install "
+                    "scripts and Package Guard cannot review them.",
+                    "The human removes it, or " + off + ".")
+            if settings.never:
+                return _build_denial(
+                    kind, "`neverBuiltDependencies` is set; pnpm then runs every dependency's "
+                    "build script that it does not name.",
+                    "The human replaces it with an `onlyBuiltDependencies` allow-list, or "
+                    + off + ".")
+            if settings.allow is None:
+                return _build_denial(
+                    kind, "no explicit build allow-list: pnpm 9 runs every dependency's install "
+                    "scripts by default, and Package Guard cannot tell what pnpm 10 would skip. "
+                    "Declare `onlyBuiltDependencies` (even empty) in pnpm-workspace.yaml (the "
+                    "human's to do),", off + ".")
+            listed = settings.allow
+        elif kind == "bun":
+            package_list = pm_config.trusted_dependencies(directory)
+            if package_list is None:
+                return _build_denial(
+                    kind, "package.json has no `trustedDependencies`, so Bun runs the install "
+                    "scripts of its built-in default list (about 367 packages) and Package "
+                    "Guard cannot review them. The human declares `trustedDependencies` "
+                    "(even `[]`),", "or " + off + ".")
+            lock_list = bun_lock.trusted_dependencies(pg_manifest.pm_lock_path(directory, "bun"))
+            extra = sorted(set(lock_list) - set(package_list))
+            if extra:
+                return _build_denial(
+                    kind, "bun.lock trusts packages that package.json `trustedDependencies` does "
+                    f"not ({', '.join(extra[:5])}): the lock is out of date or was edited.",
+                    "Tell the user, or " + off + ".")
+            listed = {n.lower() for n in package_list}
+        else:
+            listed = _yarn_built_names(directory)
+            names = {n.lower() for n, _v in tree}
+            unlocked = sorted(listed - names)
+            if unlocked:
+                return _build_denial(
+                    kind, "`dependenciesMeta` allows builds for packages the lock does not "
+                    f"contain ({', '.join(unlocked[:5])}): a stale entry would run scripts of "
+                    "whatever gets installed under that name later.", "Tell the user, or "
+                    + off + ".")
+    except (pg_manifest.ManifestError, lock_errors.LockReadError, pm_config.ConfigError) as exc:
+        return _decision("deny", f"PACKAGE_GUARD_ERROR: the build-script settings for {kind} could "
+                                 f"not be read ({exc}). Nothing was installed; tell the user.")
+    unreviewed = []
+    for name, version in tree:
+        if name.lower() in listed:
+            identity = {"ecosystem": "npm", "name": name, "version": version,
+                        "registry": pg_parser.NPM_REGISTRY}
+            if not store.is_vetted(root, identity):
+                unreviewed.append(f"{name}@{version}")
+    if unreviewed:
+        shown = ", ".join(unreviewed[:10]) + (" ..." if len(unreviewed) > 10 else "")
+        return _build_denial(
+            kind, "these packages are allowed to run install scripts during this install and "
+            f"were never reviewed: {shown}. Package Guard reviews only what a command names, and "
+            f"{kind} has no way to name one without adding it to package.json and the lock, so "
+            "do not add them as dependencies to get a review. Tell the user which packages "
+            "these are; they decide whether to remove them from the build allow-list or to "
+            "have them reviewed outside this session,", off + ".")
+    return None
+
+
+def _yarn_built_names(directory):
+    """Lower-cased package names `dependenciesMeta.<pkg>.built: true` allows (package.json
+    and the lock's root entry)."""
+    names = set()
+    for key in yarn_lock.built_allowlist(Path(directory) / "package.json"):
+        match = pm_config._BUILD_NAME.match(key)
+        if match is None:
+            raise pm_config.ConfigError(f"package.json: dependenciesMeta key {key!r} is not a "
+                                        "plain package name")
+        names.add(match.group("name").lower())
+    lock = yarn_lock.read_yarn_lock(pg_manifest.pm_lock_path(directory, "yarn"))
+    for key, meta in lock.root.dependencies_meta.items():
+        if isinstance(meta, dict) and meta.get("built") in (True, "true"):
+            match = pm_config._BUILD_NAME.match(key)
+            if match is None:
+                raise pm_config.ConfigError(f"yarn.lock: dependenciesMeta key {key!r} is not a "
+                                            "plain package name")
+            names.add(match.group("name").lower())
+    return names
 
 
 def _source_problems(parsed, targets, directory, root, **kwargs) -> list:
@@ -1451,7 +1636,7 @@ def _scope_directories(scope, directory, root) -> list:
     in `directory`. A requirements file is named relative to the shell's
     directory. A local build is pip's `.` or uv's discovered project, so both
     are read."""
-    if scope.kind == "npm":
+    if scope.kind in pg_parser.NPM_FAMILY_KINDS:
         return [_npm_project(directory, root)]
     if scope.kind == "uv-project":
         return _uv_projects(directory, root) or [Path(directory)]
@@ -1494,9 +1679,10 @@ def _outside_project(targets, directory, root) -> dict | None:
                  f"project Package Guard protects ({guarded}); run it from inside the project, "
                  f"or install the guard at {outside}."]
         chain = _upward(directory, root)
-        stopped = (any(_npm_stops(d) for d in chain) if scope.kind == "npm"
+        npm_like = scope.kind in pg_parser.NPM_FAMILY_KINDS
+        stopped = (any(_npm_stops(d) for d in chain) if npm_like
                    else any((d / "pyproject.toml").is_file() for d in chain))
-        walk, create = _OWN_MANIFEST.get(scope.kind, (None, None))
+        walk, create = _OWN_MANIFEST.get("npm" if npm_like else scope.kind, (None, None))
         if walk and not stopped:
             lines.append(f"{walk}, and the project has none of its own, so it climbs out. To make "
                          f"this directory the project, create its manifest first, as its own "
@@ -1514,6 +1700,9 @@ def _read_manifest(scope, directory):
     """(resolved, unresolved, where) for one ManifestScope."""
     if scope.kind == "npm":
         resolved, unresolved = pg_manifest.direct_dependencies(directory)
+        return resolved, unresolved, pg_manifest.manifest_path(directory)
+    if scope.kind in pg_parser.PM_KINDS:
+        resolved, unresolved = pg_manifest.pm_direct_dependencies(directory, scope.kind)
         return resolved, unresolved, pg_manifest.manifest_path(directory)
     if scope.kind == "requirements":
         path = Path(scope.path)
@@ -1585,6 +1774,23 @@ _PIN_HELP = {
         "anything and, with scripts off, runs no code:",
         "  npm install --package-lock-only --ignore-scripts",
         "Pinning the specs in package.json to exact versions works too.",
+    ),
+    "pnpm": (
+        "Let pnpm resolve them, which writes pnpm-lock.yaml without installing anything and, "
+        "with scripts off, runs no code:",
+        "  pnpm install --lockfile-only --ignore-scripts",
+        "The lock must record each dependency for exactly the spec package.json declares.",
+    ),
+    "bun": (
+        "Let Bun resolve them, which writes bun.lock without installing anything and, "
+        "with scripts off, runs no code:",
+        "  bun install --lockfile-only --ignore-scripts",
+        "The lock must record each dependency for exactly the spec package.json declares.",
+    ),
+    "yarn": (
+        "Let Yarn resolve them, which writes yarn.lock without linking or building anything:",
+        "  yarn install --mode=update-lockfile",
+        "The lock must record each dependency for exactly the spec package.json declares.",
     ),
     "requirements": (
         "Let a resolver pin them into a fully-pinned requirements file, which "
@@ -2456,16 +2662,49 @@ def _mixed_in_batch(root, reports, verdicts) -> dict | None:
         f"({labels(groups['decision'])}). Nothing was approved. Run the recommended ids first, "
         "exactly as written and as a simple standalone command (no `cd`, no `&&`):",
         _command_lines(_approve_commands(root, groups["recommended"])),
-        "Then give the user ONE short chat line per package that needs a decision, with your "
-        "suggestion (approve it, or use the alternative the vetter named), and run the decision "
+        "Then give the user ONE short chat line per package that needs a decision: its red "
+        "flags in plain words and the risk they carry first, then your suggestion (use the "
+        "alternative the vetter named, or approve only if the user needs this exact package; "
+        "never a plain 'approve it'), and run the decision "
         "ids as a separate command, without waiting for a reply: its prompt is the question.",
         _command_lines(_approve_commands(root, groups["decision"])),
     ]
     return _decision("deny", "\n".join(lines))
 
 
+# What Claude may run of `cli.py mode`: show it, or turn the guard back on.
+_MODE_CLAUDE_FORMS = ([], ["enforce"], ["enforce", "--project"])
+
+
+def _mode_cli_decision(tail, root) -> dict:
+    """`tail` is the raw tokens after `mode` (after `--root X` in the plugin
+    form), or None when the verb was not directly after cli.py. Never the
+    parsed argument list: that drops `--flags`, so `mode --reason enforce off`
+    would read as `enforce`."""
+    if tail is not None and list(tail) in _MODE_CLAUDE_FORMS:
+        return _decision("allow", "Package Guard: showing the mode." if not tail else
+                         "Package Guard: turning the guard back on (enforce).")
+    if tail and tail[0] in ("warn", "off"):
+        # The command handed to the user must be one the CLI accepts.
+        asked = shlex.join(tail) + ("" if "--reason" in tail else ' --reason "<why>"')
+    else:
+        asked = '<warn|off> --reason "<why>" [--for 8h | --permanent] [--project]'
+    return _decision(
+        "deny",
+        "PACKAGE_GUARD_MODE_HUMAN_ONLY: only the user can turn Package Guard down, in their "
+        "own terminal -- not through Claude, and not with `!`. Do not look for another way "
+        "to do this. Tell the user, and if they want it, give them this command to run "
+        f"themselves from the project folder ({root}):\n"
+        f"  {store.human_command(root, 'mode', asked)}\n"
+        "Claude may run only `mode` (to show it) and `mode enforce [--project]` (to turn it "
+        "back on), exactly as:\n  "
+        f"{store.cli_command(root, 'mode', '').rstrip()}")
+
+
 def _handle_cli(call, root, transcript_path=None) -> dict:
     subcommand, review_ids = call
+    if subcommand == "mode":
+        return _mode_cli_decision(review_ids, root)
     if subcommand == "show":
         return _decision("allow", "Package Guard: read-only review display.")
     if subcommand in ("decline", "undecline", "revoke"):
@@ -2676,12 +2915,267 @@ def _fresh_recheck(root, identity: dict, state: dict) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# pnpm, Bun and Yarn: one manager per project (design section 4)
+#
+# A lock the invoked manager does not own is a lock it may silently migrate
+# (Bun reads yarn.lock, package-lock.json and pnpm-lock.yaml; Berry migrates a
+# Classic lock), and a reviewer reading the wrong lock approves the wrong tree.
+# Every rule here applies to pnpm, Bun and Yarn invocations only: npm and npx
+# behave exactly as they always have, whatever else sits in the directory.
+# ---------------------------------------------------------------------------
+
+_LOCK_FAMILIES = {
+    "npm": ("package-lock.json", "npm-shrinkwrap.json"),
+    "pnpm": ("pnpm-lock.yaml",),
+    "bun": ("bun.lock", "bun.lockb"),
+    "yarn": ("yarn.lock",),
+}
+_NO_LOCK_REMEDY = {
+    "pnpm": "Create the lock without installing anything, with scripts off, as its own "
+            "command: `pnpm install --lockfile-only --ignore-scripts`.",
+    "bun": "Create the lock without installing anything, with scripts off, as its own "
+           "command: `bun install --lockfile-only --ignore-scripts`.",
+    "yarn": "Create the lock without linking or building anything, as its own "
+            "command: `yarn install --mode=update-lockfile`.",
+}
+_PM_VERSION = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")
+_YARN_PIN = re.compile(r"^4\.(\d+)\.\d+$")
+_PM_FIELD = re.compile(r"^(?P<name>[A-Za-z][A-Za-z0-9._-]*)@(?P<version>[^+\s]+)"
+                       r"(?:\+(?P<hash>(?:sha1|sha224|sha256|sha384|sha512)\.[0-9A-Fa-f]+))?$")
+
+
+def _lock_files(directory) -> dict:
+    """family -> the lock files of that family present in `directory`."""
+    return {family: [n for n in names if (Path(directory) / n).exists()]
+            for family, names in _LOCK_FAMILIES.items()
+            if any((Path(directory) / n).exists() for n in names)}
+
+
+def _declares_dependencies(directory, kind=None) -> bool:
+    try:
+        return pg_manifest.pm_declares_dependencies(directory, kind)
+    except pg_manifest.ManifestError:
+        return True
+
+
+def _declared_package_managers(directory) -> list:
+    """[(where, name, version or None)] from package.json's `packageManager` and
+    `devEngines.packageManager`. Raises ValueError for any shape not understood."""
+    path = Path(directory) / "package.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as exc:
+        raise ValueError(f"package.json cannot be read ({exc})") from None
+    if not isinstance(data, dict):
+        raise ValueError("package.json is not a JSON object")
+    found = []
+    field = data.get("packageManager")
+    if field is not None:
+        match = _PM_FIELD.match(field) if isinstance(field, str) else None
+        if match is None:
+            raise ValueError(f"packageManager {field!r} is not name@exact-version")
+        found.append(("packageManager", match.group("name"), match.group("version")))
+    dev = data.get("devEngines")
+    if dev is not None:
+        if not isinstance(dev, dict):
+            raise ValueError("devEngines is not an object")
+        entries = dev.get("packageManager")
+        if isinstance(entries, dict):
+            entries = [entries]
+        if entries is not None:
+            if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+                raise ValueError("devEngines.packageManager is not an object or a list of objects")
+            for entry in entries:
+                name, version = entry.get("name"), entry.get("version")
+                if not isinstance(name, str) or not name or not (
+                        version is None or isinstance(version, str)):
+                    raise ValueError("devEngines.packageManager needs a text name and version")
+                found.append(("devEngines.packageManager", name, version))
+    return found
+
+
+def _manager_pin(directory, kind, pin_required=True):
+    """(problem or None, (npm package, exact version) or None): what package.json
+    says about the manager being run (Q15, D7). pnpm and Yarn are downloaded and
+    switched to the pinned release, so that release is an acquisition and goes
+    through review as an npm package; Bun does not act on the field."""
+    try:
+        declared = _declared_package_managers(directory)
+    except ValueError as exc:
+        return f"{exc}; a package manager pin that cannot be read cannot be reviewed", None
+    pins = set()
+    for where, name, version in declared:
+        if name != kind:
+            return (f"{where} names {name}@{version or '*'} but this command runs {kind}; "
+                    "another manager would be fetched or the project is mixed. One manager "
+                    "per project."), None
+        if kind == "bun":
+            continue  # informational
+        if version is None or not _PM_VERSION.match(version):
+            return (f"{where} {kind}@{version or '(no version)'} is not an exact version; "
+                    "a range, tag or URL names no release Package Guard can review"), None
+        if kind == "yarn":
+            match = _YARN_PIN.match(version)
+            if match is None or int(match.group(1)) < 14:
+                return (f"{where} yarn@{version}: only Yarn Berry 4.14 or newer is supported "
+                        "(Classic, 2.x, 3.x and older 4.x run dependency scripts by default)"), None
+            pins.add(("@yarnpkg/cli-dist", version))
+        else:
+            pins.add(("pnpm", version))
+    if len(pins) > 1:
+        return ("packageManager and devEngines.packageManager name different versions: "
+                + ", ".join(sorted(v for _n, v in pins))), None
+    if kind == "yarn" and not pins and pin_required:
+        return ("package.json must pin Yarn with packageManager: \"yarn@4.X.Y\" (X >= 14); "
+                "without it Corepack or a Yarn on PATH decides which release runs"), None
+    return None, (next(iter(pins)) if pins else None)
+
+
+def _npm_project_problem(directory):
+    """A denial when npm would install into a project another manager owns: its lock or
+    its package.json pin names pnpm, Bun or Yarn. npm would write package-lock.json
+    beside that lock and install a tree resolved from the manifest, which nobody reviewed.
+    The reverse (pnpm, Bun or Yarn beside package-lock.json) is `_pm_project_problem`."""
+    present = {k: v for k, v in _lock_files(directory).items() if k != "npm"}
+    owner = None
+    if present:
+        kind, files = next(iter(sorted(present.items())))
+        owner = f"{kind} ({files[0]})"
+    else:
+        try:
+            declared = _declared_package_managers(directory)
+        except ValueError:
+            return None  # an unreadable package.json is the manifest gate's PACKAGE_GUARD_ERROR
+        for where, name, version in declared:
+            if name != "npm":
+                owner = f"{name} ({where} {name}@{version or '*'})"
+                break
+    if owner is None:
+        return None
+    return _decision(
+        "deny",
+        f"PACKAGE_GUARD_UNSUPPORTED: {directory} belongs to {owner}. npm would write "
+        "package-lock.json beside it and install a tree nobody reviewed. One manager per "
+        "project: use the project's own manager, or ask the user to convert the project "
+        "outside this session.")
+
+
+def _pm_project_problem(scope, directory):
+    """(denial or None, pin or None, note or None) for one pnpm, Bun or Yarn target.
+
+    Runs before any review is opened: a command refused for its shape must not
+    cost the human an approval prompt. Reads the lock completely, so a Classic,
+    malformed or unreadable one denies here and never reads as an empty tree."""
+    kind = scope.kind
+    present = _lock_files(directory)
+    if len(present) > 1:
+        names = ", ".join(sorted(n for files in present.values() for n in files))
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_UNSUPPORTED: one manager per project: {directory} has {names}. "
+            "Which lock is authoritative is the manager's choice, and a reviewer who reads "
+            "the wrong one approves the wrong tree. Tell the user; do not delete a lock "
+            "yourself."), None, None
+    try:
+        lockless = not present and pg_manifest.no_lock_needed(directory)
+    except pg_manifest.ManifestError as exc:
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_ERROR: package.json in {directory} could not be read ({exc}). "
+            "Nothing was installed."), None, None
+    if lockless:
+        # B2: a project that declares nothing and has no lock has an empty tree, and no
+        # lock can exist for it, so a first `add` must not wait on one.
+        problem, pin = _manager_pin(directory, kind)
+        if problem:
+            return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}."), None, None
+        return None, pin, None
+    if kind not in present:
+        if present:
+            other = next(iter(present.values()))[0]
+            return _decision(
+                "deny",
+                f"PACKAGE_GUARD_UNSUPPORTED: {kind} has no lock in {directory} but {other} is "
+                f"there. {kind} may migrate it into a new lock and resolve versions nobody "
+                "reviewed. Use the manager the project's lock belongs to, or ask the user to "
+                "convert the project outside this session."), None, None
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_UNSUPPORTED: {directory} has no {pg_manifest.PM_LOCKFILES[kind]}, so "
+            f"the tree this {kind} install would put on disk is not known and cannot be checked. "
+            + _NO_LOCK_REMEDY[kind]), None, None
+    note = None
+    if kind == "bun":
+        if "bun.lock" not in present["bun"]:
+            return _decision(
+                "deny",
+                "PACKAGE_GUARD_UNSUPPORTED: this project has only bun.lockb, Bun's binary lock, "
+                "which Package Guard cannot read. Stop and ask the user to migrate it outside "
+                "this session (`bun install --save-text-lockfile --frozen-lockfile "
+                "--lockfile-only`, then delete bun.lockb), then re-run the command."), None, None
+        if "bun.lockb" in present["bun"]:
+            note = "bun.lockb is present beside bun.lock and is ignored"
+    try:
+        pg_manifest.pm_locked_tree(directory, kind)  # parse and validate it all, now
+    except pg_manifest.ManifestError as exc:
+        return _decision(
+            "deny",
+            f"PACKAGE_GUARD_ERROR: the lock for {kind} in {directory} could not be read ({exc}). "
+            "Nothing was installed; do not edit the lock yourself, tell the user."), None, None
+    problem, pin = _manager_pin(directory, kind)
+    if problem:
+        return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}."), None, None
+    if kind == "pnpm":
+        problem = _pnpm_env_lock_problem(directory, pin)
+        if problem:
+            return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}."), None, None
+    return None, pin, note
+
+
+def _pnpm_env_lock_problem(directory, pin, strict=True) -> str | None:
+    """pnpm's lock may open with an environment document naming the packages pnpm itself
+    fetches before it resolves anything: `packageManagerDependencies` (the pnpm release) and
+    `configDependencies` (config packages that run code). Neither is a dependency of the
+    project, so no manifest reader lists them and no review saw them (A10): the pnpm
+    release, when it is listed at all, must be exactly the reviewed pin, and config dependencies are refused (P3)."""
+    path = pg_manifest.pm_lock_path(directory, "pnpm")
+    try:
+        found = pnpm_lock.env_dependency_sections(path)
+    except lock_errors.LockReadError as exc:
+        # An install and a `remove` read the whole lock anyway; a run or a read-only verb does
+        # not need it, so a lock this reader does not understand is not a reason to refuse it.
+        return f"pnpm-lock.yaml cannot be read ({exc})" if strict else None
+    config = found.get("configDependencies") or []
+    if config:
+        names = ", ".join(f"{name}@{version}" for name, version in config[:5])
+        return ("pnpm-lock.yaml lists configDependencies, which pnpm downloads and runs before "
+                f"resolving anything and no review covers: {names}")
+    manager = found.get("packageManagerDependencies") or []
+    wanted = [("pnpm", pin[1])] if pin else []
+    if manager and sorted(manager) != sorted(wanted):
+        listed = ", ".join(f"{name}@{version}" for name, version in manager[:5])
+        expected = f"{wanted[0][0]}@{wanted[0][1]}" if wanted else "nothing (package.json pins no pnpm)"
+        return ("pnpm-lock.yaml's packageManagerDependencies "
+                f"({listed}) is not the reviewed packageManager pin; it must be {expected}")
+    return None
+
+
 def _locked_tree(scope, directory):
-    """(ecosystem, [(name, version)], lockfile path) for a gated manifest, or None."""
+    """(ecosystem, [(name, version)], lockfile path) for a gated manifest, or None.
+
+    pnpm, Bun and Yarn read their own lock and nothing else; a lock that is
+    missing or unreadable raises ManifestError, never an empty tree."""
     if scope.kind == "npm":
         return "npm", pg_manifest.npm_locked_tree(directory), Path(directory) / "package-lock.json"
     if scope.kind == "uv-project":
         return "pypi", pg_manifest.uv_locked_tree(directory), Path(directory) / "uv.lock"
+    if scope.kind in pg_parser.PM_KINDS:
+        return (pg_parser.scope_ecosystem(scope.kind),
+                pg_manifest.pm_locked_tree(directory, scope.kind),
+                pg_manifest.pm_lock_path(directory, scope.kind))
     return None  # a requirements file is already flattened: every line is direct
 
 
@@ -2699,11 +3193,22 @@ def _check_transitives(targets, root) -> tuple:
     notes = []
     calls = 0
     for scope, directory in targets:
-        tree = _locked_tree(scope, directory)
+        try:
+            tree = _locked_tree(scope, directory)
+        except (pg_manifest.ManifestError, lock_errors.LockReadError) as exc:
+            return _decision("deny", f"PACKAGE_GUARD_ERROR: the lock for {scope.kind} could not be "
+                                     f"read ({exc}). Nothing was installed."), notes
         if tree is None:
             continue
         ecosystem, pairs, lock = tree
         if not pairs:
+            if scope.kind in pg_parser.PM_KINDS and _declares_dependencies(directory, scope.kind):
+                # The manifest declares dependencies and its lock lists none:
+                # the install would resolve a tree nobody reviewed.
+                return _decision(
+                    "deny",
+                    f"PACKAGE_GUARD_ERROR: {lock.name} lists no packages although package.json "
+                    f"declares dependencies. Nothing was installed; the lock is stale or empty."), notes
             continue
         registry = "https://registry.npmjs.org" if ecosystem == "npm" else "https://pypi.org"
         candidates = [
@@ -2914,6 +3419,11 @@ def _render_review_required(reports, root, deferred: int = 0) -> str:
             *_cooldown_note(report),
             f"reputation: {tier}",
         ]
+        if (report.get("request") or {}).get("operation") == "manager-pin":
+            blocks.append(
+                "note: this is the project's pinned package manager (package.json "
+                "`packageManager`); it is downloaded and run before anything else. Approving "
+                "it does not install it anywhere in the project.")
         if report.get("retry_command"):
             blocks.append(f"retry: {report['retry_command']}")
     unresolved_ids = " ".join(r["review_id"] for r in unresolved)
@@ -2965,8 +3475,10 @@ def _render_review_required(reports, root, deferred: int = 0) -> str:
                 + store.cli_command(root, "approve", "<RECOMMEND ids>"),
                 "  2. then the NEEDS_HUMAN_REVIEW ids, together: "
                 + store.cli_command(root, "approve", "<NEEDS_HUMAN_REVIEW ids>"),
-                "Before step 2, give the user ONE short chat line per NEEDS_HUMAN_REVIEW package "
-                "with your suggestion (approve it, or use the alternative the vetter named), then "
+                "Before step 2, give the user ONE short chat line per NEEDS_HUMAN_REVIEW package: "
+                "its red flags in plain words and the risk they carry first, then your suggestion "
+                "(use the alternative the vetter named, or approve only if the user needs this "
+                "exact package; never a plain 'approve it'), then "
                 "run it without waiting for a reply: its prompt shows each reason in plain words "
                 "and your suggestion, and the prompt is the question. A DO_NOT_RECOMMEND or "
                 "TYPO_SQUAT id gets no approve command.",
@@ -3296,6 +3808,252 @@ def _edit_decision(event: dict, root) -> dict | None:
     return None
 
 
+def _resolve_only_denial(parsed, event, root):
+    """A command that only resolves and writes a lock acquires nothing, so it is
+    `ignore`. npm's (`--package-lock-only`, `--dry-run`) is only refused in a
+    project another manager owns. A pnpm, Bun or Yarn one still runs where the
+    manager's configuration says: a Yarn `yarnPath` or plugin, a `.pnpmfile.cjs`,
+    a registry redirect. The same source checks run,
+    on the project as it stands; the lock does not exist yet, so none is
+    required. Berry has no `--ignore-scripts`: a root `preinstall`/`install`/
+    `postinstall`/`prepare` script is refused for `--mode=update-lockfile`."""
+    cwd = event.get("cwd") or root
+    problems, scripts = [], []
+    for kind in parsed.resolve_only:
+        scope = pg_parser.ManifestScope(kind, scripts=False)
+        if kind == "npm":
+            # `npm install --package-lock-only --ignore-scripts` / `--dry-run`: the
+            # hatch for an unpinned manifest, so it stays allowed in an npm project
+            # and is not source-checked (npm reads no code-running configuration).
+            # Only one-manager-per-project applies: in a project pnpm, Bun or Yarn
+            # owns it would write package-lock.json beside that lock.
+            for directory in _scope_directories(scope, cwd, root):
+                denial = _npm_project_problem(directory)
+                if denial:
+                    return denial
+            continue
+        targets = [(scope, directory) for directory in _scope_directories(scope, cwd, root)]
+        outside = _outside_project(targets, cwd, root)
+        if outside:
+            return outside
+        for _scope, directory in targets:
+            # One manager per project: a lock-writing command beside another
+            # manager's lock may migrate it (Bun reads yarn.lock, Berry a Classic
+            # lock). A directory with no lock at all is the case this form is for.
+            present = _lock_files(directory)
+            if present and set(present) != {kind}:
+                denial, _pin, _note = _pm_project_problem(scope, directory)
+                if denial:
+                    return denial
+            if kind == "yarn":
+                scripts += [f"{Path(directory) / 'package.json'}: `{name}`"
+                            for name, _body in pg_manifest.npm_root_lifecycle_scripts(directory)]
+        synthetic = dataclasses.replace(parsed, kind="package", manifests=(scope,))
+        problems += _source_problems(synthetic, targets, cwd, root)
+    if scripts:
+        return _decision("deny", (
+            "PACKAGE_GUARD_UNSUPPORTED: `yarn install --mode=update-lockfile` may run the root "
+            "project's own install-time scripts, and Yarn has no --ignore-scripts to turn them "
+            f"off: {', '.join(scripts)}. Ask the user to create or refresh yarn.lock outside this "
+            "session, or to remove those scripts."))
+    problems = list(dict.fromkeys(problems))
+    if problems:
+        return _decision("deny", _render_alternate_source(problems))
+    return None
+
+
+def _bun_autoinstall_problem(cwd, directory, root) -> str | None:
+    """Why `bun run` / `bun test` / `bun <file>` could install packages unreviewed,
+    or None. With no node_modules in the shell's directory or an ancestor inside
+    the guard root, Bun resolves what the code imports from the registry at run
+    time, `latest` when unpinned. A node_modules outside the guard root does not
+    count: it is not one this guard reviewed. Bun reads `bunfig.toml` from the
+    directory it runs in, so `[install] auto = "disable"` counts only there."""
+    if pm_config.bun_auto_install_disabled(cwd, sources.HOME):
+        return None
+    if any((candidate / "node_modules").is_dir() for candidate in _upward(cwd, root)):
+        return None
+    return ("with no node_modules here Bun installs the packages this code imports at run "
+            "time, unpinned and unreviewed. Run `bun install` first, as its own reviewed "
+            "command (put `--no-install` BEFORE the script or file name to run only what is "
+            "already installed: after it the flag belongs to the script), or have the user "
+            "set `[install] auto = \"disable\"` in bunfig.toml")
+
+
+def _yarn_install_state_problem(directory) -> str | None:
+    """Berry's install state: `yarn run` checks it and refuses to run when stale,
+    and does not install by itself (UNVERIFIED), so a project without one has
+    nothing installed that was reviewed."""
+    base = Path(directory)
+    if (base / "node_modules").is_dir() and (base / "node_modules" / ".yarn-state.yml").is_file():
+        return None
+    return ("there is no installed state here (node_modules/.yarn-state.yml): run `yarn install` "
+            "first, as its own reviewed command")
+
+
+def _manager_pin_denial(kind, directory, root, event, pin_required=True):
+    """A denial when the manager `kind` would run a pinned release nobody reviewed, or
+    when the pin cannot be read; None when it is fine (or there is no pin to review).
+
+    pnpm and Yarn are downloaded and switched to the release `package.json` pins, so that
+    release is an acquisition and goes through review as an npm package (Q15, D7), for
+    EVERY command that executes the manager, not only an install. An unvetted pin opens
+    (or reuses) a review of that package here, so a project that cannot install yet (it
+    has no lock) or a command that must stay reachable (`remove`, with a finding open)
+    never waits on an install that is itself denied. Its retry is the original command."""
+    problem, pin = _manager_pin(directory, kind, pin_required)
+    if problem:
+        return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}.")
+    if kind == "pnpm" and pg_manifest.pm_lock_path(directory, "pnpm").is_file():
+        # A10 on every pnpm execution: the lock's environment document names what pnpm itself
+        # fetches before it runs anything.
+        problem = _pnpm_env_lock_problem(directory, pin, strict=False)
+        if problem:
+            return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {problem}.")
+    if not pin:
+        return None
+    identity = {"ecosystem": "npm", "name": pin[0], "version": pin[1],
+                "registry": pg_parser.NPM_REGISTRY}
+    try:
+        if store.is_vetted(root, identity):
+            return _fresh_recheck(root, identity, {"done": 0})
+        if store.is_declined(root, identity):
+            return _decision("deny", _render_declined([{
+                "resolved_identity": identity,
+                "review_id": store.declined_review_id(root, identity) or "(declined earlier)"}],
+                root))
+        session_id = event.get("session_id")
+        report = store.find_open_review(root, session_id, identity)
+        if report is None:
+            command = ((event.get("tool_input") or {}).get("command") or "")
+            request = dataclasses.replace(
+                pg_manifest.as_request(pin[0], pin[1], command, "npm"), operation="manager-pin")
+            reports, abandoned = _create_reviews([request], root, session_id)
+            if abandoned or not reports:
+                return _decision("deny", _render_deferred_only(max(abandoned, 1)))
+            report = reports[0]
+    except store.StoreError as exc:
+        return _decision("deny", f"PACKAGE_GUARD_ERROR: Package Guard state is unavailable ({exc}). "
+                                 "Package operations are blocked until it is repaired.")
+    if report["verdict"] == "hard_deny":
+        return _decision("deny", _render_hard_deny([report]))
+    # An open review is reused across commands, and its stored retry names the command that
+    # opened it: the one to retry is this one.
+    command = ((event.get("tool_input") or {}).get("command") or "")
+    return _decision("deny", _render_review_required([dict(report, retry_command=command)], root))
+
+
+def _remove_denial(run, directory, root) -> dict | None:
+    """The checks a `pnpm|bun|yarn remove` needs beyond the configuration and pin checks
+    every run gets (v1.10.0 hardening, A4). `remove` rewrites package.json and the lock,
+    relinks node_modules and runs the root project's lifecycle scripts, and it is the
+    printed remedy for an unreviewed package, so it stays an `ignore` the gate lets by
+    while a finding is open; the checks run here instead:
+
+      - one manager per project, the lock read in full, no unreadable lock;
+      - the manifest and the lock agree (a dependency the lock does not record would be
+        resolved and installed by the relink), the names being removed excepted;
+      - no root install-lifecycle script runs unless the command turns scripts off, and
+        every dependency allowed to build is a reviewed version."""
+    kind = run.kind
+    scope = pg_parser.ManifestScope(kind, scripts=run.scripts)
+    denial, _pin, _note = _pm_project_problem(scope, directory)
+    if denial:
+        return denial
+    try:
+        _resolved, unresolved, where = _read_manifest(scope, directory)
+    except (pg_manifest.ManifestError, lock_errors.LockReadError) as exc:
+        return _decision("deny", f"PACKAGE_GUARD_ERROR: the manifest for {kind} could not be read "
+                                 f"({exc}). Nothing was changed; tell the user.")
+    removed = set(run.names)
+    stale = [(name, spec) for name, spec in unresolved if name not in removed]
+    if stale:
+        listed = "; ".join(f"{name}: {spec}" for name, spec in stale[:5])
+        return _decision("deny", (
+            f"PACKAGE_GUARD_UNSUPPORTED: `{kind} remove` would re-resolve the project, and "
+            f"{where.name} and the lock disagree, so it would install something nobody "
+            f"reviewed ({listed}). Tell the user; do not edit the lock yourself."))
+    if not run.scripts or (kind == "yarn" and pm_config.yarn_scripts_disabled(directory, sources.HOME)):
+        return None
+    try:
+        lifecycle = pg_manifest.npm_root_lifecycle_scripts(directory, kind)
+    except pg_manifest.ManifestError as exc:
+        return _decision("deny", f"PACKAGE_GUARD_ERROR: the manifest for {kind} could not be "
+                                 f"read ({exc}). Nothing was changed; tell the user.")
+    if lifecycle:
+        names = ", ".join(f"`{name}`" for name, _body in lifecycle)
+        return _decision("deny", (
+            f"PACKAGE_GUARD_UNSUPPORTED: `{kind} remove` runs the root project's own "
+            f"install-time scripts ({names} in {where.name}). "
+            + ("Add `--mode=skip-build` to turn them off." if kind == "yarn" else
+               "Add `--ignore-scripts` to turn them off." if kind == "bun" else
+               "This command has no flag Package Guard can rely on to turn them off. Tell the "
+               "user: they remove those scripts, or remove the package themselves outside this "
+               "session.")
+            + " Do not edit package.json or the lock to get around this."))
+    return _dependency_builds_check(directory, root, kind, removing=True)
+
+
+def _run_denial(parsed, event, root):
+    """A pnpm, Bun or Yarn command that RUNS project code or only executes the manager
+    (`parsed.runs`). It acquires nothing, like `npm run`, and the script's own text is not
+    read; but the manager's configuration applies to it (a pnpmfile, a Yarn plugin, a Bun
+    preload) wherever the shell is and wherever the project is, the pinned manager is
+    downloaded when it differs, Bun installs what it cannot find, and Yarn needs an
+    install state. Design 7; `manager` and `remove` runs are v1.10.0 hardening (A2, A4)."""
+    cwd = event.get("cwd") or root
+    for run in parsed.runs:
+        scope = pg_parser.ManifestScope(run.kind, scripts=False)
+        targets = [(scope, directory) for directory in _scope_directories(scope, cwd, root)]
+        outside = _outside_project(targets, cwd, root)
+        if outside:
+            return outside
+        synthetic = pg_parser.ParseResult(kind="ignore", runs=(run,))
+        # Where the shell is AND where the project is: Bun reads the bunfig of the
+        # directory it runs in, Yarn and pnpm walk up from it (A6).
+        here = {os.path.realpath(d): d for d in [cwd] + [d for _s, d in targets]}
+        problems = []
+        for directory in here.values():
+            problems += sources.problems_for(synthetic, directory)
+        problems = list(dict.fromkeys(problems))
+        if problems:
+            return _decision("deny", _render_alternate_source(problems))
+        for _scope, directory in targets:
+            if run.kind in ("pnpm", "yarn"):
+                denial = _manager_pin_denial(run.kind, directory, root, event,
+                                             pin_required=run.verb != "print")
+                if denial:
+                    return denial
+            if run.verb == "remove":
+                denial = _remove_denial(run, directory, root)
+                if denial:
+                    return denial
+            reason = None
+            if run.kind == "bun" and run.autoinstall:
+                reason = _bun_autoinstall_problem(cwd, directory, root)
+            elif run.kind == "yarn" and run.verb not in ("manager", "print", "remove"):
+                reason = _yarn_install_state_problem(directory)
+            if reason:
+                return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: `{run.kind} {run.verb}`: {reason}.")
+    return None
+
+
+def _pm_not_yet_readable(parsed) -> str | None:
+    """THE SAFETY SWITCH for pnpm, Bun and Yarn (`parser.PNPM_BUN_YARN_ENABLED`).
+
+    Their scopes, and the requests `pnpm dlx`, `bunx` and `yarn dlx` make, are
+    recognised, but nothing reads their manifests, locks or configuration yet. Until
+    every stage does, any command that reaches them is denied here, so no
+    intermediate state lets one through unreviewed."""
+    if pg_parser.PNPM_BUN_YARN_ENABLED or not pg_parser.uses_pnpm_bun_yarn(parsed):
+        return None
+    names = [m.kind for m in parsed.manifests if m.kind in pg_parser.PM_KINDS]
+    names += [r.manager.split()[0] for r in parsed.requests
+              if r.manager and r.manager.split()[0] in pg_parser.PM_MANAGERS]
+    return (f"PACKAGE_GUARD_UNSUPPORTED: manifest not yet readable for {names[0]} "
+            "(support lands in v1.10.0)")
+
+
 def evaluate(event: dict, root) -> dict | None:
     tool = event.get("tool_name")
     if isinstance(tool, str) and tool.lower() == "powershell":
@@ -3335,25 +4093,39 @@ def evaluate(event: dict, root) -> dict | None:
         call = _guard_cli_call(tokens)
         if call:
             if not _clean_project_cli(tokens, root, event.get("cwd")):
+                ids = "" if call[0] == "mode" else " ".join(call[1]) or "<review-id> ..."
                 return _decision(
                     "deny",
                     "PACKAGE_GUARD_UNSUPPORTED: run this project's own Package Guard CLI, "
                     "with no other `uv` option, exactly as:\n  "
-                    f"{store.cli_command(root, call[0] or '<subcommand>', ' '.join(call[1]) or '<review-id> ...')}",
+                    f"{store.cli_command(root, call[0] or '<subcommand>', ids).rstrip()}",
                 )
+            if call[0] == "mode":
+                # The raw tokens after the verb; None when the verb is not
+                # directly after cli.py (the parsed call skips `--flags`).
+                call = ("mode", tokens[7:] if tokens[6] == "mode" else None)
             return _handle_cli(call, root, event.get("transcript_path"))
 
-    # The command names the guard CLI's approve/decline path but was not
-    # recognised as a clean standalone invocation above. Falling through would
-    # hand it to the normal permission flow, where an auto-accept mode runs it
-    # with no human prompt — silently defeating the approval gate. Fail closed.
-    if (_PLUGIN_CLI_HINT if plugin else _GUARD_CLI_HINT).search(command):
+    # The command names a guard CLI verb but was not recognised as a clean
+    # standalone invocation above. Falling through would hand it to the normal
+    # permission flow, where an auto-accept mode runs it with no human prompt —
+    # silently defeating the approval gate. Fail closed.
+    if _names_cli_verb(command, plugin):
         return _decision(
             "deny",
-            "PACKAGE_GUARD_UNSUPPORTED: a Package Guard approve/decline must be a simple "
-            "standalone command — not wrapped in a `cd`, `&&`, `;`, subshell, or any other "
-            "compound or dynamic shell syntax. Re-run it on its own, using this absolute "
-            f"path so no directory change is needed:\n  {store.cli_command(root, '<approve|decline>', '<review-id> ...')}",
+            "PACKAGE_GUARD_UNSUPPORTED: a Package Guard CLI call (approve, decline, mode, ...) "
+            "must be a simple standalone command — not wrapped in a `cd`, `&&`, `;`, subshell, "
+            "or any other compound or dynamic shell syntax. Re-run it on its own, using this "
+            "absolute path so no directory change is needed:\n  "
+            f"{store.cli_command(root, '<approve|decline>', '<review-id> ...')}",
+        )
+    if _LAUNCHER_HINT.search(command) or _LAUNCHER_HINT.search(_SHELL_QUOTING.sub("", command)):
+        return _decision(
+            "deny",
+            "PACKAGE_GUARD_UNSUPPORTED: `pg` and `run.sh … cli.py` are how the user runs "
+            "Package Guard in their own terminal; Claude does not run them. Use the CLI "
+            "exactly as:\n  "
+            f"{store.cli_command(root, '<subcommand>', '...')}",
         )
 
     written = _guard_write(command, root, event.get("cwd"))
@@ -3385,8 +4157,124 @@ def evaluate(event: dict, root) -> dict | None:
             f"{store.cli_command(root, '<approve|decline|undecline|revoke>', '<review-id> ...')}",
         )
 
+    return _with_mode(event, root, command, early, advanced)
+
+
+def _join_output(decision: dict | None, message: str, context: str) -> dict:
+    """Add a line for the user (systemMessage) and one for Claude
+    (additionalContext) to a PreToolUse reply, keeping what it already says.
+    A reply with no permissionDecision leaves the command to the normal
+    permission flow."""
+    decision = decision if decision is not None else {
+        "hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+    out = decision["hookSpecificOutput"]
+    out["additionalContext"] = "\n\n".join(
+        part for part in (context, out.get("additionalContext")) if part)
+    decision["systemMessage"] = "\n".join(
+        part for part in (message, decision.get("systemMessage")) if part)
+    return decision
+
+
+def _warned(decision: dict, root, command: str) -> dict:
+    """warn mode: the refusal becomes context, with NO permission decision.
+    Never `allow`: that would skip the user's own permission prompt."""
+    reason = decision["hookSpecificOutput"].get("permissionDecisionReason") or ""
+    code = reason.split(":", 1)[0].split("\n", 1)[0]
+    pg_mode.append_log(root, {"event": "warned", "code": code, "command": command[:200]})
+    return _join_output(
+        None,
+        f"Package Guard (warn mode) would have refused this command: {code}.",
+        "Package Guard is in warn mode, so it did not block this command; it goes to the "
+        "user's normal permission prompt. Tell the user what the guard would have refused, "
+        "and do not try to change the mode. Enforcing, the guard would have said:\n" + reason)
+
+
+def _record_while_down(event: dict, root, command: str, early) -> None:
+    """warn and off: record the Python environments a command names, as an
+    allow does, so the scans that catch up afterwards read them. Without it, an
+    install into an outside environment while the guard was down would never be
+    seen. Best effort; it decides nothing."""
+    try:
+        parsed = early if early is not None else pg_parser.parse_command(command)
+        if parsed.kind != "package" or not parsed.environments:
+            return
+        if any(_inside_guard_dir(root, e) for e in parsed.environments):
+            return
+        _record_environments(parsed, _python_project(parsed, event.get("cwd") or root, root), root)
+    except Exception as exc:  # noqa: BLE001 - a lost record costs scan coverage, not the gate
+        print(f"Package Guard: could not record the environment "
+              f"({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+
+
+def _follow_mode(root, mode: str, session_id) -> list:
+    """`disk_guard.follow_mode`, failing soft: a snapshot or catch-up that
+    fails stays for the next command, and the gate still reads the findings
+    record (and fails closed on it) itself."""
+    try:
+        caught = disk_guard.follow_mode(root, mode, session_id)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        print(f"Package Guard: could not follow the mode ({exc.__class__.__name__}: {exc}).",
+              file=sys.stderr)
+        return []
+    if caught:
+        pg_mode.append_log(root, {"event": "caught-up", "count": len(caught)})
+    return caught
+
+
+def _with_mode(event: dict, root, command: str, early, advanced) -> dict | None:
+    """Apply the mode to acquisition, and nowhere else. Everything evaluate()
+    decided before this -- PowerShell, the guard CLI, writes to guard files --
+    holds in every mode."""
+    global _WARN_RUNNING
+    expired = pg_mode.settle(root)
+    current = pg_mode.effective(root)
+    # Before the gate, so the first package command after the guard is back
+    # is refused while what arrived in the meantime waits for review.
+    caught = _follow_mode(root, current.mode, event.get("session_id"))
+    if current.mode == "off":
+        decision = None
+        _record_while_down(event, root, command, early)
+    elif current.mode == "warn":
+        _WARN_RUNNING = True
+        try:
+            decision = _acquisition(event, root, command, early, advanced)
+        except Exception as exc:  # noqa: BLE001 - the user asked not to be blocked
+            # warn is the way out the internal-failure message names, so a
+            # crash in acquisition must not block here.
+            decision = _decision("deny", f"PACKAGE_GUARD_ERROR: internal failure "
+                                         f"({exc.__class__.__name__}: {exc}).")
+        finally:
+            _WARN_RUNNING = False
+        out = (decision or {}).get("hookSpecificOutput") or {}
+        if out.get("permissionDecision") == "deny":
+            decision = _warned(decision, root, command)
+            _record_while_down(event, root, command, early)
+    else:
+        decision = _acquisition(event, root, command, early, advanced)
+    down = current.mode != "enforce" or current.problem
+    if expired or caught or (down and pg_mode.first_in_session(root, event.get("session_id"))):
+        lines = [f"Package Guard: {line}." for line in expired]
+        lines.append(pg_mode.describe(current))
+        if caught:
+            lines.append(f"{len(caught)} package(s) installed while it was down wait for review: "
+                         + ", ".join(disk_guard._label(f) for f in caught) + ".")
+        banner = " ".join(lines)
+        decision = _join_output(
+            decision, banner,
+            banner + " Only the user changes the mode; do not try to change it.")
+    return decision
+
+
+def _acquisition(event: dict, root, command: str, early, advanced) -> dict | None:
+    """The package gate: what the mode turns down."""
     parsed = early if early is not None else pg_parser.parse_command(command)
     if parsed.kind == "ignore":
+        if parsed.resolve_only:
+            denial = _resolve_only_denial(parsed, event, root)
+            if denial:
+                return denial
+        if parsed.runs:
+            return _run_denial(parsed, event, root)
         return None
 
     # Something unreviewed is already installed. Deny package operations until
@@ -3410,6 +4298,18 @@ def evaluate(event: dict, root) -> dict | None:
 
     if parsed.kind == "unsupported":
         return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {parsed.reason}")
+    not_yet = _pm_not_yet_readable(parsed)
+    if not_yet:
+        return _decision("deny", not_yet)
+    if parsed.resolve_only:
+        # A lock-writing pnpm, Bun or Yarn command beside an acquiring one.
+        denial = _resolve_only_denial(parsed, event, root)
+        if denial:
+            return denial
+    if parsed.runs:
+        denial = _run_denial(parsed, event, root)
+        if denial:
+            return denial
     inside = [e for e in parsed.environments if _inside_guard_dir(root, e)]
     if inside:
         # The parser refuses a `.claude` path it can read; this is the one a
@@ -3438,6 +4338,22 @@ def evaluate(event: dict, root) -> dict | None:
     if refusal:
         return _decision("deny", f"PACKAGE_GUARD_UNSUPPORTED: {refusal}")
     environments = disk_guard.environments(project, root, parsed.environments)
+
+    # pnpm, Bun and Yarn: one manager per project, the lock read in full, the
+    # packageManager pin. Before any review, so a refused shape costs no prompt.
+    pm_pins, pm_notes = {}, []
+    for scope, directory in targets:
+        if scope.kind == "npm":
+            denial = _npm_project_problem(directory)
+            if denial:
+                return denial
+        if scope.kind in pg_parser.PM_KINDS:
+            denial, pin, note = _pm_project_problem(scope, directory)
+            if denial:
+                return denial
+            pm_pins[(scope.kind, os.path.realpath(directory))] = pin
+            if note and note not in pm_notes:
+                pm_notes.append(note)
 
     # A review vets registry/name@version; refuse when configuration, a
     # lock entry or a manifest spec would make the installer fetch from
@@ -3559,25 +4475,30 @@ def evaluate(event: dict, root) -> dict | None:
                 return _decision("deny", _UV_UNLOCKED)
             try:
                 resolved, unresolved, where = _read_manifest(scope, directory)
-            except pg_manifest.ManifestError as exc:
+            except (pg_manifest.ManifestError, lock_errors.LockReadError) as exc:
                 return _decision(
                     "deny",
                     f"PACKAGE_GUARD_ERROR: the manifest for {scope.kind} could not be read ({exc}). "
                     "Package operations are blocked until it is repaired.",
                 )
+            pin = pm_pins.get((scope.kind, os.path.realpath(directory)))
+            if pin:
+                # The pinned manager is downloaded and run: it is reviewed like
+                # any other npm package (Q15, D7).
+                resolved = list(resolved) + [(pin[0], pin[1], "packageManager")]
             if unresolved:
                 return _decision("deny", _render_unpinned(unresolved, where, scope.kind,
                                                           _build_pins(unresolved, deadline)))
-            if scope.kind == "npm" and scope.scripts:
-                blocked = _lifecycle_check(directory, root)
+            if scope.kind in pg_parser.NPM_FAMILY_KINDS and scope.scripts:
+                blocked = _lifecycle_check(directory, root, scope.kind)
                 if blocked:
                     return blocked
-            ecosystem = "npm" if scope.kind == "npm" else "pypi"
+            ecosystem = pg_parser.scope_ecosystem(scope.kind)
             registry = pg_parser.NPM_REGISTRY if ecosystem == "npm" else pg_parser.PYPI_REGISTRY
             # Local checks first (no network), so only genuinely new packages
             # cost a round trip.
             todo = []
-            for name, version, _source in resolved:
+            for name, version, source in resolved:
                 covered.add((ecosystem, name))
                 identity = {
                     "ecosystem": ecosystem,
@@ -3602,7 +4523,10 @@ def evaluate(event: dict, root) -> dict | None:
                 if existing is not None:
                     file(existing)
                     continue
-                todo.append(pg_manifest.as_request(name, version, command, ecosystem))
+                request = pg_manifest.as_request(name, version, command, ecosystem)
+                if source == "packageManager":
+                    request = dataclasses.replace(request, operation="manager-pin")
+                todo.append(request)
             for report in review(todo, uv_project=scope.kind == "uv-project"):
                 file(report)
     except store.StoreError as exc:
@@ -3646,6 +4570,8 @@ def evaluate(event: dict, root) -> dict | None:
     reason = "Package Guard: all direct external packages are exact vetted versions."
     if audit_notes:
         reason += " " + " | ".join(audit_notes) + "."
+    if pm_notes:
+        reason += " " + " | ".join(pm_notes) + "."
     if notes:
         reason += " Transitive check: " + " | ".join(notes) + "."
     # An allow's reason reaches the debug log, not the model.
@@ -3673,11 +4599,23 @@ def evaluate(event: dict, root) -> dict | None:
     return decision
 
 
+# Set while acquisition runs in warn mode: the user asked not to be blocked,
+# and a slow network is one of the ways a guard is broken.
+_WARN_RUNNING = False
+
+
 def _watchdog(_signum, _frame):
-    sys.stdout.write(json.dumps(_decision(
-        "deny",
-        "PACKAGE_GUARD_REVIEW_BUDGET: Package Guard ran out of time before deciding. "
-        "Nothing was installed. Re-run the same command; reviews already opened are reused.")))
+    if _WARN_RUNNING:
+        reply = _join_output(
+            None, "Package Guard (warn mode) ran out of time before deciding; not blocking.",
+            "Package Guard is in warn mode and ran out of time before deciding, so it did not "
+            "block this command; it goes to the user's normal permission prompt.")
+    else:
+        reply = _decision(
+            "deny",
+            "PACKAGE_GUARD_REVIEW_BUDGET: Package Guard ran out of time before deciding. "
+            "Nothing was installed. Re-run the same command; reviews already opened are reused.")
+    sys.stdout.write(json.dumps(reply))
     sys.stdout.flush()
     os._exit(0)
 
@@ -3713,6 +4651,17 @@ def _with_migration_note(decision: dict, root) -> dict:
     return decision
 
 
+def _way_out() -> str:
+    """The guard still fails closed; this names the supported way past a
+    broken one."""
+    try:
+        command = store.human_command(store.project_root(__file__), "mode", 'warn --reason "<why>"')
+    except Exception:  # noqa: BLE001 - the message must print whatever broke
+        command = 'sh .claude/hooks/package_guard/pg mode warn --reason "<why>"'
+    return ("If this keeps happening, the user can run, in their own terminal, from the "
+            f"project folder:\n  {command}\nand report the bug.")
+
+
 def main() -> int:
     _arm_watchdog()
     try:
@@ -3726,7 +4675,8 @@ def main() -> int:
         if decision is not None:
             decision = _with_migration_note(decision, root)
     except Exception as exc:  # fail closed on any internal error
-        print(f"Package Guard: internal failure ({exc.__class__.__name__}: {exc}); failing closed.", file=sys.stderr)
+        print(f"Package Guard: internal failure ({exc.__class__.__name__}: {exc}); failing closed.\n"
+              f"{_way_out()}", file=sys.stderr)
         return 2
     if decision is not None:
         json.dump(decision, sys.stdout)

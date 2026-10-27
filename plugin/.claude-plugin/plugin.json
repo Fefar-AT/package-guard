@@ -1,6 +1,6 @@
 {
   "name": "package-guard",
-  "version": "1.9.1",
+  "version": "1.11.0",
   "description": "Gates every package install behind human approval.",
   "author": {
     "name": "Fefar-AT"

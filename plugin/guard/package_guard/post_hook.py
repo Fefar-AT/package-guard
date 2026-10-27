@@ -51,6 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # because it is not the gate -- see the module docstring.
 try:
     import disk_guard  # noqa: E402
+    import mode as pg_mode  # noqa: E402
     import store  # noqa: E402
     import transcript  # noqa: E402
 except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
@@ -81,6 +82,17 @@ def evaluate(event: dict, root) -> dict | None:
     if event.get("tool_name") != "Bash":
         return None
     command = ((event.get("tool_input") or {}).get("command")) or None
+    current = pg_mode.effective(root).mode
+    # A project's `off` can arrive with the command that just ran (a pull), so
+    # this hook follows the mode too: snapshot while down, catch up once back.
+    try:
+        caught = disk_guard.follow_mode(root, current, event.get("session_id"))
+    except Exception as exc:  # noqa: BLE001 - fails open, see the module docstring
+        print(f"Package Guard post hook: could not follow the mode "
+              f"({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        caught = []
+    if caught:
+        pg_mode.append_log(root, {"event": "caught-up", "count": len(caught)})
     result = disk_guard.reconcile(
         root,
         project_root=root,
@@ -89,10 +101,14 @@ def evaluate(event: dict, root) -> dict | None:
         command=command,
         session_started=transcript.session_started(event.get("transcript_path")),
     )
-    if not result.new_findings:
+    if not result.new_findings and not caught:
         # Findings that were already open are the PreToolUse gate's job and the
         # Stop hook's. Re-reporting them after every command is noise, and an
         # alert nobody reads is not an alert.
+        return None
+    # Recorded in every mode, so whatever lands while the guard is down is an
+    # open finding once it is back on. Only the reporting follows the mode.
+    if current == "off":
         return None
     count = len(result.new_findings)
     header = (
@@ -102,15 +118,25 @@ def evaluate(event: dict, root) -> dict | None:
         "project declares and what you approved — not by reading the command, which is "
         "why wrapping or indirection does not hide it. The command has already run; this "
         "cannot be undone by the guard."
+    ) if count else ""
+    if caught:
+        header = (header + " " if header else "") + (
+            f"Package Guard is enforcing again, and {len(caught)} package(s) installed while it "
+            "was down (warn or off) are accounted for by no manifest or lockfile.")
+    body = disk_guard.render_block(
+        list(result.new_findings) + list(caught),
+        root,
+        header=header,
+        declined_check=lambda identity: store.is_declined(root, identity),
     )
-    return _decision(
-        disk_guard.render_block(
-            result.new_findings,
-            root,
-            header=header,
-            declined_check=lambda identity: store.is_declined(root, identity),
-        )
-    )
+    if current == "warn":
+        return {"hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": "Package Guard is in warn mode, so this is not a block; tell "
+                                 "the user. It stays an open finding for when the guard is "
+                                 "back on.\n" + body,
+        }}
+    return _decision(body)
 
 
 def main() -> int:

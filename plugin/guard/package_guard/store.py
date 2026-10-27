@@ -108,6 +108,20 @@ def cli_path(root) -> str:
     return str(Path(root) / CLI_SUFFIX)
 
 
+# The command a PERSON types in their own terminal (`mode warn`, `mode off`).
+# Short and relative so it survives being copied out of a narrow terminal in
+# one piece; run from the project folder. Claude never runs it: the hook
+# refuses the launcher (hook._LAUNCHER_HINT) and Claude uses cli_command.
+HUMAN_CLI = "sh .claude/hooks/package_guard/pg"
+
+
+def human_command(root, subcommand: str, args: str) -> str:
+    """A plugin has no project-local launcher, so it keeps the full form."""
+    if plugin_mode():
+        return cli_command(root, subcommand, args)
+    return f"{HUMAN_CLI} {subcommand} {args}".rstrip()
+
+
 def cli_command(root, subcommand: str, ids: str) -> str:
     base = "uv run --no-project --no-config --no-python-downloads "
     if plugin_mode():
@@ -538,6 +552,37 @@ def disk_state_path(root: Path) -> Path:
 
 def disk_findings_path(root: Path) -> Path:
     return guard_dir(root) / ".disk-findings.json"
+
+
+# .mode-snapshot.json: what was installed when the guard went down (warn or
+# off), kept until it enforces again (disk_guard.catch_up). Its presence is the
+# marker that a catch-up is due.
+def mode_snapshot_path(root: Path) -> Path:
+    return guard_dir(root) / ".mode-snapshot.json"
+
+
+def save_mode_snapshot(root: Path, entries, taken_at: str) -> None:
+    _atomic_write_json(mode_snapshot_path(root), {
+        "schema_version": SCHEMA_VERSION, "taken_at": taken_at, "entries": sorted(entries)})
+
+
+def load_mode_snapshot(root: Path):
+    """The snapshot's entry keys; None when it is absent or unreadable."""
+    try:
+        data = json.loads(mode_snapshot_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    entries = data.get("entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list) or not all(isinstance(e, str) for e in entries):
+        return None
+    return set(entries)
+
+
+def clear_mode_snapshot(root: Path) -> None:
+    try:
+        mode_snapshot_path(root).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def new_finding_id() -> str:

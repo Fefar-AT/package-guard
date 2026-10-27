@@ -2554,8 +2554,24 @@ def audit_vetted(entries):
 
 def _retry_command(request, version: str) -> str:
     name = request.display_name
+    if request.operation == "manager-pin":
+        # The project's own pinned package manager (pnpm, Yarn): the command that needed it
+        # is the one to retry. `npm install pnpm@<version>` would install the manager into
+        # the project.
+        return request.original_command
     if request.ecosystem == "npm":
         spec = f"{name}@{version}"
+        # Retry with the manager that was run: `npm install` in a pnpm, Bun or Yarn
+        # project writes a second lock and installs a tree nobody reviewed.
+        tool = request.manager.split()[0]
+        if request.manager == "pnpm create":
+            return request.original_command  # names the initializer, not the package
+        if tool in ("pnpm", "pnpx", "pnx"):
+            return f"pnpm dlx {spec}" if request.operation == "exec" else f"pnpm add {spec} --ignore-scripts"
+        if tool in ("bun", "bunx"):
+            return f"bunx {spec}" if request.operation == "exec" else f"bun add {spec} --ignore-scripts"
+        if tool == "yarn":
+            return f"yarn dlx {spec}" if request.operation == "exec" else f"yarn add {spec} --mode=skip-build"
         return f"npx {spec}" if request.operation == "exec" else f"npm install {spec}"
     if request.operation == "tool":
         return f"uvx {name}@{version}"

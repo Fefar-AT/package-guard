@@ -28,7 +28,7 @@ What one run does, in the order the README's manual procedure lists:
   3. appends the `## Packages` section to CLAUDE.md if it is absent;
   4. seeds .claude/package-guard/ with empty vetted.json / declined.json and
      the reports/.gitignore -- existing state is never touched;
-  5. adds the four machine-local ignore lines to .gitignore;
+  5. adds the machine-local ignore lines (guard state, the hook's __pycache__) to .gitignore;
   6. adds .gitattributes lines that keep the guard's files LF on a Windows
      checkout -- a CRLF run.sh makes every hook exit 2, which blocks every
      command and traps the Stop hook (Docker Sandboxes on a Windows host
@@ -139,7 +139,7 @@ LEGACY_SANDBOX_DOMAINS = (
 CLI_PREFIX = "uv run --no-project --no-config --no-python-downloads"
 SANDBOX_EXCLUDED = tuple(
     f"{CLI_PREFIX} *.claude/hooks/package_guard/cli.py {verb} *"
-    for verb in ("approve", "decline", "undecline", "revoke", "reconcile", "audit")
+    for verb in ("approve", "decline", "undecline", "revoke", "reconcile", "audit", "mode")
 )
 SANDBOX_LISTS = (
     (("excludedCommands",), SANDBOX_EXCLUDED),
@@ -157,7 +157,24 @@ GITIGNORE_LINES = (
     ".claude/package-guard/.disk-findings.json",
     ".claude/package-guard/.transitive-state.json",
     ".claude/package-guard/.environments.json",
+    ".claude/package-guard/.mode.local.json",
+    ".claude/package-guard/.mode-log.jsonl",
+    ".claude/package-guard/.mode-seen.json",
+    ".claude/package-guard/.mode-snapshot.json",
+    ".claude/hooks/package_guard/__pycache__/",
 )
+# Machine-local mode files; --uninstall removes them and keeps the committed
+# mode.json, which is the team's decision.
+MODE_LOCAL_FILES = (".mode.local.json", ".mode-log.jsonl", ".mode-seen.json",
+                    ".mode-snapshot.json")
+
+# The clause v1.10.0 retired ("never use pnpm/yarn/bun") and its replacement;
+# re-running the installer swaps one for the other in an existing section.
+OLD_MANAGER_CLAUSE = "use `pnpm`/`yarn`/`bun`,"
+NEW_MANAGER_CLAUSE = (
+    "use a package manager other than `npm`/`npx`, `pip`, `uv`, `pnpm`, `bun` or "
+    "Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack`, Yarn Classic and "
+    "Yarn Plug'n'Play are refused),")
 
 # Plugin projects: the guard's code lives in the plugin, so the section names no
 # file-install hook path. The plugin's own hook enforces the file locks.
@@ -174,7 +191,9 @@ one is reconciled against disk afterwards. Before adding, syncing, or running an
 dependency-touching command, invoke the `package-guard` skill and follow it.
 
 Never: hand-edit `package.json` / `pyproject.toml` / lockfiles to add a
-dependency, use `pnpm`/`yarn`/`bun`, wrap installs in `sh -c`/`eval`, use any
+dependency, use a package manager other than `npm`/`npx`, `pip`, `uv`, `pnpm`,
+`bun` or Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack`, Yarn Classic
+and Yarn Plug'n'Play are refused), wrap installs in `sh -c`/`eval`, use any
 other installer or wrapper to get packages onto disk, edit the project's
 Package Guard state directory, or disable or uninstall the `package-guard`
 plugin. Package Guard is the only gate in this project; if a Bash denial does
@@ -440,6 +459,15 @@ def _append_claude_md(target: Path, plugin: bool = False) -> list[str]:
                 tail = "" if end < 0 else "\n" + text[end + 1:]
                 path.write_text(text[:start] + section + tail, encoding="utf-8")
                 return [f"updated  CLAUDE.md {CLAUDE_MD_HEADING} (plugin wording)"]
+            # Upgrade: swap only the retired manager clause, so a section the
+            # project has edited keeps its own wording.
+            if OLD_MANAGER_CLAUSE in _section_of(text):
+                start = text.find(CLAUDE_MD_HEADING)
+                end = text.find("\n## ", start + len(CLAUDE_MD_HEADING))
+                end = len(text) if end < 0 else end
+                body = text[start:end].replace(OLD_MANAGER_CLAUSE, NEW_MANAGER_CLAUSE)
+                path.write_text(text[:start] + body + text[end:], encoding="utf-8")
+                return [f"updated  CLAUDE.md {CLAUDE_MD_HEADING} (package manager wording)"]
             return []
         joiner = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
         path.write_text(text + joiner + section, encoding="utf-8")
@@ -555,6 +583,7 @@ def check_plugin(target: Path) -> list[tuple[bool, str]]:
     gitignore = target / ".gitignore"
     present = set(gitignore.read_text(encoding="utf-8").splitlines()) if gitignore.exists() else set()
     rows.append((all(l in present for l in GITIGNORE_LINES), ".gitignore lists the local state files"))
+    rows.append(mode_row(target))
     return rows
 
 
@@ -647,7 +676,29 @@ def check(target: Path, sandbox: bool = False) -> list[tuple[bool, str]]:
     runner = target / HOOK_DIR / "run.sh"
     rows.append((not runner.is_file() or b"\r" not in runner.read_bytes(),
                  f"{HOOK_DIR}/run.sh has LF line endings (re-run install to repair)"))
+    rows.append(mode_row(target))
     return rows
+
+
+def mode_row(target: Path) -> tuple[bool, str]:
+    """The mode in force. warn and off are the user's choice, so they pass;
+    a mode file the guard cannot read fails, though the guard reads it as
+    enforce."""
+    # A built plugin keeps the guard in guard/package_guard beside install.py.
+    guard = SOURCE / HOOK_DIR
+    if not guard.is_dir():
+        guard = SOURCE / "guard" / "package_guard"
+    try:
+        sys.path.insert(0, str(guard))
+        import mode as pg_mode
+        current = pg_mode.effective(target)
+    except Exception as exc:  # noqa: BLE001 - a check row, never a crash
+        return False, f"mode could not be read ({exc})"
+    finally:
+        sys.path.pop(0)
+    if current.problem:
+        return False, f"mode: enforce (fail closed: {current.problem})"
+    return True, f"mode: {pg_mode.describe(current)}"
 
 
 def _remove_file_install(target: Path) -> list[str]:
@@ -699,13 +750,13 @@ def uninstall(target: Path) -> list[str]:
     state = target / STATE_DIR
     if state.is_dir():
         for name in (".stop-state.json", ".disk-state.json", ".disk-findings.json",
-                     ".transitive-state.json", ".environments.json"):
+                     ".transitive-state.json", ".environments.json") + MODE_LOCAL_FILES:
             if (state / name).exists():
                 (state / name).unlink()
         reports = state / "reports"
         if reports.is_dir():
             shutil.rmtree(reports)
-        changed.append(f"cleared  {STATE_DIR} (kept vetted.json, declined.json)")
+        changed.append(f"cleared  {STATE_DIR} (kept vetted.json, declined.json, mode.json)")
 
     claude_md = target / "CLAUDE.md"
     if claude_md.exists():

@@ -15,6 +15,8 @@ import re
 import shlex
 from dataclasses import dataclass
 
+import pm_config
+import protocols
 import shell
 import verbs
 
@@ -95,7 +97,7 @@ class PackageRequest:
 @dataclass(frozen=True)
 class ManifestScope:
     """A manifest this command would install in full, beyond any named specs."""
-    kind: str               # npm | requirements | uv-project
+    kind: str               # npm | pnpm | bun | yarn | requirements | uv-project | build-requires
     path: str | None = None  # explicit file (requirements); None means "in cwd"
     # uv-project only. `locked`: the installer is told to install exactly the
     # lock (`--locked` / `--frozen`) rather than re-resolve pyproject.toml
@@ -111,6 +113,80 @@ class ManifestScope:
 
 
 @dataclass(frozen=True)
+class RunScope:
+    """A pnpm, Bun or Yarn command that RUNS project code and acquires nothing by
+    itself (`pnpm run`, `yarn run`, `bun run`, `bun file.ts`, `pnpm exec`).
+    The hook still reads the manager's configuration (a pnpmfile, a Yarn plugin, a
+    Bun preload run on every command) and checks the state the run needs.
+    `autoinstall` (Bun only): Bun may install the packages it cannot find before
+    running, unless `--no-install` is given."""
+    kind: str               # pnpm | bun | yarn
+    # run | exec | test | start | restart | stop | file | x   run project code
+    # remove                                                  rewrites the manifest and lock
+    # print                                                   a bare `--version` / `--help`: a
+    #   `manager` run whose missing Yarn pin is not a reason to refuse (nothing is read or run
+    #   of the project; a pin and `yarnPath` / plugins are still checked)
+    # manager                                                 only runs the manager's own
+    #   binary (a read-only verb, `config get`, `dlx`, a resolve-only install): the pinned
+    #   release is downloaded and the manager's configuration is read, nothing else is
+    #   checked of the project (v1.10.0 hardening, A2)
+    verb: str
+    autoinstall: bool = False
+    # `remove` only: False when the command turns lifecycle scripts off (`--ignore-scripts`,
+    # Yarn's `--mode=skip-build`). Anything else leaves the root project's own install
+    # scripts to run (A4).
+    scripts: bool = True
+    # `remove` only: the package names it deletes (they may be the very ones the manifest and
+    # the lock disagree about, which the drift check must not hold against the command).
+    names: tuple = ()
+
+
+# The package managers whose manifest is package.json. pnpm, Bun and Yarn each
+# get their own scope kind, not kind "npm": npm's lock reader returns nothing
+# when there is no package-lock.json, which would read as "nothing to check".
+PM_KINDS = ("pnpm", "bun", "yarn")
+NPM_FAMILY_KINDS = ("npm",) + PM_KINDS
+# The `PackageRequest.manager` words (first word) of pnpm, Bun and Yarn.
+PM_MANAGERS = ("pnpm", "pnpx", "pnx", "bun", "bunx", "yarn", "yarnpkg")
+
+# THE SAFETY SWITCH. The hook reads this and, while it is False, denies every
+# command that reaches pnpm, Bun or Yarn as an acquisition (hook.py), and the
+# handlers below refuse the inert-by-flag forms (`remove`, resolve-only,
+# `bunx --no-install`) rather than return "ignore". Nothing reads these managers'
+# manifests or locks yet; P6 sets this to True once every stage does.
+PNPM_BUN_YARN_ENABLED = True
+
+
+def scope_ecosystem(kind: str) -> str:
+    """The registry ecosystem a ManifestScope kind installs from: npm for
+    npm, pnpm, bun and yarn; pypi for the Python kinds."""
+    return "npm" if kind in NPM_FAMILY_KINDS else "pypi"
+
+
+def pm_kinds(result) -> dict:
+    """{kind: scoped} for every pnpm, Bun or Yarn the parse reaches: `scoped` is
+    True when it installs a manifest in the project, False for the one-shot
+    runners (`pnpm dlx`, `bunx`, `yarn dlx`), which have no project tree."""
+    kinds = {m.kind: True for m in result.manifests if m.kind in PM_KINDS}
+    kinds.update({r.kind: True for r in result.runs if r.verb not in ("manager", "print")})
+    for run in result.runs:
+        kinds.setdefault(run.kind, False)
+    for request in result.requests:
+        word = request.manager.split()[0] if request.manager else ""
+        if word in PM_MANAGERS:
+            kinds.setdefault(PM_NAMES[word], False)
+    return kinds
+
+
+def uses_pnpm_bun_yarn(result) -> bool:
+    """True when the parse reaches pnpm, Bun or Yarn: a scope of their kind,
+    or a request they make (`pnpm dlx`, `bunx`, `yarn dlx`)."""
+    return (any(m.kind in PM_KINDS for m in result.manifests)
+            or bool(result.runs)
+            or any(r.manager.split()[0] in PM_MANAGERS for r in result.requests if r.manager))
+
+
+@dataclass(frozen=True)
 class ParseResult:
     kind: str               # ignore | package | unsupported
     requests: tuple = ()
@@ -122,19 +198,63 @@ class ParseResult:
     # installs package.json; `pip install -r f` installs f; `uv sync` installs
     # the locked project.
     manifests: tuple = ()
+    # Kinds of a command that only resolves and writes a lock (kind "ignore",
+    # nothing acquired). The hook still reads their project: npm's lock-only
+    # forms are refused beside another manager's lock, and pnpm, Bun and Yarn
+    # read configuration that runs code (a `yarnPath`, a `.pnpmfile.cjs`).
+    resolve_only: tuple = ()
     # Python environments outside the project tree this command installs into:
     # a literal `UV_PROJECT_ENVIRONMENT`, or a literal `VIRTUAL_ENV` that
     # `uv ... --active` or `uv pip` uses. The hook records them so
     # reconciliation reads them, as it reads `<project>/.venv`.
     environments: tuple = ()
+    # pnpm, Bun or Yarn commands that run project code (`RunScope`). Nothing is
+    # acquired by them, so the kind stays "ignore" when they are all there is;
+    # the hook checks each one (`hook._run_denial`).
+    runs: tuple = ()
 
     @property
     def manifest_scope(self) -> bool:
         return bool(self.manifests)
 
 
+def _inert(result) -> bool:
+    """Nothing in `result` acquires, runs a project script or needs a hook
+    check of its own. A wrapper (`sh -c`, `env -S`, `$(...)`) that hides anything
+    else from the hook is refused: the hook reads the event's command, not what
+    the wrapper later runs."""
+    return result.kind == "ignore" and not result.runs and not result.resolve_only
+
+
 def _ignore() -> ParseResult:
     return ParseResult(kind="ignore")
+
+
+def _manager_run(head, result, verb="manager"):
+    """pnpm and Yarn run through Corepack: the release `package.json` pins is DOWNLOADED
+    and run, whatever the verb (v1.10.0 hardening, A2). Every segment that executes one
+    carries a `manager` RunScope so the hook checks that pin and the manager's
+    configuration, including the read-only verbs (`list`, `why`, `config get`), `dlx`,
+    `remove`, a resolve-only install and a bare `--version` / `--help` print (pnpm and
+    Yarn switch to the pinned release / run `yarnPath` before they print; v1.10.0
+    hardening). `result` None means nothing was found to run."""
+    kind = _PM_NAMES.get(head)
+    if kind not in ("pnpm", "yarn"):
+        return result
+    if result is None:
+        result = ParseResult(kind="ignore")
+    if (any(m.kind == kind for m in result.manifests)
+            or any(r.kind == kind for r in result.runs)):
+        return result  # an install reviews the pin; a runner or `remove` checks it
+    if not PNPM_BUN_YARN_ENABLED:
+        _pm_disabled(f"'{head}'")
+    return dataclasses.replace(result, runs=result.runs + (RunScope(kind, verb),))
+
+
+def _resolve_only(kind) -> ParseResult:
+    """Nothing is acquired (a lock is resolved and written), but the manager
+    still reads the project's configuration, so the hook checks it."""
+    return ParseResult(kind="ignore", resolve_only=(kind,))
 
 
 def _package(requests, manifests=()) -> ParseResult:
@@ -220,6 +340,10 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
     unreadable = None
     symlink = False
     refusals = []   # ("written" | "unreadable", what) before a package segment
+    # Per command segment, (runs Bun with auto-install, only reads): A5. Bun installs what it
+    # cannot find when no node_modules exists at run time, and a segment of the same line
+    # that removes or moves node_modules makes that so after the hook looked.
+    command_kinds = []
     for segment in segments:
         sub_written, sub_symlink = _check_substitutions(segment, depth)
         loop = _loop_variable(segment.words)
@@ -242,9 +366,15 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
         else:
             result = _parse_segment(words, assignments, inherited, command,
                                     _stdin_text(segment, command))
+            if result is not _CD_MARKER:
+                runner = result is not None and any(r.autoinstall for r in result.runs)
+                # The runner itself only has to be free of substitutions, which run first.
+                command_kinds.append((runner, not segment.substitutions if runner
+                                      else _only_reads(segment, plain)))
             if result is _CD_MARKER:
                 changed_directory = True
-            elif result is not None and result.kind != "ignore":
+            elif result is not None and (result.kind != "ignore" or result.resolve_only
+                                         or result.runs):
                 if written:
                     refusals.append(("written", written))
                 if unreadable:
@@ -265,6 +395,10 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
     if symlink and results:
         raise _Unsupported(_SYMLINK_MESSAGE, code="same-command-write")
 
+    runners = sum(1 for runner, _reads in command_kinds if runner)
+    if runners and (runners > 1 or any(not reads for _runner, reads in command_kinds)):
+        raise _Unsupported(_AUTOINSTALL_MESSAGE, code="same-command-write")
+
     if refusals:
         kind, what = refusals[0]
         if kind == "written":
@@ -272,6 +406,33 @@ def _parse(command: str, depth: int = 0) -> ParseResult:
         raise _Unsupported(_UNREADABLE_MESSAGE.format(what=what), code="unreadable-environment")
 
     return _merge(results)
+
+
+_AUTOINSTALL_MESSAGE = (
+    "a Bun command that may install packages at run time (`bun run`, `bun test`, `bun <file>`; "
+    "Bun installs what it cannot find when there is no node_modules) shares this line with "
+    "another command that could remove or move node_modules, write files or run code first, "
+    "after Package Guard looked at the disk. Run the Bun command on its own, as its own "
+    "command (`--no-install`, before the script or file name, makes it run only what is "
+    "already installed)"
+)
+
+
+def _only_reads(segment, plain) -> bool:
+    """True for a segment that only reads and prints: a head the table lists as read-only
+    (`verbs.READ_ONLY_HEADS`, exact case), no command substitution, and no redirection
+    that writes a file. `rm`, `mv`, `git` and every other head is not."""
+    if not plain or segment.substitutions:
+        return False
+    if _executable(plain[0].text, fold=False) not in verbs.READ_ONLY_HEADS:
+        return False
+    for operator, target in segment.redirects:
+        if operator not in shell.WRITE_REDIRECTS:
+            continue
+        if target.text == "/dev/null" or (operator == ">&" and (target.text.isdigit() or target.text == "-")):
+            continue
+        return False
+    return True
 
 
 # Segments that open a compound command and run nothing themselves.
@@ -555,7 +716,9 @@ def _written_file(segment, words, known=None):
         if _guarded_path(path):
             return path
     for code in _inline_code(head, args, segment):
-        found = verbs.INSTALLER_FILE_IN_TEXT.search(code) or _GUARD_DIR_IN_TEXT.search(code)
+        found = (verbs.INSTALLER_FILE_IN_TEXT.search(code)
+                 or (verbs.INSTALLER_DIR_IN_TEXT and verbs.INSTALLER_DIR_IN_TEXT.search(code))
+                 or _GUARD_DIR_IN_TEXT.search(code))
         if found:
             return found.group(0).strip(" \t\n'\"/=(")
     return None
@@ -576,7 +739,7 @@ def _check_substitutions(segment, depth=0):
         raise _TooDeep()
     written, symlink = None, False
     for text in segment.substitutions:
-        if _parse(text, depth + 1).kind != "ignore":
+        if not _inert(_parse(text, depth + 1)):
             raise _Unsupported(_SUBSTITUTION_MESSAGE, code="wrapper")
         inner, ok = shell.segment(text)
         for part in inner if ok else ():
@@ -733,37 +896,287 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
     if head in _RECURSIVE_WRAPPERS:
         return _parse_wrapper_payload(head, words, command, stdin)
 
+    # `python setup.py develop` is `pip install -e .` with the app's dependencies (setuptools 80+), and
+    # `install` / `easy_install` / `bdist_egg` fetch them too: not a command the table above reads.
+    if head == "setup.py":
+        _check_setup_py(words[1:])
+    elif verbs.is_interpreter(head):
+        script = _python_script(words)
+        if script is not None and _executable(script[0].text) == "setup.py":
+            _check_setup_py(script[1])
+
     installer = verbs.lookup(head)
 
-    # `python -m pip` becomes the pip installer; nothing else about python does.
+    # `python -m pip` becomes the pip installer; nothing else about python does,
+    # except that a module it cannot tell from an installer is refused.
     if installer is None and head == "python":
-        texts = [w.text for w in words]
-        if texts[1:3] == ["-m", "pip"]:
-            installer = verbs.lookup("pip")
-            words = [head_word] + words[3:]
-        elif texts[1:3] == ["-m", "uv"]:
-            installer = verbs.lookup("uv")
-            words = [head_word] + words[3:]
+        module = _python_module(words)
+        if module is not None:
+            name, rest = module
+            if not name:
+                return None
+            if name in ("pip", "pip.__main__"):
+                installer = verbs.lookup("pip")
+                words = [head_word] + rest
+            elif name in ("uv", "uv.__main__"):
+                installer = verbs.lookup("uv")
+                words = [head_word] + rest
+            else:
+                _refuse_module(name, rest)
 
     if installer is None:
+        if head == "bench":
+            _check_bench(words)
+        if head == "virtualenv":
+            _check_virtualenv(words[1:])
+        if head == "easy_install":
+            raise _Unsupported(_EASY_INSTALL_MESSAGE, code="foreign-manager")
         if head in verbs.FOREIGN:
             return _parse_foreign(head, words)
         return _check_unknown_head(head_word, head, words, inherited + assignments, command, stdin)
 
+    if _PM_NAMES.get(head) == "pnpm":
+        # `--config.<key>=<value>` sets any pnpm setting, the registry and the Node
+        # runtime included, and pnpm reads it wherever it stands in the arguments.
+        for word in words[1:]:
+            if word.text.startswith("--config."):
+                raise _Unsupported(f"{word.text.partition('=')[0]!r} sets an installer setting "
+                                   "and is not supported", code="alternate-source")
+    _check_python_env(inherited + assignments, installer)
     _check_env(inherited + assignments, installer, head)
     result = _dispatch(installer, head, words, command)
     if result is not None and result.kind == "package" and any(
             r.ecosystem == "npm" and r.name.casefold() == "corepack" for r in result.requests):
         # `npx corepack ...` / `npm exec corepack ...` fetch corepack itself.
         raise _Unsupported(verbs.FOREIGN["corepack"], code="foreign-manager")
+    if result is not None and result.kind == "package":
+        runs_manager = [r for r in result.requests
+                        if r.operation == "exec" and r.name.casefold() in _RUN_MANAGER_PACKAGES]
+        if runs_manager:
+            # `npx pnpm add evil`, `bunx yarn ...`: the manager is the package
+            # being run and the rest of the line is its command, which is not read.
+            raise _Unsupported(
+                f"{runs_manager[0].display_name!r} is a package manager, and what follows it "
+                "is a command Package Guard does not read past; run it directly, as its own "
+                "command", code="wrapper")
     if _scripts_off(assignments, inherited) and result is not None and result.manifests:
         result = dataclasses.replace(result, manifests=tuple(
-            dataclasses.replace(m, scripts=False) if m.kind == "npm" else m
+            dataclasses.replace(m, scripts=False) if m.kind in _ENV_SCRIPTS_OFF_KINDS else m
             for m in result.manifests))
     if installer.get("env") == "uv" and result is not None and result.kind == "package":
         result = _uv_env_effects(result, assignments, inherited, words)
+    if result is not None:
+        result = _manager_run(head, result)
     return result
 
+
+# CPython's option parsing (Python/getopt.c, `bBc:dEhiIJm:OPqRsStuvVW:xX:?`, and Python 2's
+# `Q:`): short flags combine (`-Im pip`), `-m` takes the rest of its word or else the next
+# word (`-mpip`), `-W`/`-X` take a value the same way, so `-W -m pip` runs no module, and
+# `--check-hash-based-pycs` is the one long option with a value (a separate word; `=` is an
+# error). `-c`, `-`, `--` and the first non-option word end the options; only `-m` names a module.
+_PYTHON_VALUE_FLAGS = "WXQ"
+_PYTHON_VALUE_LONG = {"--check-hash-based-pycs"}
+_PYTHON_PRINT_LONG = {"--help", "--help-env", "--help-xoptions", "--help-all", "--version"}
+
+
+def _python_module(words):
+    """(module, words after it) of the `-m <module>` an interpreter command line
+    runs, the module name case-folded; None when it runs no module."""
+    i = 1
+    prints = False  # `-V`, `-h`: the interpreter prints and exits, whatever follows
+    while i < len(words):
+        text = words[i].text
+        if text in ("-", "--") or not text.startswith("-"):
+            return None
+        if text.startswith("--"):
+            prints = prints or text in _PYTHON_PRINT_LONG
+            i += 2 if text in _PYTHON_VALUE_LONG else 1
+            continue
+        for j, flag in enumerate(text[1:], 1):
+            if flag == "c":
+                return None
+            if flag in "hV?":
+                prints = True
+            if flag == "m":
+                if prints:
+                    return "", []  # prints and exits: runs nothing
+                attached, value = text[j + 1:], words[i]
+                if not attached:
+                    i += 1
+                    if i >= len(words):
+                        return None
+                    attached, value = words[i].text, words[i]
+                # a name built at run time (`-m "$M"`) is marked with a `$`
+                name = ("$" if value.dynamic else "") + attached.casefold()
+                return name, words[i + 1:]
+            if flag in _PYTHON_VALUE_FLAGS:
+                if j == len(text) - 1:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
+def _python_script(words):
+    """(script word, the words after it) of the file an interpreter command line runs; None when it
+    runs a module (`-m`), a string (`-c`) or standard input. The options are read as in
+    `_python_module`."""
+    i = 1
+    while i < len(words):
+        text = words[i].text
+        if text == "--":
+            return (words[i + 1], list(words[i + 2:])) if i + 1 < len(words) else None
+        if text == "-":
+            return None
+        if not text.startswith("-"):
+            return words[i], list(words[i + 1:])
+        if text.startswith("--"):
+            i += 2 if text in _PYTHON_VALUE_LONG else 1
+            continue
+        for j, flag in enumerate(text[1:], 1):
+            if flag in "cm":
+                return None
+            if flag in _PYTHON_VALUE_FLAGS:
+                if j == len(text) - 1:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
+# What `python setup.py <command>` does, by command (setuptools and distutils): these install the
+# project (`develop` runs `python -m pip install -e .` since setuptools 80, dependencies and
+# `--index-url` included), fetch `install_requires` / `tests_require` through easy_install, or
+# upload. Anything named `install*` is one. The rest build or inspect in place.
+_SETUP_PY_INSTALL = frozenset({"develop", "easy_install", "bdist_egg", "test", "pytest", "upload",
+                               "upload_docs", "register", "bdist_wininst", "bdist_msi", "bdist_rpm"})
+_SETUP_PY_BUILD = frozenset({"sdist", "build", "build_py", "build_ext", "build_clib", "build_scripts",
+                             "bdist", "bdist_wheel", "bdist_dumb", "check", "clean", "egg_info",
+                             "dist_info", "editable_wheel"})
+_SETUP_PY_SOURCE_OPTIONS = ("--index-url", "--find-links", "--allow-hosts", "--index")
+_SETUP_PY_MESSAGE = (
+    "`setup.py {command}` installs this project and its dependencies, or fetches them, out of the "
+    "hook's sight (setuptools 80 and later run `develop` as `pip install -e .`, with an `--index-url` "
+    "of your choosing). Use the route Package Guard reviews: `bench setup requirements` for a Frappe "
+    "app, or `pip install -e .` / `uv pip install -e .` elsewhere, which review every dependency. "
+    "Commands that only build or read the project (`setup.py sdist`, `--version`) are not refused")
+
+
+def _check_setup_py(args):
+    """Refuse a `setup.py` command that installs or fetches. `args` are the words after the file."""
+    texts = [a.text for a in args]
+    commands = [t for t in texts if not t.startswith("-")]
+    for text in texts:
+        if text.startswith(_SETUP_PY_SOURCE_OPTIONS) or text == "-i" or text.startswith("-i="):
+            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=" ".join(commands) or text)
+                               + f"; `{text.split('=')[0]}` names where packages come from",
+                               code="unsupported-form")
+    for word in args:
+        text = word.text
+        if word.dynamic or "$" in text:
+            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text) + "; the command is only known "
+                               "when it runs", code="unsupported-form")
+        if text.startswith("-"):
+            continue
+        if text.startswith("install") or text in _SETUP_PY_INSTALL:
+            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text), code="unsupported-form")
+        if text not in _SETUP_PY_BUILD and "-f" in texts:
+            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text)
+                               + "; `-f` names a directory to find packages in", code="unsupported-form")
+
+
+# Modules that install, or run an installer, and that are not read as `pip` or `uv`
+# themselves: `ensurepip`, `setuptools`, `easy_install`, and any dotted submodule of
+# those or of `pip` / `uv` (`pip._internal.cli.main`, `uv.__main__`). Matched on the whole
+# dotted name's first part, so `uvicorn`, `pipdeptree` and `setuptools_scm` are other
+# modules. A module name built at run time cannot be told from them and is refused too.
+_INSTALLER_MODULES = frozenset({"pip", "uv", "ensurepip", "setuptools", "easy_install"})
+
+
+def _installer_module(name):
+    return name.split(".")[0] in _INSTALLER_MODULES or "$" in name
+
+
+_MODULE_RUNNERS = frozenset(m.casefold() for m in verbs.MODULE_RUNNERS)
+
+
+def _refuse_module(name, rest):
+    """Refuse `python -m <name> ...` when it can install: an installer module, a
+    module that runs another by name (`runpy`, `pdb`, ...) with an installer or an
+    unreadable target, `venv --upgrade-deps`, `virtualenv --download`."""
+    if _installer_module(name):
+        raise _Unsupported(_MODULE_MESSAGE.format(module=name.lstrip("$")), code="wrapper")
+    if name in _MODULE_RUNNERS:
+        # The target is a word after the options; any word naming an installer module,
+        # or built at run time, is treated as it (`-m pdb -m pip`, `cProfile -o f -m pip`).
+        for word in rest:
+            if word.dynamic or _installer_module(word.text.casefold().lstrip("-m")):
+                raise _Unsupported(_RUNNER_MESSAGE.format(runner=name), code="wrapper")
+    elif name == "venv":
+        if any(w.text.startswith("--upgrade-") for w in rest):
+            raise _Unsupported(_VENV_MESSAGE, code="wrapper")
+    elif name == "virtualenv":
+        _check_virtualenv(rest)
+
+
+def _check_virtualenv(rest):
+    for word in rest:
+        option = word.text.partition("=")[0]
+        if len(option) > 2 and option.startswith("--") and (
+                "--download".startswith(option) or "--upgrade-embed-wheels".startswith(option)):
+            raise _Unsupported(_VENV_MESSAGE, code="wrapper")
+
+
+_VENV_MESSAGE = (
+    "`venv --upgrade-deps` and `virtualenv --download` fetch pip and setuptools from the "
+    "package index, unreviewed; create the environment offline (`python -m venv env`, "
+    "without it)"
+)
+
+_RUNNER_MESSAGE = (
+    "`python -m {runner}` runs another module by name, and its target is an installer or "
+    "cannot be read; run the installer directly (`pip install ...`, `uv pip install ...`), "
+    "as its own command"
+)
+
+_EASY_INSTALL_MESSAGE = (
+    "`easy_install` downloads, builds and installs packages outside any review; use "
+    "`pip install <exact version>` instead"
+)
+
+
+_PYTHON_ENV_MESSAGE = (
+    "{name!r} makes Python run code or load modules before the installer (a "
+    "sitecustomize or .pth file, another stdlib or cache) that Package Guard cannot "
+    "read, and `-E` / `-I` do not reach the builds the installer starts; run the "
+    "installer without it"
+)
+
+
+def _check_python_env(assignments, installer):
+    """A Python variable in front of a Python-run installer (pip, uv) refuses."""
+    if installer.get("env") not in ("pip", "uv"):
+        return
+    for word in assignments:
+        name = _assignment(word)[0]
+        if verbs.python_env_refused(name):
+            raise _Unsupported(_PYTHON_ENV_MESSAGE.format(name=name), code="alternate-source")
+
+
+_MODULE_MESSAGE = (
+    "`python -m {module}` can install packages, and Package Guard does not read what it "
+    "runs; run the installer directly (`pip install ...`, `uv pip install ...`), as its "
+    "own command"
+)
+
+
+# Packages that ARE a package manager: run through npx, npm exec, pnpm dlx or
+# bunx they would take a command line of their own.
+_RUN_MANAGER_PACKAGES = frozenset({
+    "pnpm", "pnpx", "pnx", "yarn", "yarnpkg", "bun", "bunx", "@yarnpkg/cli-dist",
+    "@yarnpkg/cli", "@pnpm/exe", "@pnpm/pnpm",
+})
 
 # uv reads a boolean variable as true from any of these, in any case.
 _UV_TRUE = {"1", "true", "yes", "y", "on", "t"}
@@ -792,12 +1205,18 @@ def _uv_locked(assignments) -> bool:
                for canonical, found in by_name.items())
 
 
+# `npm_config_ignore_scripts` is read by npm and pnpm only. Bun reads no npm_config_*
+# variable and Yarn Berry has no such setting, so the variable proves nothing for them.
+_ENV_SCRIPTS_OFF_KINDS = ("npm", "pnpm")
+
+
 def _scripts_off(assignments, inherited) -> bool:
     """`npm_config_ignore_scripts=true` among the segment's own assignments,
     and no assignment in reach giving that setting another value (npm reads
     the variable in any case, so two spellings can disagree)."""
     def ignore_scripts(word):
-        return verbs.env_key("npm", _assignment(word)[0]) == "ignore-scripts"
+        name = _assignment(word)[0]
+        return "ignore-scripts" in (verbs.env_key("npm", name), verbs.env_key("pnpm", name))
 
     def true(word):
         _name, value, appends = _assignment(word)
@@ -952,7 +1371,7 @@ def _parse_peeled(head, words, assignments, inherited, command, stdin=None):
         payload = split + rest
         if any(word.dynamic for word in payload):
             return _hint_fallback(head, command, "with a command line built dynamically")
-        if _parse(" ".join(word.text for word in payload)).kind == "ignore":
+        if _inert(_parse(" ".join(word.text for word in payload))):
             return None
         raise _wrapper_refusal(head, "-S cannot be vetted")
     own = [] if verbs.wrapper_grammar(head).get("resets_environment") else assignments
@@ -1015,7 +1434,7 @@ def _parse_wrapper_payload(head, words, command, stdin=None):
 
     payload = " ".join(word.text for word in payload_words)
     inner = _parse(payload)
-    if inner.kind == "ignore":
+    if _inert(inner):
         return None
     raise _Unsupported(
         f"package operation wrapped in {head!r} cannot be vetted; "
@@ -1085,6 +1504,14 @@ def _check_unknown_head(head_word, head, words, assignments, command="", stdin=N
             w.text in command_options or w.text.startswith(tuple(o + "=" for o in command_options))
             for w in words[1:]):
         raise _Unsupported(_STDIN_MESSAGE.format(head=head), code="wrapper")
+    if dynamic or verbs.is_interpreter(head):
+        # An interpreter the dispatch did not name (`python3.13t`, `pypy3`, `py -3`, `"$PY"`):
+        # its own words are an interpreter command line.
+        module = _python_module(words)
+        if module is not None and not module[0]:
+            return None
+        if module is not None:
+            _refuse_module(*module)
     for reading in _readings(words, _known_values(assignments), head in verbs.STRING_RUNNERS):
         if verbs.ACQUISITION_HINT.search(reading):
             if dynamic:
@@ -1104,7 +1531,7 @@ def _check_unknown_head(head_word, head, words, assignments, command="", stdin=N
                                    code="wrapper") from exc
             if result is _CD_MARKER:
                 return result
-            if result is not None and result.kind != "ignore":
+            if result is not None and not _inert(result):
                 raise _Unsupported(_DYNAMIC_HEAD_MESSAGE.format(name=head_word.text), code="wrapper")
     return None
 
@@ -1135,6 +1562,59 @@ def _reads_stdin(words, payload_words) -> bool:
     options = words[1:len(words) - len(payload_words)]
     return any(w.text.startswith("-") and not w.text.startswith("--") and "s" in w.text[1:]
                for w in options)
+
+
+# Frappe's `bench` installs out of the hook's sight: it runs `yarn install --check-files`
+# (dependency scripts on) in every app and `pip install` into `<bench>/env`, from Python.
+# These verbs acquire packages (or pull app code that does); the rest of bench (`build`,
+# `start`, `migrate`, `new-site`, `--site x ...`) runs project code and is read like
+# `npm run`. `setup` acquires only through these subcommands. Also here: the verbs that pull
+# app code (`retry-upgrade`, `switch-to-develop`), rebuild the env and reinstall every app
+# (`migrate-env`), and run ansible under sudo with `pip install ansible` and apt roles
+# (`install`, `setup role`, `setup production`); `remove` is an alias of `remove-app`.
+_BENCH_INSTALL_VERBS = verbs.BENCH_INSTALL_VERBS
+_BENCH_INSTALL_SETUP = verbs.BENCH_INSTALL_SETUP
+# The click group's own options (bench/commands/__init__.py) and the context flags
+# bench's get_cmd_from_sysargv skips; the rest of bench's options are read by its verbs.
+_BENCH_VALUE_FLAGS = {"--site", "--use-feature"}
+_BENCH_FLAGS = {"--version", "--help", "-v", "--verbose", "--profile", "--force"}
+_BENCH_UNKNOWN_OPTION = (
+    "`bench {option}` is an option Package Guard does not know, and it could select a verb "
+    "that installs packages out of the hook's sight; use bench's own options "
+    "(`--site`, `--use-feature`, `-v`) or run the verb without it")
+_BENCH_MESSAGE = (
+    "`bench {verb}` installs packages out of the hook's sight: bench runs `yarn install` "
+    "with dependency scripts on and `pip install` into the bench env from Python. Frappe / "
+    "bench is not supported by Package Guard yet (planned for v1.12.0). Tell the user; run "
+    "`bench build`, `bench start`, `bench migrate` and site commands as usual.")
+
+
+def _check_bench(words):
+    """Refuse the bench verbs that acquire packages; leave the rest to run."""
+    texts = [w.text for w in words[1:]]
+    index = 0
+    while index < len(texts) and texts[index].startswith("-"):
+        option = texts[index]
+        if option == "--":  # click: what follows is the command
+            index += 1
+            break
+        if option in _BENCH_VALUE_FLAGS:
+            index += 2
+        elif option in _BENCH_FLAGS or option.partition("=")[0] in _BENCH_VALUE_FLAGS:
+            index += 1
+        else:
+            raise _Unsupported(_BENCH_UNKNOWN_OPTION.format(option=option), code="foreign-manager")
+    if index >= len(texts):
+        return
+    verb = texts[index]
+    sub = index + 1
+    if verb == "setup":
+        while sub < len(texts) and texts[sub] == "--":
+            sub += 1
+    if verb in _BENCH_INSTALL_VERBS or (
+            verb == "setup" and sub < len(texts) and texts[sub] in _BENCH_INSTALL_SETUP):
+        shown = verb if verb != "setup" else f"setup {texts[sub]}"
+        raise _Unsupported(_BENCH_MESSAGE.format(verb=shown), code="foreign-manager")
 
 
 def _parse_foreign(head, words):
@@ -1177,15 +1657,27 @@ def _consume_globals(installer, words):
             break
         base = text.partition("=")[0]
         action = globals_.get(base)
+        if action is None and base.startswith(tuple(installer.get("globals_deny_prefixes") or ())):
+            # pnpm's `--config.<key>` sets any setting, the registry included.
+            raise _Unsupported(f"{base!r} is not supported", code="alternate-source")
         if action == "deny_cwd":
             raise _Unsupported(
                 f"{base!r} is not supported; to install into a subdirectory, "
                 "cd there in its own command first, then run the install",
                 code="install-target",
             )
+        if action == "deny_source":
+            raise _Unsupported(f"{base!r} names another registry or configuration; "
+                               "alternate sources are not supported", code="alternate-source")
         if action == "deny":
             raise _Unsupported(f"{base!r} is not supported", code="unsupported-flag")
         if action == "inert":
+            if installer.get("print_bare_only") and index != len(words) - 1:
+                # `pnpm --version add evil`: whether the rest runs is the
+                # manager's business, not ours; only a bare print is a print.
+                raise _Unsupported(
+                    f"{base!r} is a print only on its own; run the package command without it",
+                    code="unsupported-form")
             # `npm -v`, `npm --help`: the flag makes the whole command a print
             # and nothing after it runs, so `node -v && npm -v` at the start
             # of a fresh project is not refused.
@@ -1216,14 +1708,36 @@ def _check_env(assignments, installer, head):
     downloads is refused, and so is any unknown name with the installer's
     prefix. Each refusal names the variable, why, and what to do instead.
     """
-    family = installer.get("env")
-    if not family:
+    families = installer.get("env")
+    if not families:
         return
+    if isinstance(families, str):
+        families = [families]
     for assignment in assignments:
         name, value, appends = _assignment(assignment)
-        category = verbs.classify_env(family, name)
-        if category in (None, "allow", "locked"):
+        if "yarn" in families and pm_config.yarn_env_key(name):
+            # Yarn: the rc rule on the setting the name overrides, the one the
+            # hook applies to its own environment and to .yarnrc.yml.
+            problem = pm_config.yarn_env_problem(name, value)
+            if problem is None and not appends:
+                continue
+            category = verbs.classify_env("yarn", name)
+            reason = f"{name!r} " + (problem or "appends to a value Package Guard cannot see")
+            if category == "retarget":
+                raise _Unsupported(reason, code="install-target")
+            if category in (None, "allow", "locked", "unknown"):
+                raise _Unsupported(reason, code="unknown-setting")
+            raise _Unsupported(reason, code="alternate-source")
+        # An installer may read several families (pnpm: pnpm_config_ and
+        # npm_config_); the first that refuses the name decides.
+        family, category = next(
+            ((f, c) for f in families for c in [verbs.classify_env(f, name)]
+             if c not in (None, "allow", "locked")), (families[0], None))
+        if category is None:
             continue
+        if ((set(families) & {"pnpm", "bun"} or family == "corepack") and not appends
+                and pm_config.env_value_allows(family, category, name, value)):
+            continue  # a source variable naming the official registry
         reason = f"{name!r} " + verbs.env_reason(family, category, name)
         if category == "path":
             if _static_path(assignment, value, appends):
@@ -1291,7 +1805,11 @@ def _dispatch(installer, head, words, command):
     all_words = words
     verb, words = _consume_globals(installer, words)
     if verb is _INERT:
-        return None
+        # A print still starts the manager, and pnpm and Yarn switch to the
+        # release `packageManager` pins (or run `yarnPath`) before they print,
+        # so `pnpm --version` / `yarn -h` get the same pin and config checks as
+        # any other verb. Without a pin or a config hazard it passes.
+        return _manager_run(head, None, "print")
 
     subtables = installer.get("subtables") or {}
     if verb in subtables:
@@ -1304,7 +1822,7 @@ def _dispatch(installer, head, words, command):
         subverb = words[2].text if len(words) > 2 else None
         kind = verbs.classify(inner, subverb)
         if kind == "inert":
-            return None
+            return _manager_run(head, None)
         if kind == "unknown":
             raise _Unsupported(
                 f"unrecognized {head} {verb} subcommand {subverb!r}; "
@@ -1324,13 +1842,26 @@ def _dispatch(installer, head, words, command):
     canonical = verbs.normalize(installer, verb)
     kind = verbs.classify(installer, canonical)
     if kind == "inert":
-        return None
+        # `help [verb]` only prints, like `--help`; every other inert verb reads the project.
+        return _manager_run(head, None, "print" if canonical == "help" else "manager")
     if kind == "unknown":
         if installer.get("unknown_verb") == "ignore":
-            return None
+            return _manager_run(head, None)
+        file_handler = installer.get("file_handler")
+        if file_handler and _is_bun_file(verb):
+            # `bun ./x.ts`: Bun's shorthand for `bun run ./x.ts`.
+            _refuse_dynamic_before_name(words[1:], _PM_RUN_VALUE["bun"])
+            if any(word.glued_op for word in words[1:]):
+                raise _Unsupported("a redirect or operator is glued to a word",
+                                   code="unquoted-range")
+            texts = [w.text for w in words]
+            if _pre_verb_no_install(all_words, words):
+                texts.insert(1, "--no-install")
+            return _run_handler(file_handler, texts, command, head)
+        hint = installer.get("unknown_hint")
         raise _Unsupported(
             f"unrecognized {head} subcommand {verb!r}; "
-            "run the package command in its plain documented form",
+            + (f"{hint}" if hint else "run the package command in its plain documented form"),
             code="unknown-verb",
         )
 
@@ -1340,7 +1871,11 @@ def _dispatch(installer, head, words, command):
     # Let its handler decide, then an unreadable `--with` value fails the name
     # grammar. Without this, `uv run python -c "...$VAR..."` -- an ordinary
     # command that acquires nothing -- would be refused.
-    if handler_name != "uv_run" and any(word.dynamic for word in words[1:]):
+    if handler_name in _RUN_HANDLERS:
+        # A runner's own arguments are the script's, and routinely carry shell
+        # variables. A variable BEFORE the script name could be a flag.
+        _refuse_dynamic_before_name(words[2:], _PM_RUN_VALUE.get(_executable(head), set()))
+    elif handler_name != "uv_run" and any(word.dynamic for word in words[1:]):
         raise _Unsupported(
             "package identity is built dynamically (a variable, substitution or "
             "glob); name the exact package and version instead",
@@ -1358,24 +1893,61 @@ def _dispatch(installer, head, words, command):
 
     handler = handler_name
     texts = [w.text for w in words]
-    texts[1] = canonical if len(texts) > 1 else canonical
+    if len(texts) > 1:
+        texts[1] = canonical
+    else:
+        texts.append(canonical)  # a bare command (`yarn`) is the empty verb
+    if handler_name in _RUN_HANDLERS and _pre_verb_no_install(all_words, words):
+        texts.insert(2, "--no-install")  # `bun --no-install run x`
     return _run_handler(handler, texts, command, head)
+
+
+_RUN_HANDLERS = frozenset({"pnpm_run", "pnpm_exec", "yarn_run", "bun_run"})
+
+
+def _refuse_dynamic_before_name(words, value_flags):
+    """Words up to the first plain positional are read as flags; a variable, glob
+    or substitution there could be any flag."""
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        if word.dynamic:
+            raise _Unsupported(
+                "a flag before the script name is built dynamically (a variable, "
+                "substitution or glob); write it out", code="dynamic-spec")
+        if not word.text.startswith("-"):
+            return
+        if word.text in value_flags:
+            skip = True
+
+
+def _pre_verb_no_install(all_words, words) -> bool:
+    """`bun --no-install run x`: a flag the global scan skipped before the verb."""
+    before = all_words[1:len(all_words) - len(words) + 1]
+    return any(w.text == "--no-install" for w in before)
 
 
 def _merge(results):
     requests = []
     manifests = []
     environments = []
+    resolve_only = []
+    runs = []
     for result in results:
+        resolve_only.extend(k for k in result.resolve_only if k not in resolve_only)
+        runs.extend(r for r in result.runs if r not in runs)
         requests.extend(result.requests)
         for scope in result.manifests:
             if scope not in manifests:
                 manifests.append(scope)
         environments.extend(e for e in result.environments if e not in environments)
     if not requests and not manifests:
-        return _ignore()
+        return ParseResult(kind="ignore", resolve_only=tuple(resolve_only), runs=tuple(runs))
     return ParseResult(kind="package", requests=tuple(requests), manifests=tuple(manifests),
-                       environments=tuple(environments))
+                       environments=tuple(environments), resolve_only=tuple(resolve_only),
+                       runs=tuple(runs))
 
 
 def _run_handler(name, tokens, command, head):
@@ -1432,7 +2004,12 @@ def _executable(token: str, fold: bool = True) -> str:
     # python3.13. Matching only `pip`/`pip3` would let
     # `pip3.12 install requests` dispatch nowhere and install silently.
     match = re.match(r"^(pip|python)[0-9.]*$", name)
-    return match.group(1) if match else name
+    if match:
+        return match.group(1)
+    if verbs.is_interpreter(name):
+        return "python"
+    # `easy_install`, `easy_install-3.9`: setuptools' legacy installer executable.
+    return "easy_install" if re.fullmatch(r"easy_install(?:-[0-9.]+)?", name) else name
 
 
 def _bad_source(spec: str) -> str | None:
@@ -1443,7 +2020,7 @@ def _bad_source(spec: str) -> str | None:
     cannot reach. Calling that a parse failure would mislabel the denial.
     """
     s = spec.lower()
-    if s.startswith(("git+", "git://", "ssh://", "http://", "https://", "file:")):
+    if s.startswith(protocols.NON_REGISTRY_PREFIXES):
         return "direct Git/URL/file package sources are not supported"
     if s in (".", "..") or s.startswith(("./", "../", "/", "~")):
         return "local path package sources are not supported"
@@ -1517,9 +2094,11 @@ def _parse_npm_install(tokens, original) -> ParseResult:
             # versions and writes a lockfile but puts nothing in node_modules
             # and runs no code, so nothing is acquired. This is the escape
             # hatch the hook points at when a manifest's ranges cannot be pinned.
+            # It is resolve-only, not plain ignore: the hook still refuses it in a
+            # project another manager owns (`hook._npm_project_problem`).
             if "--package-lock-only" in tokens[2:] and scripts and "--dry-run" not in tokens[2:]:
                 raise _Unsupported(_LOCK_ONLY_NEEDS_SCRIPTS_OFF, code="unsupported-flag")
-            return _ignore()
+            return _resolve_only("npm")
         if sub in ("ci", "install-ci-test") and specs:
             raise _Unsupported(f"'npm {sub}' does not take package arguments", code="unsupported-form")
         scope = ManifestScope("npm", scripts=scripts)
@@ -1784,6 +2363,458 @@ def _npm_spec_to_request(spec, operation, original, manager) -> PackageRequest:
         registry=NPM_REGISTRY,
         original_command=original,
     )
+
+
+# ---------------------------------------------------------------------------
+# pnpm / Bun / Yarn Berry
+#
+# Flags are an allow-list per manager, as `_NPM_SAFE_FLAGS` is for npm: a flag
+# not listed is `unsupported-flag`. Each manager has its own table because the
+# same spelling means different things (`-C` is pnpm's directory and Yarn's
+# caret; `-w` is pnpm's workspace root).
+# ---------------------------------------------------------------------------
+
+_PM_NAMES = PM_NAMES = {"pnpm": "pnpm", "pnpx": "pnpm", "pnx": "pnpm", "bun": "bun",
+                        "bunx": "bun", "yarn": "yarn", "yarnpkg": "yarn"}
+
+_PM_FLAGS = {
+    "pnpm": {
+        "safe": {"-D", "--save-dev", "-P", "--save-prod", "-O", "--save-optional", "-E",
+                 "--save-exact", "--frozen-lockfile", "--production", "--prod", "--dev",
+                 "--no-optional", "-q", "--quiet", "-s", "--silent", "--no-color", "--color",
+                 "--offline", "--prefer-offline", "--ignore-scripts"},
+        "value": {"--reporter", "--loglevel"},
+        "target": {"-C", "--dir", "--filter", "-F", "--filter-prod", "-r", "--recursive", "-w",
+                   "--workspace-root", "--ignore-workspace", "-g", "--global", "--prefix"},
+        "source": {"--registry", "--userconfig", "--globalconfig", "--config"},
+        "resolve_only": {"--lockfile-only"},
+    },
+    "bun": {
+        "safe": {"-d", "-D", "--dev", "--development", "-p", "--production", "-O", "--optional",
+                 "--peer", "-E", "--exact", "--frozen-lockfile", "--ignore-scripts", "--silent",
+                 "--verbose", "--no-progress", "--no-summary", "--offline"},
+        "value": {"--linker"},
+        "target": {"--cwd", "-g", "--global", "--filter"},
+        "source": {"--registry", "-c", "--config"},
+        "resolve_only": {"--dry-run", "--lockfile-only"},
+    },
+    "yarn": {
+        # Berry has no --ignore-scripts: `--mode=skip-build` is the safe flag.
+        "safe": {"-D", "--dev", "-P", "--peer", "-O", "--optional", "-E", "--exact", "-T",
+                 "--tilde", "-C", "--caret", "--immutable", "--immutable-cache", "--check-cache",
+                 "--json"},
+        "value": set(),
+        "target": {"--cwd", "-A", "--all", "-W"},
+        "source": {"--registry", "--config"},
+        "resolve_only": set(),
+    },
+}
+_PM_SCRIPTS_OFF = {"pnpm": {"--ignore-scripts", "--ignore-scripts=true"},
+                   "bun": {"--ignore-scripts", "--ignore-scripts=true"},
+                   "yarn": {"--mode=skip-build"}}
+
+# A spec's version part (or its whole text) naming something other than a
+# registry version: an alias, a repository, a path, a patch, a protocol.
+_PM_SPEC_PREFIXES = protocols.NON_REGISTRY_PREFIXES
+
+
+def _pm_disabled(what):
+    """The forms that would be inert once pnpm, Bun and Yarn are read end to end
+    are refused until then, so nothing here returns "ignore"."""
+    raise _Unsupported(f"{what}: support for pnpm, Bun and Yarn lands in v1.10.0",
+                       code="unsupported-form")
+
+
+def _pm_spec_to_request(spec, operation, original, manager):
+    lowered = spec.lower()
+    sep = spec.find("@", 1) if spec.startswith("@") else spec.find("@")
+    version = spec[sep + 1:].lower() if sep != -1 else ""
+    if (lowered.startswith(_PM_SPEC_PREFIXES) or version.startswith(_PM_SPEC_PREFIXES)
+            or (manager.startswith("pnpm") and spec.partition("@")[0].lower() == "rust")):
+        raise _Unsupported(f"{spec!r}: only a plain registry package name and version is supported",
+                           code="alternate-source")
+    return _npm_spec_to_request(spec, operation, original, manager=manager)
+
+
+def _pm_scan(manager, args, verb):
+    """Classify the arguments of an acquiring verb: (specs, scripts, resolve_only).
+
+    Flags come from the manager's allow-list. A flag that names another source,
+    another directory or any scope other than this project is refused under its
+    own code; one the table does not list is `unsupported-flag`."""
+    table = _PM_FLAGS[manager]
+    _refuse_npm_source_args(args)
+    specs, resolve_only, scripts = [], False, True
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if not arg.startswith("-"):
+            specs.append(arg)
+            continue
+        base, equals, value = arg.partition("=")
+        if base.startswith("--config."):
+            raise _Unsupported(f"{base!r} sets an installer setting and is not supported",
+                       code="alternate-source")
+        if base in table["source"]:
+            raise _Unsupported(f"{base!r} names another registry or configuration; "
+                                            "alternate sources are not supported",
+                       code="alternate-source")
+        if base in table["target"]:
+            raise _Unsupported(f"{base!r} is not supported: it installs somewhere other "
+                                          "than this project (a global, workspace or other "
+                                          "directory); to use a subdirectory, cd there in its own "
+                                          "command first, then run the install",
+                       code="install-target")
+        if base == "--mode" and manager == "yarn":
+            mode = value if equals else (args[index] if index < len(args) else "")
+            if mode not in ("skip-build", "update-lockfile"):
+                raise _Unsupported(f"yarn --mode={mode}: only --mode=skip-build and "
+                                   "--mode=update-lockfile are supported",
+                       code="unsupported-flag")
+            if not equals:
+                index += 1
+            if mode == "update-lockfile":
+                # Resolves and writes yarn.lock; skips the link and build steps.
+                resolve_only = True
+            else:
+                scripts = False
+            continue
+        if arg in _PM_SCRIPTS_OFF[manager]:
+            scripts = False
+            continue
+        if base in table["resolve_only"]:
+            resolve_only = True
+            continue
+        if base in table["value"]:
+            if not equals:
+                index += 1  # the flag's value, never a package
+            continue
+        if base in table["safe"] and not (equals and base == "--ignore-scripts"):
+            continue
+        hint = (" (Yarn Berry has no --ignore-scripts; use --mode=skip-build)"
+                if manager == "yarn" and base == "--ignore-scripts" else "")
+        raise _Unsupported(f"unrecognized {manager} flag {base!r}{hint}; "
+                                        f"use a plain '{manager} {verb} <pkg>@<version>' form",
+                       code="unsupported-flag")
+    return specs, scripts, resolve_only
+
+
+def _pm_install(manager):
+    def handler(tokens, original):
+        verb = tokens[1] if len(tokens) > 1 else ""
+        specs, scripts, resolve_only = _pm_scan(manager, tokens[2:], verb)
+        if resolve_only and manager == "yarn":
+            # `yarn install --mode=update-lockfile`: resolves and writes yarn.lock
+            # and skips linking and building, so there is no `--ignore-scripts`
+            # to ask for. The hook reads the configuration and refuses a root
+            # install-time script all the same (hook._resolve_only_denial).
+            if specs or verb not in ("", "install"):
+                raise _Unsupported("yarn --mode=update-lockfile is supported only as "
+                                   "'yarn install --mode=update-lockfile' with no package arguments",
+                                   code="unsupported-form")
+            if not PNPM_BUN_YARN_ENABLED:
+                _pm_disabled("'yarn install --mode=update-lockfile'")
+            return _resolve_only(manager)
+        if resolve_only:
+            # Resolves and writes the lock without installing, but still runs the
+            # root project's own lifecycle scripts unless they are off.
+            if scripts:
+                raise _Unsupported(f"'{manager} {verb}' with a resolve-only flag still "
+                                                "runs the project's lifecycle scripts; add --ignore-scripts",
+                       code="unsupported-flag")
+            if not PNPM_BUN_YARN_ENABLED:
+                _pm_disabled(f"'{manager} {verb}' with a resolve-only flag")
+            return _resolve_only(manager)
+        if specs and (verb in ("fetch", "dedupe") or (manager == "yarn" and verb in ("", "install"))):
+            raise _Unsupported(f"'{manager} {verb}'".rstrip()
+                        + " does not take package arguments",
+                       code="unsupported-form")
+        scope = ManifestScope(manager, scripts=scripts)
+        if not specs:
+            return _manifest_only(scope)
+        return _package((_pm_spec_to_request(s, "install", original, manager) for s in specs),
+                        manifests=(scope,))
+    return handler
+
+
+def _parse_pm_remove(tokens, original):
+    """`remove` acquires nothing, so it stays `ignore` and the printed remedy for an
+    unreviewed package on disk (`disk_guard.removal_command`) stays reachable while a
+    finding is open. It is NOT inert, though: it rewrites package.json and the lock,
+    relinks node_modules and runs the root project's lifecycle scripts, so the hook
+    checks the manager's configuration, the pin, the lock and the scripts first
+    (`hook._run_denial`, v1.10.0 hardening A4). A source or target flag is refused.
+    Yarn's `--mode=skip-build` and Bun's `--ignore-scripts` turn scripts off (each
+    suppresses the root postinstall that otherwise runs; verified live). pnpm rejects
+    `--ignore-scripts` on `remove` ("Unknown option") and never ran the root postinstall, so
+    its scripts stay on: the denial for a root install script is the safe, documented one."""
+    manager = _PM_NAMES[_executable(tokens[0])]
+    names, scripts, _resolve = _pm_scan(manager, tokens[2:], "remove")
+    if not PNPM_BUN_YARN_ENABLED:
+        _pm_disabled(f"'{manager} remove'")
+    return ParseResult(kind="ignore", runs=(RunScope(
+        manager, "remove", scripts=scripts or manager == "pnpm", names=tuple(names)),))
+
+
+def _parse_pm_config(tokens, original):
+    """Only `config get` / `config list` read; a registry key set is refused as
+    a redirect, any other config verb is not supported."""
+    manager = _PM_NAMES[_executable(tokens[0])]
+    sub = tokens[2] if len(tokens) > 2 else None
+    if sub in ("get", "list"):
+        return _ignore()
+    if sub == "set" and any("registry" in t.lower() for t in tokens[3:]):
+        raise _Unsupported(f"'{manager} config set' of a registry key redirects every "
+                                        "later install; alternate registries are not supported",
+                       code="alternate-source")
+    raise _Unsupported(f"'{manager} config {sub or ''}'".rstrip()
+                + " changes configuration; only 'config get' and 'config list' are supported",
+                       code="unsupported-form")
+
+
+def _parse_pm_audit(tokens, original):
+    if any(t == "fix" or t.startswith("--fix") for t in tokens[2:]):
+        raise _Unsupported(f"'{_PM_NAMES[_executable(tokens[0])]} audit fix' installs "
+                                        "packages and cannot be vetted",
+                       code="unsupported-form")
+    return _ignore()
+
+
+def _parse_pm_store(tokens, original):
+    if len(tokens) > 2 and tokens[2] in ("path", "status"):
+        return _ignore()
+    raise _Unsupported("'pnpm store' is supported only as path or status; "
+                                    "'store add' fetches packages",
+                       code="unsupported-form")
+
+
+def _parse_yarn_npm(tokens, original):
+    if len(tokens) > 2 and tokens[2] in ("info", "audit"):
+        return _ignore()
+    raise _Unsupported("'yarn npm' is supported only as 'npm info' and 'npm audit'",
+                       code="unsupported-form")
+
+
+_PM_EXEC_VALUE_REFUSED = ("-p", "--package", "-c", "--call", "--shell-mode")
+
+
+def _parse_pm_exec(args, original, manager, safe_flags=frozenset(), initializer=False):
+    """`pnpm dlx`, `pnpx`, `bun x`, `bunx`, `yarn dlx`, `pnpm create`: the first
+    positional is the package, the rest belongs to the tool."""
+    for arg in args:
+        if arg.startswith("-"):
+            base = arg.partition("=")[0]
+            if base in _PM_EXEC_VALUE_REFUSED:
+                raise _Unsupported(f"{base} forms are not supported; use "
+                                                f"'{manager} <pkg>@<version>'",
+                       code="unsupported-form")
+            _refuse_npm_source_args([arg])
+            if base in ("--registry", "--config", "-c") or base.startswith("--config."):
+                raise _Unsupported(f"{base!r} names another registry or configuration",
+                       code="alternate-source")
+            if base in safe_flags:
+                continue
+            raise _Unsupported(f"unrecognized {manager} flag {base!r} before the package name",
+                       code="unsupported-flag")
+        spec = _initializer_package(arg) if initializer else arg
+        return _package([_pm_spec_to_request(spec, "exec", original, manager)])
+    raise _Unsupported(f"'{manager}' needs a package to run",
+                       code="unsupported-form")
+
+
+_PM_DLX_SAFE = {"pnpm": {"-q", "--quiet", "-s", "--silent"}, "bun": {"--bun", "--silent"},
+                "yarn": {"-q", "--quiet"}}
+
+
+def _parse_pnpm_dlx(tokens, original):
+    return _parse_pm_exec(tokens[2:], original, "pnpm dlx", _PM_DLX_SAFE["pnpm"])
+
+
+def _parse_pnpm_create(tokens, original):
+    return _parse_pm_exec(tokens[2:], original, "pnpm create", initializer=True)
+
+
+def _parse_pnpm_dlx_head(tokens, original):
+    return _parse_pm_exec(tokens[1:], original, _executable(tokens[0]), _PM_DLX_SAFE["pnpm"])
+
+
+def _bun_exec(args, original, manager):
+    """`bun x` / `bunx`. `--no-install` makes it run only what is already installed, and
+    only BEFORE the package name: after it, the flag belongs to the tool being run
+    (`bunx evil@1.0.0 --no-install` still installs and runs `evil`). A flag before the
+    name is read as `bun run`'s are, so `--registry` and the like stay refused."""
+    before = []
+    for arg in args:
+        if not arg.startswith("-"):
+            break
+        before.append(arg)
+    if any(arg.partition("=")[0] == "--no-install" for arg in before):
+        # Runs what is already installed and fetches nothing, but it still runs
+        # code under the project's bunfig (preload) and pinned manager, so it is
+        # a runner the hook checks (`hook._run_denial`), not a bare `ignore`.
+        _pm_run_scan("bun", args, True)
+        return _runner_result("bun", "x")
+    return _parse_pm_exec(args, original, manager, _PM_DLX_SAFE["bun"])
+
+
+def _parse_bun_x(tokens, original):
+    return _bun_exec(tokens[2:], original, "bun x")
+
+
+def _parse_bunx_head(tokens, original):
+    return _bun_exec(tokens[1:], original, "bunx")
+
+
+def _parse_yarn_dlx(tokens, original):
+    return _parse_pm_exec(tokens[2:], original, "yarn dlx", _PM_DLX_SAFE["yarn"])
+
+
+# ---------------------------------------------------------------------------
+# Runners: pnpm run|exec|test|start, yarn run, bun run|test|<file> (design 7)
+#
+# They acquire nothing themselves, so they are `ignore` as `npm run` is, with
+# a RunScope for the hook: the manager's configuration still applies (a pnpmfile,
+# a Yarn plugin, a Bun preload), Bun may install what it cannot find, and Yarn
+# refuses to run on a stale install. The script's body is read no more than
+# `npm run`'s is. Until the switch flips each is refused, as `remove` is.
+# ---------------------------------------------------------------------------
+
+_PM_RUN_PRE = {
+    # Flags that may come before the script name. Anything else there is refused:
+    # an unknown flag could retarget the command or change what it installs.
+    "pnpm": {"--if-present", "-s", "--silent", "-q", "--quiet", "--no-color", "--color",
+             "--stream", "--no-bail", "--aggregate-output"},
+    "bun": {"--bun", "--silent", "--if-present", "--no-install", "--watch", "--hot",
+            "--no-clear-screen", "--smol"},
+    "yarn": {"-T", "--top-level", "-B", "--binaries-only"},
+}
+_PM_RUN_VALUE = {"pnpm": {"--reporter", "--loglevel"}, "bun": set(), "yarn": set()}
+# Refused wherever they appear before `--` (pnpm) or before the script name (Bun, Yarn).
+_PM_RUN_REFUSED = {
+    "pnpm": {"-C", "--dir", "--filter", "-F", "--filter-prod", "-r", "--recursive", "-w",
+             "--workspace-root", "--ignore-workspace", "-g", "--global", "--prefix",
+             "--parallel", "--sequential", "--workspace-concurrency", "--resume-from",
+             "--report-summary", "--test-pattern", "--changed-files-ignore-pattern",
+             "--shell-mode", "-c", "--use-stderr"},
+    "bun": {"-i", "--install", "--preload", "-r", "--require", "--import", "--cwd", "--filter",
+            "--workspaces", "--env-file", "--config", "-c", "--shell", "--eval", "-e",
+            "--print", "-p", "--tsconfig-override", "--define", "-d", "--loader", "--inspect",
+            "--inspect-brk", "--inspect-wait", "--registry"},
+    "yarn": {"--cwd", "-A", "--all", "-W", "--inspect", "--inspect-brk"},
+}
+
+
+def _pm_run_scan(manager, args, takes_name, name_required=False):
+    """Flags up to the script name (or the first positional); returns (name,
+    no_install, args after the name). The script's own arguments are not read,
+    except that a flag that names another source or directory is refused where
+    the manager itself might read it."""
+    pre, refused, value = _PM_RUN_PRE[manager], _PM_RUN_REFUSED[manager], _PM_RUN_VALUE[manager]
+    _refuse_npm_source_args(args)
+    no_install, name, index = False, None, 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            break
+        base = arg.partition("=")[0]
+        if arg.startswith("-"):
+            if base.startswith("--config."):
+                raise _Unsupported(f"{base!r} sets an installer setting and is not supported",
+                                   code="alternate-source")
+            if base in refused:
+                raise _Unsupported(
+                    f"{arg!r} is not supported on '{manager} run': it runs more than this "
+                    "project's one script (a workspace, another directory, an install "
+                    "mode, preloaded code or inline code)", code="install-target")
+            if name is None:
+                if base == "--no-install" and manager == "bun":
+                    no_install = True
+                    continue
+                if base in value:
+                    if "=" not in arg:
+                        index += 1
+                    continue
+                if base in pre:
+                    continue
+                if takes_name:
+                    raise _Unsupported(
+                        f"unrecognized {manager} flag {base!r} before the script name; "
+                        f"use a plain '{manager} run <script>' form", code="unsupported-flag")
+            continue
+        if name is None:
+            name = arg
+            if takes_name:
+                break
+    rest = args[index:]
+    if name_required and name is None:
+        raise _Unsupported(f"'{manager}' needs a command to run", code="unsupported-form")
+    return name, no_install, rest
+
+
+def _after_name_refused(manager, rest):
+    """pnpm reads some flags after the script name too: refused before `--`."""
+    if manager != "pnpm":
+        return
+    _refuse_npm_source_args(rest)
+    for arg in rest:
+        if arg == "--":
+            return
+        base = arg.partition("=")[0]
+        if arg.startswith("-") and base in _PM_RUN_REFUSED["pnpm"]:
+            raise _Unsupported(f"{arg!r} is not supported on 'pnpm run': it runs more than this "
+                               "project's one script", code="install-target")
+
+
+def _runner_result(kind, verb, autoinstall=False):
+    if not PNPM_BUN_YARN_ENABLED:
+        _pm_disabled(f"'{kind} {verb}'")
+    return ParseResult(kind="ignore", runs=(RunScope(kind, verb, autoinstall),))
+
+
+def _parse_pnpm_run(tokens, original):
+    verb = tokens[1]
+    takes_name = verb == "run"
+    name, _ni, rest = _pm_run_scan("pnpm", tokens[2:], takes_name)
+    _after_name_refused("pnpm", rest if takes_name else tokens[2:])
+    return _runner_result("pnpm", verb)
+
+
+def _parse_pnpm_exec(tokens, original):
+    """`pnpm exec <bin> ...` runs a binary of this project's node_modules/.bin; it
+    does not fetch (that is `pnpm dlx`). A shell string (`-c`) is refused."""
+    _pm_run_scan("pnpm", tokens[2:], True, name_required=True)
+    return _runner_result("pnpm", "exec")
+
+
+def _parse_yarn_run(tokens, original):
+    _pm_run_scan("yarn", tokens[2:], True)
+    return _runner_result("yarn", "run")
+
+
+def _parse_bun_run(tokens, original):
+    verb = tokens[1]
+    if verb == "test":
+        # `bun test` takes filters and flags of its own and resolves like `bun run`.
+        _name, no_install, _rest = _pm_run_scan("bun", tokens[2:], False)
+        no_install = no_install or "--no-install" in tokens[2:]
+    else:
+        _name, no_install, _rest = _pm_run_scan("bun", tokens[2:], True)
+    return _runner_result("bun", verb, autoinstall=not no_install)
+
+
+_BUN_FILE = re.compile(r"(?:^|/)[^/]+\.(?:[cm]?[jt]sx?|jsonc?|json5|toml|html|sh)$|/")
+
+
+def _is_bun_file(word) -> bool:
+    return bool(word) and not word.startswith("-") and bool(_BUN_FILE.search(word))
+
+
+def _parse_bun_file(tokens, original):
+    """`bun ./x.ts args...`: runs a file; Bun installs what it cannot find first."""
+    _name, no_install, _rest = _pm_run_scan("bun", tokens[1:], True)
+    return _runner_result("bun", "file", autoinstall=not no_install)
 
 
 # ---------------------------------------------------------------------------
@@ -2230,7 +3261,7 @@ def _parse_uv_run(args, original) -> ParseResult:
     is read like any other: `uv run pip install x` is a package operation."""
     options, command = _uv_project_options(args)
     _refuse_uv_source_flags([name for name, _v in options], "uv run")
-    if command and _parse(" ".join(shlex.quote(word) for word in command)).kind != "ignore":
+    if command and not _inert(_parse(" ".join(shlex.quote(word) for word in command))):
         raise _Unsupported("'uv run' would run a package operation inside the project "
                            "environment; run the package command directly, as its own "
                            "command (for that environment, `uv pip install ...`)", code="wrapper")
@@ -2328,6 +3359,25 @@ HANDLERS = {
     "npm_config": _parse_npm_config,
     "pip_config": _parse_pip_config,
     "npx": _parse_npx_verb,
+    "pnpm_install": _pm_install("pnpm"),
+    "bun_install": _pm_install("bun"),
+    "yarn_install": _pm_install("yarn"),
+    "pm_remove": _parse_pm_remove,
+    "pm_config": _parse_pm_config,
+    "pm_audit": _parse_pm_audit,
+    "pm_store": _parse_pm_store,
+    "yarn_npm": _parse_yarn_npm,
+    "pnpm_dlx": _parse_pnpm_dlx,
+    "pnpm_dlx_head": _parse_pnpm_dlx_head,
+    "pnpm_create": _parse_pnpm_create,
+    "bunx": _parse_bunx_head,
+    "bun_x": _parse_bun_x,
+    "yarn_dlx": _parse_yarn_dlx,
+    "pnpm_run": _parse_pnpm_run,
+    "pnpm_exec": _parse_pnpm_exec,
+    "yarn_run": _parse_yarn_run,
+    "bun_run": _parse_bun_run,
+    "bun_file": _parse_bun_file,
     "uvx": _parse_uvx_verb,
     "uv_add": _parse_uv_add,
     "uv_sync": _parse_uv_sync,

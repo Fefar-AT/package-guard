@@ -49,6 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # only nags.
 try:
     import disk_guard  # noqa: E402
+    import mode as pg_mode  # noqa: E402
     import store  # noqa: E402
     import transcript  # noqa: E402
 except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
@@ -187,7 +188,11 @@ def vetter_status(transcript_path, now=None) -> dict | None:
             kind = node.get("type")
             if kind == "tool_use" and node.get("name") == "Agent":
                 if (node.get("input") or {}).get("subagent_type") == _VETTER_AGENT:
-                    launched[node.get("id")] = _parse_timestamp(record.get("timestamp"))
+                    # Newer builds copy the request into an `api-request-blob` record with
+                    # no timestamp; a copy must not erase the launch time it already has.
+                    started = _parse_timestamp(record.get("timestamp"))
+                    if launched.get(node.get("id")) is None:
+                        launched[node.get("id")] = started
             elif kind == "tool_result" and node.get("tool_use_id") in launched:
                 texts = list(_strings(node.get("content")))
                 if any(_ASYNC_LAUNCH in text for text in texts):
@@ -309,6 +314,18 @@ def evaluate(event: dict, root) -> str | None:
     """Return a block reason, or None to allow stopping."""
     session_id = event.get("session_id")
     if not isinstance(session_id, str) or not session_id:
+        return None
+    current = pg_mode.effective(root).mode
+    try:
+        caught = disk_guard.follow_mode(root, current, session_id)
+    except Exception as exc:  # noqa: BLE001 - fails soft; the snapshot stays for next time
+        print(f"Package Guard stop hook: could not follow the mode "
+              f"({exc.__class__.__name__}: {exc}).", file=sys.stderr)
+        caught = []
+    if caught:
+        pg_mode.append_log(root, {"event": "caught-up", "count": len(caught)})
+    if current != "enforce":
+        # warn and off are quiet: reviews and findings wait for enforce.
         return None
     store_error = None
     path = event.get("transcript_path")

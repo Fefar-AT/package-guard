@@ -4,11 +4,11 @@
 #   sh install.sh [<project>]       guards <project> (default: the current directory)
 #   sh install.sh <new-dir>         creates <new-dir>, git init, guards it
 #
-# Run it from a copy of the repository: a clone, or an unzipped download. The
-# repository is private, so the old `curl ... raw.githubusercontent.com | sh`
-# one-liner does not work; GitHub answers it with "404: Not Found". With no
-# local copy, install.sh clones PG_REPO itself, which needs a GitHub login
-# (see the message printed when that fails).
+# Run it from a copy of the repository (a clone, or an unzipped download), or
+# straight from GitHub: the repository is public, so
+#   curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- <project>
+# works with no login. With no local copy, install.sh clones PG_REPO itself; a
+# failed clone prints git's own error and the likely causes.
 #
 # A target that does not exist yet is a fresh project: the directory is created
 # and `git init` runs in it before the guard goes in, so the printed `git add`
@@ -193,21 +193,21 @@ else
     rm -rf "$PG_HOME"
     mkdir -p "$(dirname "$PG_HOME")"
     say "source: $PG_REPO @ $PG_REF -> $PG_HOME"
-    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$PG_REF" "$PG_REPO" "$PG_HOME" \
-        || fail "clone failed: $PG_REPO @ $PG_REF
-The Package Guard repository is private. Git needs a GitHub account that has
-been given read access, and a saved login. GitHub does not accept your account
-password for git. Pick one way to log in, in a terminal, then run this again:
-  1. gh auth login   (choose GitHub.com, HTTPS, then 'Login with a web browser')
-  2. Git Credential Manager (signs in through the browser; included with Git
-     for Windows; on macOS: brew install --cask git-credential-manager)
-  3. A personal access token, pasted when git asks for the password
-Other ways:
-  - SSH: PG_REPO=git@github.com:Fefar-AT/package-guard.git sh install.sh ...
-  - A ZIP: download it from GitHub in the browser (or get it from the
-    maintainer), unzip it, then run: sh <folder>/install.sh <your-project>
-If this run has no terminal (for example Claude started it), git cannot ask for
-a login. Log in in a terminal first, then run the command there."
+    # Keep git's own error: a blocked network, a proxy, a wrong ref and a
+    # missing login look alike from the outside.
+    if ! clone_err=$(git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$PG_REF" "$PG_REPO" "$PG_HOME" 2>&1); then
+        fail "clone failed: $PG_REPO @ $PG_REF
+git said: $clone_err
+The repository is public; no GitHub login is needed. Likely causes, in order:
+  1. No network access to github.com. In a Docker Sandbox (sbx) allow it:
+       sbx policy allow network --sandbox <name> github.com
+     Behind a proxy, check HTTPS_PROXY.
+  2. PG_REF=$PG_REF is not a branch or tag of $PG_REPO (default: main).
+  3. PG_REPO points to a private fork: log in to GitHub in a terminal first
+     (gh auth login), then run this again.
+No network at all: download the ZIP from GitHub, unzip it, then run
+  sh <folder>/install.sh <your-project>"
+    fi
     src="$PG_HOME"
 fi
 

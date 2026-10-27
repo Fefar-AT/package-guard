@@ -11,8 +11,10 @@
 # runs (Docker's v2 kit spec), and sbx substitutes nothing in a command: every
 # $VAR below is expanded by the shell.
 #
-#   setup.install  (once, at creation) clones PG_REPO into the agent user's
-#                  ~/.cache/package-guard and runs its install.sh against a
+#   setup.install  (once, at creation) copies the guard into the agent user's
+#                  ~/.cache/package-guard -- from the bundle a built kit
+#                  carries (sbx_kit.py), else by cloning PG_REPO -- and runs
+#                  its install.sh against a
 #                  scratch directory, which puts uv (and a CPython 3.11 if the
 #                  image has none) in ~/.local/bin, where the hooks look.
 #   setup.startup  (every start, no network) installs the guard into
@@ -22,9 +24,11 @@
 # up owned by root. The sandbox's outbound proxy is closed by default; the
 # allow list below is exactly what the installer and the guard need.
 #
-# While PG_REPO is private the clone needs a git credential for github.com (a
-# token in PG_REPO, or a credential helper the image carries); without one the
-# install step fails at the clone and says so.
+# The built kit (python3 sbx_kit.py) bundles the guard, so it needs no clone.
+# This directory on its own clones PG_REPO, which is public, so the clone
+# needs no git credential. Only a private fork in PG_REPO needs one (a token
+# in the URL, or a credential helper the image carries); without it the clone
+# fails and the installer prints git's error.
 
 schemaVersion: "2"
 kind: mixin
@@ -37,12 +41,16 @@ setup:
       command: >-
         set -eu;
         HOME="${HOME:-/home/agent}"; export HOME;
+        src="$HOME/.cache/package-guard"; rm -rf "$src"; mkdir -p "$HOME/.cache";
+        if [ -f "$HOME/.package-guard-bundle/install.py" ]; then
+        cp -R "$HOME/.package-guard-bundle" "$src"; from="the bundled copy";
+        else
         command -v git >/dev/null || { echo "package-guard kit: git is not in this image" >&2; exit 1; };
-        src="$HOME/.cache/package-guard"; rm -rf "$src";
         git -c advice.detachedHead=false clone --quiet --depth 1
-        --branch "$PG_REF" "$PG_REPO" "$src";
+        --branch "$PG_REF" "$PG_REPO" "$src"; from="$PG_REPO @ $PG_REF";
+        fi;
         scratch=$(mktemp -d); sh "$src/install.sh" "$scratch" >/dev/null; rm -rf "$scratch";
-        echo "package-guard kit: fetched $PG_REF and set up the runner"
+        echo "package-guard kit: installed from $from and set up the runner"
   startup:
     - command:
         - sh

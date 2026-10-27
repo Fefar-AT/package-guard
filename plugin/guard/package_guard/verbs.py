@@ -25,6 +25,8 @@ PEEL_WRAPPERS = set(TABLE["peel_wrappers"])
 RECURSIVE_WRAPPERS = set(TABLE["recursive_wrappers"])
 WRAPPER_GRAMMAR = TABLE.get("wrapper_grammar") or {}
 INERT_HEADS = set(TABLE.get("inert_heads") or ())
+# Heads that only read and print (generator: READ_ONLY_HEADS). Stricter than INERT_HEADS.
+READ_ONLY_HEADS = set(TABLE.get("read_only_heads") or ())
 STRING_RUNNERS = set(TABLE.get("string_runners") or ())
 STDIN_SHELLS = TABLE.get("stdin_shells") or {}
 CD_COMMANDS = set(TABLE["cd_commands"])
@@ -43,11 +45,17 @@ ENV_REACH = TABLE.get("env_reach") or {}
 _FILES = TABLE.get("installer_files") or {}
 _FILE_NAMES = {name.casefold() for name in _FILES.get("names", ())}
 _FILE_PATTERNS = [re.compile(fnmatch.translate(p.casefold())) for p in _FILES.get("patterns", ())]
+# Directories whose every file an installer reads (Yarn's `.yarn/`).
+_FILE_DIRS = {name.casefold() for name in _FILES.get("dirs", ())}
 
 
 def installer_file(path):
-    """True when the last component of `path` is a file an installer reads."""
-    name = re.split(r"[\\/]", path)[-1].casefold()
+    """True when the last component of `path` is a file an installer reads, or
+    any component names a directory it reads wholesale (`.yarn/releases/x.cjs`)."""
+    parts = re.split(r"[\\/]", path)
+    name = parts[-1].casefold()
+    if _FILE_DIRS and (name in _FILE_DIRS or any(p.casefold() in _FILE_DIRS for p in parts[:-1])):
+        return True
     return name in _FILE_NAMES or any(p.match(name) for p in _FILE_PATTERNS)
 
 
@@ -59,6 +67,11 @@ INSTALLER_FILE_IN_TEXT = re.compile(
         + [re.escape(p).replace(r"\*", r"[\w.-]*") for p in _FILES.get("patterns", ())]),
     re.IGNORECASE,
 )
+# `.yarn/releases/yarn.cjs` inside code: the directory, not a longer name.
+INSTALLER_DIR_IN_TEXT = re.compile(
+    r"(?<![\w.-])(?:%s)(?=[/\\])" % "|".join(re.escape(d) for d in sorted(_FILE_DIRS)),
+    re.IGNORECASE,
+) if _FILE_DIRS else None
 
 
 def installer_reads(name):
@@ -125,6 +138,51 @@ def npm_deref(verb):
     return canonical
 
 
+# One answer to "is this word a Python interpreter": python, python3, python3.13t, pythonw,
+# pypy, pypy3, the `py` / `pyw` launchers, Jython, GraalPy, IronPython; any directory,
+# any `.exe`. Broad on purpose: a wrong match only reads one more command line for `-m`.
+_INTERPRETER = re.compile(
+    r"(?:(?:python|pypy|jython|graalpy|ironpython|rustpython)[\w.+-]*|pyw?|ipy(?:64)?)", re.IGNORECASE)
+
+
+def is_interpreter(name):
+    """True when a command basename (no directory) names a Python interpreter."""
+    name = re.split(r"[\\/]", name)[-1]
+    if name.lower().endswith(".exe"):
+        name = name[:-4]
+    return bool(_INTERPRETER.fullmatch(name))
+
+
+# Variables CPython (and PyPy) read that change what runs before or around the module
+# (`PYTHONPATH`'s sitecustomize, `PYTHONHOME`, `PYTHONUSERBASE`'s usercustomize,
+# `PYTHONSTARTUP`, `PYTHONPYCACHEPREFIX`, `PYTHON_PRESITE`, `PYTHONSAFEPATH`, ...): every
+# name starting `PYTHON` is refused in front of an installer except these, which only
+# tune output, hashing, bytecode writing or text encoding. `-E` / `-I` make the
+# interpreter ignore them, but the builds pip and uv start do not: no flag excuses one.
+PYTHON_ENV_HARMLESS = frozenset({
+    "PYTHONDONTWRITEBYTECODE", "PYTHONUNBUFFERED", "PYTHONHASHSEED", "PYTHONUTF8",
+    "PYTHONIOENCODING", "PYTHONNOUSERSITE", "PYTHONFAULTHANDLER", "PYTHONCOERCECLOCALE",
+    "PYTHONDEVMODE", "PYTHONOPTIMIZE", "PYTHONVERBOSE", "PYTHONDEBUG", "PYTHONCASEOK",
+    "PYTHONINTMAXSTRDIGITS", "PYTHONPROFILEIMPORTTIME", "PYTHONTRACEMALLOC",
+    "PYTHONASYNCIODEBUG", "PYTHON_COLORS", "PYTHONLEGACYWINDOWSSTDIO",
+})
+
+
+def python_env_refused(name):
+    """True when `name` is a Python variable that may add code to an installer's run."""
+    upper = name.upper()
+    return upper.startswith("PYTHON") and upper not in PYTHON_ENV_HARMLESS
+
+
+# Frappe's bench: the verbs that acquire packages or pull app code, and the `setup`
+# subcommands that do. Here so the fallback hint reads the same words as the parser.
+BENCH_INSTALL_VERBS = frozenset({
+    "init", "get-app", "get", "update", "new-app", "pip", "switch-to-branch", "remove-app",
+    "remove", "rm", "retry-upgrade", "switch-to-develop", "migrate-env", "install"})
+BENCH_INSTALL_SETUP = frozenset({
+    "requirements", "env", "socketio", "manager", "role", "production", "firewall"})
+
+
 def lookup(head):
     """The installer entry for a command basename, or None."""
     return _BY_HEAD.get(head)
@@ -148,7 +206,7 @@ def env_key(family, name):
     table = ENVIRONMENT.get(family)
     if not table or not name.upper().startswith(table["prefix"].upper()):
         return None
-    if family == "npm":
+    if table.get("normalise") == "npm":
         key = name[len(table["prefix"]):]
         if not key.startswith("//"):
             key = (key[:1] + key[1:].replace("_", "-")).lower()
@@ -156,7 +214,7 @@ def env_key(family, name):
     return name.upper()
 
 
-def classify_env(family, name):
+def classify_env(family, name, shared=True):
     """What `name=...` in front of this family's installer means.
 
     None when the installer does not read it. Otherwise `allow`, `locked`
@@ -165,7 +223,14 @@ def classify_env(family, name):
     prefix that no list carries is refused by default.
     """
     upper = name.upper()
-    for category, names in ENV_SHARED_REFUSE.items():
+    # `shared`: the names every installer reads (HOME, a proxy, a CA bundle).
+    # They matter in a command's own prefix; the environment the hook itself
+    # runs in carries HOME and the like in every session.
+    for category, names in (ENV_SHARED_REFUSE.items() if shared else ()):
+        if upper in names:
+            return category
+    # A whole name with no family prefix that the installer reads (`PNPM_HOME`).
+    for category, names in ((ENVIRONMENT.get(family) or {}).get("exact_refuse") or {}).items():
         if upper in names:
             return category
     key = env_key(family, name)
@@ -200,7 +265,10 @@ def normalize(installer, verb):
     """Canonicalise a verb for this installer."""
     if installer.get("normalize") == "npm_deref":
         return npm_deref(verb)
-    return verb
+    if verb is None:
+        # A bare command (`yarn`) is the empty verb when the table has one.
+        return "" if "" in installer.get("acquire", {}) else None
+    return (installer.get("aliases") or {}).get(verb, verb)
 
 
 def classify(installer, verb):
@@ -248,6 +316,14 @@ def _npm_spellings():
 _HEAD_SUFFIX = r"(?:\.(?:exe|cmd|bat|ps1))?"
 
 
+# Modules `python -m` runs that install, or run an installer, and that the parser does not
+# read as `pip` or `uv` themselves (`parser._installer_module` is the same rule).
+INSTALLER_MODULE = r"(?:pip|uv|ensurepip|setuptools|easy_install)(?:\.[\w.]+)?"
+
+# Modules whose job is to run another module by name (`python -m runpy pip.__main__ ...`).
+MODULE_RUNNERS = ("runpy", "pdb", "cProfile", "profile", "trace")
+
+
 def _build_hint():
     alternatives = []
     for installer in INSTALLERS:
@@ -259,15 +335,49 @@ def _build_hint():
             alternatives.append(r"%s\s+" % heads)
             continue
         verbs = (_npm_spellings() if installer.get("normalize") == "npm_deref"
-                 else sorted(installer.get("acquire", {}), key=len, reverse=True))
+                 else sorted((v for v in installer.get("acquire", {}) if v), key=len, reverse=True))
+        # Verb aliases name the same verbs (`pnpm i x`, `bun rm x`).
+        verbs += [a for a, canonical in (installer.get("aliases") or {}).items()
+                  if canonical in installer.get("acquire", {})]
         if verbs:
             alternatives.append(r"(?:%s)\s+(?:%s)\b" % (heads, "|".join(re.escape(v) for v in verbs)))
+        scripts = installer.get("hint_scripts")
+        if scripts:
+            alternatives.append(r"(?:%s)(?:\s+|$)" % "|".join(scripts))
+        # The head alone, whatever follows: a wrapped shorthand is not read.
+        hint_heads = installer.get("hint_heads")
+        if hint_heads:
+            alternatives.append(r"(?:%s)%s(?:\s+|$)" % (
+                "|".join(re.escape(h) for h in hint_heads), _HEAD_SUFFIX))
         for name, sub in (installer.get("subtables") or {}).items():
             subverbs = sorted(sub.get("acquire", {}), key=len, reverse=True)
             if subverbs:
                 alternatives.append(r"(?:%s)\s+%s\s+(?:%s)\b" % (
                     heads, re.escape(name), "|".join(re.escape(v) for v in subverbs)))
-    alternatives.append(r"python[0-9.]*\s+-m\s+pip\s+install\b")
+    # An interpreter run on a module that installs, however `-m` is spelt: `python -mpip`,
+    # `py -3 -Im pip.__main__`, `pypy3 -W error -m ensurepip` (parser._python_module reads
+    # the same options; this is the reading for the words of a command it does not parse).
+    interpreter = (r"(?:[\w.-]*(?:python|pypy|jython|graalpy)[\w.-]*|pyw?|ipy(?:64)?)%s(?:\s+"
+                   r"(?:-[WXQ]\s+\S+|--check-hash-based-pycs\s+\S+|-\S*))*?" % _HEAD_SUFFIX)
+    alternatives.append(r"%s\s+-[A-Za-z]*m\s*['\"]?%s['\"]?(?:\s|$)" % (interpreter, INSTALLER_MODULE))
+    # `-m runpy pip.__main__`, `-m pdb -m pip`: a module that runs another by name.
+    alternatives.append(r"%s\s+-[A-Za-z]*m\s*['\"]?(?:%s)['\"]?\s+(?:\S+\s+)*?['\"]?%s['\"]?(?:\s|$)"
+                        % (interpreter, "|".join(MODULE_RUNNERS), INSTALLER_MODULE))
+    # `-m venv --upgrade-deps` runs pip against the index.
+    alternatives.append(r"%s\s+-[A-Za-z]*m\s*['\"]?venv['\"]?\s+(?:\S+\s+)*?--upgrade-"
+                        % interpreter)
+    # `python setup.py develop|install|easy_install|bdist_egg|test|upload`: installs the project and
+    # fetches its dependencies (the parser reads the interpreter forms; this reads the words of a
+    # command it does not parse, `flock /tmp/l python setup.py develop`).
+    alternatives.append(r"setup\.py\s+(?:\S+\s+)*?(?:develop|easy_install|bdist_egg|install\w*|test|pytest|"
+                        r"upload\w*|register)(?:\s|$)")
+    # The legacy installer executable: `easy_install`, `easy_install-3.9`.
+    alternatives.append(r"easy_install(?:-[0-9.]+)?%s(?:\s+|$)" % _HEAD_SUFFIX)
+    # bench's refused verbs, past the options of its click group (`--use-feature x`).
+    alternatives.append(
+        r"bench%s\s+(?:--?[\w-]+(?:=\S*)?\s+(?:[^-\s]\S*\s+)?)*(?:%s|setup\s+(?:--\s+)?(?:%s))(?:\s|$)"
+        % (_HEAD_SUFFIX, "|".join(sorted(BENCH_INSTALL_VERBS, key=len, reverse=True)),
+           "|".join(sorted(BENCH_INSTALL_SETUP, key=len, reverse=True))))
     for manager in FOREIGN:
         alternatives.append(r"%s%s\s+" % (re.escape(manager), _HEAD_SUFFIX))
     # `=` leads too: zsh runs `=npm` as the npm on PATH, and an alias body
@@ -285,7 +395,8 @@ def _verb_words():
     """Every spelling of a verb whose bare form acquires, for any installer:
     what follows a command name the parser cannot read (`$CMD install x`)."""
     always = {"npm_install", "npm_ci", "npm_exec", "npm_update", "uv_add", "uv_sync",
-              "pip_install", "pip_download", "pip_wheel"}
+              "pip_install", "pip_download", "pip_wheel",
+              "pnpm_install", "bun_install", "yarn_install"}
     found = set()
     for installer in INSTALLERS:
         verbs_ = {verb for verb, spec in installer.get("acquire", {}).items()

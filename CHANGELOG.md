@@ -1,5 +1,75 @@
 # Release notes
 
+## v1.11.0
+
+- **Modes: enforce, warn, off.** A supported way to turn the guard down for a
+  while, instead of uninstalling it. Only you can do it, from your own
+  terminal (`sh .claude/hooks/package_guard/pg mode warn --reason "..."`); Claude
+  is refused. It goes back to `enforce` after 24 hours by default, and every
+  package installed while it was down is checked when it comes back. See
+  [DETAILS](DETAILS.md#turning-it-down-modes).
+- **More install routes are caught.** Every spelling of `python -m pip`
+  (`-mpip`, `-Im pip`, `pip.__main__`, any interpreter name),
+  `python setup.py develop` / `install`, `venv --upgrade-deps`, `easy_install`,
+  module runners such as `python -m runpy pip`, and `PYTHONPATH`-style
+  variables in front of an installer. Each one used to install with the guard
+  silent; now each is reviewed or refused.
+- **More `bench` verbs are refused** until Frappe support lands in v1.12.0
+  (`migrate-env`, `install`, `setup production`, `setup role`, `setup firewall`,
+  ...). `bench build`, `start`, `migrate` and site commands still run.
+- The README is now a short quick start; everything else is in `DETAILS.md`.
+- The Docker Sandboxes kit can be one zip with the guard inside.
+
+## v1.10.0
+
+- pnpm, Bun and Yarn Berry (4.14.0 or newer) now work with the guard. They go
+  through the same review as npm: exact versions, the lock read in full
+  (`pnpm-lock.yaml` v9, text `bun.lock`, Berry `yarn.lock`), install scripts
+  off or on a reviewed allow-list, and no `.pnpmfile`, Bun `preload`, Yarn
+  `yarnPath` or plugin, or alternate registry. The project's `packageManager`
+  pin (`pnpm@X.Y.Z`, `yarn@4.X.Y`) is reviewed once like a package. `pnpm dlx`, `bunx` and
+  `yarn dlx` need an exact version and a review, like `npx`. `pipx`, `poetry`,
+  `conda` and `corepack` stay refused.
+- When a lock is missing or stale the guard names a command that installs
+  nothing: `pnpm install --lockfile-only --ignore-scripts`, `bun install
+  --lockfile-only --ignore-scripts` or `yarn install --mode=update-lockfile`.
+- Refused flags: `-r`, `--filter`, `-w`, `-g`/`--global`, `-C`/`--dir`, `--cwd`.
+  Refused verbs: pnpm `init`, `link`, `rebuild`, `approve-builds`, `import`,
+  `self-update`, `env`, `deploy`, `pack`, `publish`, `patch`, `store add`; Bun
+  `create`, `init`, `build`, `upgrade`, `pm trust`, `pm cache`, `pm pack`,
+  `patch`, `publish`; Yarn `exec`, `set`, `workspace(s)`, `create`, `init`,
+  `upgrade`, `global`, `npm publish`, `pack`, `patch`, `plugin`, `constraints`,
+  `rebuild`, `unplug`, `node`. Use `yarn run <script>`, not `yarn <script>`.
+  `pnpm create <x>@<exact>` is reviewed like `npm init`. `remove` is checked
+  like the lock-only forms; for a package found on disk the guard names
+  `pnpm remove <pkg>`, `bun remove <pkg> --ignore-scripts` or
+  `yarn remove <pkg> --mode=skip-build`.
+- `pnpm --version` and `yarn --version` (and `-v`, `--help`, `-h`, `help`) are
+  checked like any other run of the manager: pnpm and Yarn switch to the release
+  `packageManager` pins and Yarn runs `yarnPath`, so the pin must be reviewed
+  and a `yarnPath`, plugin or `.pnpmfile` is refused. Without a pin or one of
+  those, a print passes.
+- Known gaps: `pnpm update`, `bun update` and `yarn up` can move a package
+  within its existing range, like `npm update`. Yarn's checksums cannot be compared with npm's, so a person reads
+  the `yarn.lock` diff. Yarn Classic and Plug'n'Play, workspaces and catalogs
+  are refused. The approval flow is verified by tests; the maintainer checks a
+  live approval. The cache layouts the disk check reads have not been checked
+  against real managers, and pnpm store files with unexpected names are
+  skipped.
+- The guard's runner is unchanged: `uv` with exactly Python 3.11.
+- Upgrading: re-run the installer (or `/package-guard:setup` for the plugin) so
+  your project's `CLAUDE.md` gets the new package-manager wording.
+
+## v1.9.2
+
+- The repository is public, so the one-line install works again with no
+  GitHub login:
+  `curl -fsSL https://raw.githubusercontent.com/Fefar-AT/package-guard/release/install.sh | sh -s -- <project>`.
+  Outside members install the plugin without asking for access.
+- When the installer cannot clone, it shows git's own error and the likely
+  cause (usually the network or a sandbox rule) instead of asking you to log
+  in.
+
 ## v1.9.1
 
 - Windows hosts without WSL2 can run the guard in a Docker sandbox (`sbx`)

@@ -727,6 +727,72 @@
     "xxd",
     "yq"
   ],
+  "read_only_heads": [
+    ":",
+    "[",
+    "ack",
+    "ag",
+    "base64",
+    "basename",
+    "cat",
+    "cmp",
+    "column",
+    "comm",
+    "cut",
+    "date",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "egrep",
+    "false",
+    "fgrep",
+    "file",
+    "grep",
+    "head",
+    "hexdump",
+    "hostname",
+    "id",
+    "jq",
+    "ls",
+    "md5",
+    "md5sum",
+    "nl",
+    "od",
+    "paste",
+    "print",
+    "printf",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rev",
+    "rg",
+    "seq",
+    "sha256sum",
+    "shasum",
+    "sleep",
+    "sort",
+    "stat",
+    "strings",
+    "sw_vers",
+    "tac",
+    "tail",
+    "test",
+    "tr",
+    "tree",
+    "true",
+    "type",
+    "uname",
+    "uniq",
+    "wc",
+    "whence",
+    "where",
+    "whereis",
+    "which",
+    "whoami",
+    "xxd"
+  ],
   "string_runners": [
     "alias",
     "concurrently",
@@ -753,21 +819,33 @@
   },
   "installer_files": {
     "names": [
+      ".bunfig.toml",
       ".npmrc",
+      ".pnpmfile.cjs",
+      ".pnpmfile.mjs",
       ".python-version",
+      ".yarnrc.yml",
+      "bun.lock",
+      "bun.lockb",
+      "bunfig.toml",
       "npm-shrinkwrap.json",
       "package-lock.json",
       "package.json",
       "pip.conf",
       "pip.ini",
+      "pnpm-lock.yaml",
       "pnpm-workspace.yaml",
       "pyproject.toml",
       "uv.lock",
-      "uv.toml"
+      "uv.toml",
+      "yarn.lock"
     ],
     "patterns": [
       "requirements*.txt",
       "requirements*.in"
+    ],
+    "dirs": [
+      ".yarn"
     ]
   },
   "cd_commands": [
@@ -954,6 +1032,7 @@
     "npm": {
       "prefix": "npm_config_",
       "tool": "npm",
+      "normalise": "npm",
       "allow": [
         "audit",
         "bin-links",
@@ -1012,6 +1091,214 @@
           ":registry"
         ]
       },
+      "refuse_prefixes": {}
+    },
+    "pnpm": {
+      "prefix": "pnpm_config_",
+      "tool": "pnpm",
+      "normalise": "npm",
+      "allow": [
+        "audit",
+        "bin-links",
+        "cache",
+        "foreground-scripts",
+        "fund",
+        "ignore-scripts",
+        "install-links",
+        "legacy-peer-deps",
+        "loglevel",
+        "maxsockets",
+        "offline",
+        "prefer-offline",
+        "prefer-online",
+        "progress",
+        "save-exact",
+        "update-notifier",
+        "yes"
+      ],
+      "allow_prefixes": [
+        "fetch-"
+      ],
+      "locked": [],
+      "paths": [],
+      "refuse": {
+        "source": [
+          "globalconfig",
+          "registry",
+          "replace-registry-host",
+          "userconfig"
+        ],
+        "requirements": [],
+        "retarget": [
+          "global",
+          "prefix",
+          "workspace",
+          "workspaces"
+        ],
+        "network": [
+          "ca",
+          "cafile",
+          "cert",
+          "https-proxy",
+          "key",
+          "noproxy",
+          "proxy",
+          "strict-ssl"
+        ],
+        "integrity": [
+          "package-lock",
+          "script-shell"
+        ]
+      },
+      "refuse_suffixes": {
+        "source": [
+          ":registry"
+        ]
+      },
+      "refuse_prefixes": {},
+      "exact_refuse": {
+        "retarget": [
+          "PNPM_HOME"
+        ]
+      }
+    },
+    "bun": {
+      "prefix": "BUN_",
+      "tool": "bun",
+      "allow": [
+        "BUN_CONFIG_DNS_RESULT_ORDER",
+        "BUN_CONFIG_HTTP_RETRY_COUNT",
+        "BUN_CONFIG_MAX_HTTP_REQUESTS",
+        "BUN_CONFIG_VERBOSE_FETCH"
+      ],
+      "allow_prefixes": [],
+      "locked": [],
+      "paths": [],
+      "refuse": {
+        "source": [
+          "BUN_CONFIG_REGISTRY",
+          "BUN_CONFIG_TOKEN"
+        ],
+        "requirements": [],
+        "retarget": [],
+        "network": [],
+        "integrity": [
+          "BUN_CONFIG_SKIP_LOAD_LOCKFILE",
+          "BUN_CONFIG_SKIP_SAVE_LOCKFILE",
+          "BUN_CONFIG_SKIP_INSTALL_PACKAGES",
+          "BUN_CONFIG_YARN_LOCKFILE"
+        ]
+      },
+      "refuse_prefixes": {
+        "retarget": [
+          "BUN_INSTALL"
+        ]
+      }
+    },
+    "yarn": {
+      "prefix": "YARN_",
+      "tool": "yarn",
+      "allow": [
+        "YARN_ENABLE_COLORS",
+        "YARN_ENABLE_HYPERLINKS",
+        "YARN_ENABLE_IMMUTABLE_CACHE",
+        "YARN_ENABLE_IMMUTABLE_INSTALLS",
+        "YARN_ENABLE_INLINE_BUILDS",
+        "YARN_ENABLE_MESSAGE_NAMES",
+        "YARN_ENABLE_PROGRESS_BARS",
+        "YARN_ENABLE_TELEMETRY",
+        "YARN_ENABLE_TIMERS",
+        "YARN_HTTP_RETRY",
+        "YARN_HTTP_TIMEOUT",
+        "YARN_NETWORK_CONCURRENCY",
+        "YARN_PREFER_INTERACTIVE",
+        "YARN_PROGRESS_BAR_STYLE"
+      ],
+      "allow_prefixes": [],
+      "locked": [],
+      "paths": [],
+      "refuse": {
+        "source": [
+          "YARN_NPM_REGISTRY_SERVER",
+          "YARN_NPM_REGISTRIES",
+          "YARN_NPM_SCOPES",
+          "YARN_NPM_AUTH_TOKEN",
+          "YARN_NPM_AUTH_IDENT",
+          "YARN_YARN_PATH",
+          "YARN_PLUGINS",
+          "YARN_PACKAGE_EXTENSIONS",
+          "YARN_INJECT_ENVIRONMENT_FILES",
+          "YARN_UNSAFE_HTTP_WHITELIST"
+        ],
+        "requirements": [
+          "YARN_NPM_PREAPPROVED_PACKAGES"
+        ],
+        "retarget": [
+          "YARN_RC_FILENAME",
+          "YARN_NODE_LINKER",
+          "YARN_CACHE_FOLDER",
+          "YARN_GLOBAL_FOLDER"
+        ],
+        "network": [
+          "YARN_HTTP_PROXY",
+          "YARN_HTTPS_PROXY",
+          "YARN_HTTPS_CA_FILE_PATH",
+          "YARN_HTTPS_KEY_FILE_PATH",
+          "YARN_HTTPS_CERT_FILE_PATH",
+          "YARN_NETWORK_SETTINGS"
+        ],
+        "integrity": [
+          "YARN_ENABLE_SCRIPTS",
+          "YARN_CHECKSUM_BEHAVIOR",
+          "YARN_NPM_MINIMAL_AGE_GATE"
+        ]
+      },
+      "refuse_prefixes": {}
+    },
+    "corepack": {
+      "prefix": "COREPACK_",
+      "tool": "corepack",
+      "allow": [
+        "COREPACK_ENABLE_DOWNLOAD_PROMPT"
+      ],
+      "allow_prefixes": [],
+      "locked": [],
+      "paths": [],
+      "refuse": {
+        "source": [
+          "COREPACK_NPM_REGISTRY",
+          "COREPACK_NPM_TOKEN",
+          "COREPACK_NPM_USERNAME",
+          "COREPACK_NPM_PASSWORD"
+        ],
+        "requirements": [],
+        "retarget": [
+          "COREPACK_HOME"
+        ],
+        "network": [],
+        "integrity": [
+          "COREPACK_INTEGRITY_KEYS",
+          "COREPACK_ENABLE_STRICT",
+          "COREPACK_ENABLE_AUTO_PIN",
+          "COREPACK_ENABLE_NETWORK",
+          "COREPACK_DEFAULT_TO_LATEST"
+        ]
+      },
+      "refuse_prefixes": {},
+      "exact_refuse": {
+        "integrity": [
+          "SKIP_YARN_COREPACK_CHECK"
+        ]
+      }
+    },
+    "npm-unread": {
+      "prefix": "npm_config_",
+      "tool": "npm",
+      "allow": [],
+      "allow_prefixes": [],
+      "locked": [],
+      "paths": [],
+      "refuse": {},
       "refuse_prefixes": {}
     }
   },
@@ -1384,6 +1671,631 @@
     },
     {
       "heads": [
+        "pnpm"
+      ],
+      "ecosystem": "npm",
+      "unknown_verb": "deny",
+      "unknown_hint": "use pnpm run <script> or pnpm exec <bin>",
+      "globals": {
+        "-v": "inert",
+        "-V": "inert",
+        "--version": "inert",
+        "-h": "inert",
+        "--help": "inert",
+        "-C": "deny_cwd",
+        "--dir": "deny_cwd",
+        "--filter": "deny_cwd",
+        "-F": "deny_cwd",
+        "-r": "deny_cwd",
+        "--recursive": "deny_cwd",
+        "-w": "deny_cwd",
+        "--workspace-root": "deny_cwd",
+        "--ignore-workspace": "deny_cwd",
+        "-g": "deny_cwd",
+        "--global": "deny_cwd",
+        "--filter-prod": "deny_cwd",
+        "--registry": "deny_source",
+        "--config": "deny_source",
+        "--userconfig": "deny_source",
+        "--reporter": "skip+arg",
+        "--loglevel": "skip+arg",
+        "-s": "skip",
+        "--silent": "skip",
+        "-q": "skip",
+        "--quiet": "skip",
+        "--color": "skip",
+        "--no-color": "skip"
+      },
+      "globals_deny_prefixes": [
+        "--config."
+      ],
+      "print_bare_only": true,
+      "hint_heads": [
+        "pnpm"
+      ],
+      "hint_scripts": [
+        "pnpm\\.[cm]?js"
+      ],
+      "env": [
+        "pnpm",
+        "npm",
+        "corepack"
+      ],
+      "acquire": {
+        "install": {
+          "handler": "pnpm_install",
+          "sample": "pnpm install left-pad@1.3.0"
+        },
+        "add": {
+          "handler": "pnpm_install",
+          "sample": "pnpm add left-pad@1.3.0"
+        },
+        "update": {
+          "handler": "pnpm_install",
+          "sample": "pnpm update",
+          "note": "re-resolves dependencies from the registry"
+        },
+        "install-test": {
+          "handler": "pnpm_install",
+          "sample": "pnpm install-test"
+        },
+        "fetch": {
+          "handler": "pnpm_install",
+          "sample": "pnpm fetch",
+          "note": "downloads every locked package into the store"
+        },
+        "dedupe": {
+          "handler": "pnpm_install",
+          "sample": "pnpm dedupe",
+          "note": "re-resolves the tree from the registry"
+        },
+        "remove": {
+          "handler": "pm_remove",
+          "sample": "pnpm remove --filter app left-pad",
+          "note": "inert unless a source or target flag is present (Q12)"
+        },
+        "dlx": {
+          "handler": "pnpm_dlx",
+          "sample": "pnpm dlx cowsay@1.6.0"
+        },
+        "create": {
+          "handler": "pnpm_create",
+          "sample": "pnpm create vite@5.4.11"
+        },
+        "config": {
+          "handler": "pm_config",
+          "sample": "pnpm config set registry https://x.example/",
+          "note": "only config get|list is read-only"
+        },
+        "audit": {
+          "handler": "pm_audit",
+          "sample": "pnpm audit --fix",
+          "note": "only the --fix form installs"
+        },
+        "deploy": {
+          "handler": "unsupported",
+          "sample": "pnpm deploy out",
+          "note": "installs into a directory reconciliation never reads"
+        },
+        "link": {
+          "handler": "unsupported",
+          "sample": "pnpm link ../x"
+        },
+        "unlink": {
+          "handler": "unsupported",
+          "sample": "pnpm unlink"
+        },
+        "rebuild": {
+          "handler": "unsupported",
+          "sample": "pnpm rebuild",
+          "note": "re-runs install scripts of installed packages"
+        },
+        "approve-builds": {
+          "handler": "unsupported",
+          "sample": "pnpm approve-builds",
+          "note": "authorises package-supplied lifecycle scripts"
+        },
+        "import": {
+          "handler": "unsupported",
+          "sample": "pnpm import",
+          "note": "converts a foreign lock"
+        },
+        "pack": {
+          "handler": "unsupported",
+          "sample": "pnpm pack",
+          "note": "runs the root prepack and prepare scripts"
+        },
+        "publish": {
+          "handler": "unsupported",
+          "sample": "pnpm publish",
+          "note": "outward-facing: uploads to a registry"
+        },
+        "patch": {
+          "handler": "unsupported",
+          "sample": "pnpm patch left-pad@1.3.0",
+          "note": "fetches and extracts a package"
+        },
+        "patch-commit": {
+          "handler": "unsupported",
+          "sample": "pnpm patch-commit x"
+        },
+        "patch-remove": {
+          "handler": "unsupported",
+          "sample": "pnpm patch-remove x"
+        },
+        "self-update": {
+          "handler": "unsupported",
+          "sample": "pnpm self-update",
+          "note": "replaces the package manager"
+        },
+        "setup": {
+          "handler": "unsupported",
+          "sample": "pnpm setup"
+        },
+        "env": {
+          "handler": "unsupported",
+          "sample": "pnpm env use 20",
+          "note": "fetches a Node.js runtime"
+        },
+        "runtime": {
+          "handler": "unsupported",
+          "sample": "pnpm runtime set node 20"
+        },
+        "store": {
+          "handler": "pm_store",
+          "sample": "pnpm store add left-pad@1.3.0",
+          "note": "store path|status only; add fetches, prune deletes"
+        },
+        "init": {
+          "handler": "unsupported",
+          "sample": "pnpm init"
+        },
+        "run": {
+          "handler": "pnpm_run",
+          "sample": "pnpm run build",
+          "note": "runs a project script; inert like npm run, plus the config checks (RunScope)"
+        },
+        "exec": {
+          "handler": "pnpm_exec",
+          "sample": "pnpm exec eslint .",
+          "note": "runs a binary of the project's node_modules/.bin; fetches nothing (pnpm dlx fetches)"
+        },
+        "test": {
+          "handler": "pnpm_run",
+          "sample": "pnpm test"
+        },
+        "start": {
+          "handler": "pnpm_run",
+          "sample": "pnpm start"
+        },
+        "restart": {
+          "handler": "pnpm_run",
+          "sample": "pnpm restart"
+        },
+        "stop": {
+          "handler": "pnpm_run",
+          "sample": "pnpm stop"
+        }
+      },
+      "inert": [
+        "list",
+        "why",
+        "outdated",
+        "licenses",
+        "view",
+        "root",
+        "bin",
+        "help",
+        "ignored-builds",
+        "doctor"
+      ],
+      "aliases": {
+        "i": "install",
+        "it": "install-test",
+        "up": "update",
+        "upgrade": "update",
+        "rm": "remove",
+        "uninstall": "remove",
+        "un": "remove",
+        "ls": "list",
+        "ll": "list",
+        "la": "list",
+        "ln": "link",
+        "dislink": "unlink",
+        "rb": "rebuild",
+        "run-script": "run",
+        "t": "test",
+        "tst": "test",
+        "c": "config",
+        "info": "view",
+        "show": "view",
+        "v": "view",
+        "x": "exec"
+      }
+    },
+    {
+      "heads": [
+        "pnx",
+        "pnpx"
+      ],
+      "ecosystem": "npm",
+      "unknown_verb": "ignore",
+      "head_only": true,
+      "hint_heads": [
+        "pnx",
+        "pnpx"
+      ],
+      "env": [
+        "pnpm",
+        "npm",
+        "corepack"
+      ],
+      "acquire": {
+        "": {
+          "handler": "pnpm_dlx_head",
+          "sample": "pnpx cowsay@1.6.0"
+        }
+      },
+      "inert": []
+    },
+    {
+      "heads": [
+        "bun"
+      ],
+      "ecosystem": "npm",
+      "unknown_verb": "deny",
+      "unknown_hint": "use bun run <script>",
+      "file_handler": "bun_file",
+      "globals": {
+        "-v": "inert",
+        "-V": "inert",
+        "--version": "inert",
+        "-h": "inert",
+        "--help": "inert",
+        "--cwd": "deny_cwd",
+        "-g": "deny_cwd",
+        "--global": "deny_cwd",
+        "--filter": "deny_cwd",
+        "--registry": "deny_source",
+        "-c": "deny_source",
+        "--config": "deny_source",
+        "--silent": "skip",
+        "--verbose": "skip",
+        "--no-progress": "skip",
+        "--bun": "skip",
+        "--watch": "skip",
+        "--hot": "skip",
+        "--smol": "skip",
+        "--no-install": "skip",
+        "--revision": "inert"
+      },
+      "globals_deny_prefixes": [],
+      "print_bare_only": true,
+      "hint_heads": [
+        "bun",
+        "bunx"
+      ],
+      "env": [
+        "bun",
+        "npm-unread"
+      ],
+      "acquire": {
+        "install": {
+          "handler": "bun_install",
+          "sample": "bun install"
+        },
+        "add": {
+          "handler": "bun_install",
+          "sample": "bun add left-pad@1.3.0"
+        },
+        "update": {
+          "handler": "bun_install",
+          "sample": "bun update",
+          "note": "re-resolves dependencies from the registry"
+        },
+        "remove": {
+          "handler": "pm_remove",
+          "sample": "bun remove --cwd app left-pad",
+          "note": "inert unless a source or target flag is present (Q12)"
+        },
+        "x": {
+          "handler": "bun_x",
+          "sample": "bun x cowsay@1.6.0"
+        },
+        "audit": {
+          "handler": "pm_audit",
+          "sample": "bun audit fix"
+        },
+        "create": {
+          "handler": "unsupported",
+          "sample": "bun create vite",
+          "note": "runs create-* packages and template hooks"
+        },
+        "link": {
+          "handler": "unsupported",
+          "sample": "bun link left-pad"
+        },
+        "unlink": {
+          "handler": "unsupported",
+          "sample": "bun unlink"
+        },
+        "patch": {
+          "handler": "unsupported",
+          "sample": "bun patch left-pad",
+          "note": "fetches and extracts a package"
+        },
+        "patch-commit": {
+          "handler": "unsupported",
+          "sample": "bun patch-commit x"
+        },
+        "upgrade": {
+          "handler": "unsupported",
+          "sample": "bun upgrade",
+          "note": "replaces the bun binary"
+        },
+        "init": {
+          "handler": "unsupported",
+          "sample": "bun init"
+        },
+        "run": {
+          "handler": "bun_run",
+          "sample": "bun run build",
+          "note": "with no node_modules Bun installs what it imports at run time; the hook refuses that (RunScope.autoinstall)"
+        },
+        "test": {
+          "handler": "bun_run",
+          "sample": "bun test",
+          "note": "resolves like bun run"
+        },
+        "repl": {
+          "handler": "unsupported",
+          "sample": "bun repl"
+        },
+        "build": {
+          "handler": "unsupported",
+          "sample": "bun build ./index.ts"
+        }
+      },
+      "inert": [
+        "outdated",
+        "why",
+        "info",
+        "help"
+      ],
+      "aliases": {
+        "i": "install",
+        "a": "add",
+        "up": "update",
+        "rm": "remove",
+        "r": "remove",
+        "uninstall": "remove"
+      },
+      "subtables": {
+        "pm": {
+          "acquire": {
+            "trust": {
+              "handler": "unsupported",
+              "sample": "bun pm trust esbuild",
+              "note": "runs blocked lifecycle scripts"
+            },
+            "migrate": {
+              "handler": "unsupported",
+              "sample": "bun pm migrate",
+              "note": "rewrites lockfiles"
+            },
+            "version": {
+              "handler": "unsupported",
+              "sample": "bun pm version patch"
+            },
+            "cache": {
+              "handler": "unsupported",
+              "sample": "bun pm cache rm"
+            },
+            "scan": {
+              "handler": "unsupported",
+              "sample": "bun pm scan"
+            },
+            "pack": {
+              "handler": "unsupported",
+              "sample": "bun pm pack",
+              "note": "runs the root prepack and prepare scripts"
+            },
+            "pkg": {
+              "handler": "unsupported",
+              "sample": "bun pm pkg set x=1",
+              "note": "rewrites package.json"
+            }
+          },
+          "inert": [
+            "ls",
+            "bin",
+            "hash",
+            "hash-string",
+            "hash-print",
+            "untrusted",
+            "default-trusted",
+            "whoami"
+          ]
+        }
+      }
+    },
+    {
+      "heads": [
+        "bunx"
+      ],
+      "ecosystem": "npm",
+      "unknown_verb": "ignore",
+      "head_only": true,
+      "hint_heads": [
+        "bunx"
+      ],
+      "env": [
+        "bun",
+        "npm-unread"
+      ],
+      "acquire": {
+        "": {
+          "handler": "bunx",
+          "sample": "bunx cowsay@1.6.0"
+        }
+      },
+      "inert": [],
+      "no_acquire_flags": [
+        "--no-install"
+      ]
+    },
+    {
+      "heads": [
+        "yarn",
+        "yarnpkg"
+      ],
+      "ecosystem": "npm",
+      "unknown_verb": "deny",
+      "unknown_hint": "use yarn run <script>",
+      "globals": {
+        "-v": "inert",
+        "-V": "inert",
+        "--version": "inert",
+        "-h": "inert",
+        "--help": "inert",
+        "--cwd": "deny_cwd"
+      },
+      "globals_deny_prefixes": [],
+      "print_bare_only": true,
+      "hint_heads": [
+        "yarn",
+        "yarnpkg"
+      ],
+      "hint_scripts": [
+        "yarn-[0-9][\\w.-]*\\.cjs",
+        "yarn\\.[cm]?js"
+      ],
+      "env": [
+        "yarn",
+        "npm-unread",
+        "corepack"
+      ],
+      "acquire": {
+        "": {
+          "handler": "yarn_install",
+          "sample": "yarn",
+          "note": "bare yarn is yarn install"
+        },
+        "install": {
+          "handler": "yarn_install",
+          "sample": "yarn install"
+        },
+        "add": {
+          "handler": "yarn_install",
+          "sample": "yarn add left-pad@1.3.0"
+        },
+        "up": {
+          "handler": "yarn_install",
+          "sample": "yarn up left-pad@1.3.0",
+          "note": "re-resolves dependencies from the registry"
+        },
+        "remove": {
+          "handler": "pm_remove",
+          "sample": "yarn remove --cwd app left-pad",
+          "note": "inert unless a source or target flag is present (Q12)"
+        },
+        "dlx": {
+          "handler": "yarn_dlx",
+          "sample": "yarn dlx cowsay@1.6.0"
+        },
+        "npm": {
+          "handler": "yarn_npm",
+          "sample": "yarn npm login",
+          "note": "only npm info and npm audit are read-only"
+        },
+        "config": {
+          "handler": "pm_config",
+          "sample": "yarn config set npmRegistryServer https://x.example/",
+          "note": "only config get is read-only"
+        },
+        "exec": {
+          "handler": "unsupported",
+          "sample": "yarn exec node x.js"
+        },
+        "node": {
+          "handler": "unsupported",
+          "sample": "yarn node x.js"
+        },
+        "rebuild": {
+          "handler": "unsupported",
+          "sample": "yarn rebuild"
+        },
+        "unplug": {
+          "handler": "unsupported",
+          "sample": "yarn unplug x"
+        },
+        "pack": {
+          "handler": "unsupported",
+          "sample": "yarn pack",
+          "note": "runs the root prepack and prepare scripts"
+        },
+        "patch": {
+          "handler": "unsupported",
+          "sample": "yarn patch x"
+        },
+        "patch-commit": {
+          "handler": "unsupported",
+          "sample": "yarn patch-commit x"
+        },
+        "plugin": {
+          "handler": "unsupported",
+          "sample": "yarn plugin import x",
+          "note": "plugins are code that runs inside yarn"
+        },
+        "set": {
+          "handler": "unsupported",
+          "sample": "yarn set version stable",
+          "note": "swaps the yarn binary (writes yarnPath)"
+        },
+        "workspaces": {
+          "handler": "unsupported",
+          "sample": "yarn workspaces foreach run build"
+        },
+        "workspace": {
+          "handler": "unsupported",
+          "sample": "yarn workspace app add x"
+        },
+        "constraints": {
+          "handler": "unsupported",
+          "sample": "yarn constraints"
+        },
+        "upgrade-interactive": {
+          "handler": "unsupported",
+          "sample": "yarn upgrade-interactive"
+        },
+        "create": {
+          "handler": "unsupported",
+          "sample": "yarn create vite"
+        },
+        "link": {
+          "handler": "unsupported",
+          "sample": "yarn link ../x"
+        },
+        "init": {
+          "handler": "unsupported",
+          "sample": "yarn init"
+        },
+        "run": {
+          "handler": "yarn_run",
+          "sample": "yarn run build",
+          "note": "runs a project script; the hook requires an up-to-date node_modules install state"
+        }
+      },
+      "inert": [
+        "why",
+        "info",
+        "explain",
+        "bin",
+        "help"
+      ]
+    },
+    {
+      "heads": [
         "uv"
       ],
       "ecosystem": "pypi",
@@ -1617,11 +2529,7 @@
       "outdated",
       "which"
     ],
-    "no_safe_verbs": [
-      "bunx",
-      "pnpx",
-      "pnx"
-    ],
+    "no_safe_verbs": [],
     "print_only": {
       "corepack": [
         "--version",
@@ -1631,13 +2539,6 @@
       ]
     },
     "managers": {
-      "pnpm": "pnpm is not permitted in this project; use npm",
-      "yarn": "yarn is not permitted in this project; use npm",
-      "yarnpkg": "yarnpkg (yarn) is not permitted in this project; use npm",
-      "bunx": "bunx downloads and runs packages and is not permitted in this project; use npx",
-      "pnpx": "pnpx downloads and runs packages and is not permitted in this project; use npx",
-      "pnx": "pnx (pnpm dlx) downloads and runs packages and is not permitted in this project; use npx",
-      "bun": "bun is not permitted in this project; use npm",
       "corepack": "corepack downloads package managers (pnpm, yarn) and 'corepack use' installs the project's dependencies; it is not permitted in this project, only 'corepack --version' and 'corepack --help'; use npm",
       "pipx": "pipx is not permitted in this project; use 'uv tool install'",
       "poetry": "poetry is not permitted in this project; use 'uv add'",

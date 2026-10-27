@@ -31,6 +31,14 @@ import shutil
 import tomllib
 from pathlib import Path
 
+import bun_lock
+import parser as pg_parser
+import pm_config
+import pnpm_lock
+import protocols
+import yarn_lock
+from lock_errors import LockReadError
+
 NPM_REGISTRY = "https://registry.npmjs.org"
 PYPI_INDEX = "https://pypi.org/simple"
 PYPI_FILES = "https://files.pythonhosted.org/"
@@ -39,15 +47,13 @@ HOME = Path.home()
 
 
 def _same_url(value, default) -> bool:
-    return isinstance(value, str) and value.strip().strip("\"'").rstrip("/") == default
+    if not isinstance(value, str):
+        return False
+    # registry.yarnpkg.com is registry.npmjs.org under another name (D11).
+    return protocols.canonical_registry(value) == protocols.canonical_registry(default)
 
 
-_USERINFO = re.compile(r"(?<=://)[^/@\s]*@")
-
-
-def _redact(value) -> str:
-    """A URL as a reason may name it: the host, never the credentials before it."""
-    return _USERINFO.sub("***@", str(value))
+_redact = protocols.redact
 
 
 # ---------------------------------------------------------------------------
@@ -57,8 +63,8 @@ def _redact(value) -> str:
 # A spec that names something other than a registry version. `owner/repo` is
 # npm's GitHub shorthand; a range never contains a bare slash.
 _NPM_NON_REGISTRY = re.compile(
-    r"^(?:npm:|github:|gitlab:|bitbucket:|gist:|git\+|git:|ssh:|https?:|file:|link:|workspace:"
-    r"|\.{0,2}/|~/|[^/@\s]+@[^:/\s]+:)", re.IGNORECASE)
+    r"^(?:" + "|".join(re.escape(p) for p in protocols.NON_REGISTRY_PREFIXES)
+    + r"|\.{0,2}/|~/|[^/@\s]+@[^:/\s]+:)", re.IGNORECASE)
 _NPM_GITHUB_SHORTHAND = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:#.*)?$")
 # npm reads `.tgz`, `.tar.gz` and `.tar` as a tarball file, in any case. The
 # rest name no registry version either.
@@ -110,7 +116,7 @@ def _npm_global_rc(environ):
     return Path(prefix) / "etc" / "npmrc"
 
 
-def npm_config_problems(directory, home=None, environ=None) -> list:
+def npm_config_problems(directory, home=None, environ=None, prefixes=("npm_config_",)) -> list:
     home = Path(home) if home is not None else HOME
     environ = os.environ if environ is None else environ
     problems = []
@@ -126,11 +132,20 @@ def npm_config_problems(directory, home=None, environ=None) -> list:
                 problems.append(f"{path}: `{key}={_redact(value)}` redirects npm")
     for name, value in environ.items():
         lowered = name.lower()
-        if lowered.startswith("npm_config_") and (
-                lowered == "npm_config_registry" or lowered.endswith(":registry")):
+        prefix = next((p for p in prefixes if lowered.startswith(p)), None)
+        if prefix and (lowered == prefix + "registry" or lowered.endswith(":registry")):
             if not _same_url(value, NPM_REGISTRY):
                 problems.append(f"environment: {name} redirects npm")
     return problems
+
+
+def pm_config_problems(kind, directory, home=None, environ=None, require_linker=True) -> list:
+    """`pm_config` for one pnpm, Bun or Yarn, with the npm spec rules for the
+    `overrides` and `resolutions` it reads."""
+    home = Path(home) if home is not None else HOME
+    environ = os.environ if environ is None else environ
+    return pm_config.pm_config_problems(kind, directory, home, environ,
+                                        spec_problem=npm_spec_problem, require_linker=require_linker)
 
 
 def npm_lock_problems(directory) -> list:
@@ -164,12 +179,53 @@ def npm_lock_problems(directory) -> list:
             continue
         if entry.get("inBundle"):
             continue  # shipped inside its parent's tarball
-        if isinstance(resolved, str) and not resolved.startswith(NPM_REGISTRY + "/"):
+        if isinstance(resolved, str) and not any(
+                resolved.startswith(base + "/") for base in (NPM_REGISTRY, *protocols.NPM_REGISTRY_ALIASES)):
             problems.append(f"package-lock.json: {name} resolves to {_redact(resolved)}")
         alias = entry.get("name")
         if isinstance(alias, str) and alias != name:
             problems.append(f"package-lock.json: {name} is installed as {alias!r}")
     return problems
+
+
+_PM_LOCK_MODULES = {"pnpm": ("pnpm-lock.yaml", pnpm_lock), "bun": ("bun.lock", bun_lock),
+                    "yarn": ("yarn.lock", yarn_lock)}
+
+
+def pm_lock_problems(kind, directory) -> list:
+    """Lock entries a pnpm, Bun or Yarn install would fetch from somewhere other
+    than the registry (git, URL, tarball, file, link, workspace, patch, exec,
+    portal, jsr), and an unreadable lock, which is a problem and never an empty
+    list. A missing lock is the hook's own check (`_pm_project_problem`)."""
+    name, module = _PM_LOCK_MODULES[kind]
+    path = Path(directory) / name
+    if not path.is_file():
+        return []
+    try:
+        problems = []
+        for entry in module.non_registry_entries(path):
+            source = entry.resolution if kind == "yarn" else entry.spec
+            problems.append(f"{name}: {entry.name} is a {entry.kind} source ({_redact(source)})")
+        if kind == "pnpm":
+            problems += [f"{name}: patchedDependencies applies local code to {key}"
+                         for key in pnpm_lock.patched_dependencies(path)]
+        if kind == "bun":
+            problems += [f"{name}: patchedDependencies applies local code to {key}"
+                         for key in bun_lock.patched_dependencies(path)]
+        return problems
+    except LockReadError as exc:
+        return [f"{name} cannot be read ({exc})"]
+
+
+def _pm_lock_artifacts(kind, directory):
+    name, module = _PM_LOCK_MODULES[kind]
+    path = Path(directory) / name
+    if kind == "yarn" or not path.is_file():
+        return []  # Berry's checksum is a hash of its own cache zip, not npm's digest
+    try:
+        return [("npm", n, v, digests, missing) for n, v, digests, missing in module.artifacts(path)]
+    except LockReadError:
+        return []  # pm_lock_problems reports it
 
 
 def npm_manifest_problems(directory) -> list:
@@ -438,12 +494,14 @@ def _uv_lock_artifacts(directory):
     return out
 
 
-def artifact_problems(kinds, directory, artifacts_of) -> list:
+def artifact_problems(kinds, directory, artifacts_of, pm_kinds=()) -> list:
     """Lock files whose digest is not one an approval recorded: a file the
     registry gained after the review, or a lock edited to point elsewhere."""
     entries = []
     if "npm" in kinds:
         entries += _npm_lock_artifacts(directory)
+    for kind in pm_kinds:
+        entries += _pm_lock_artifacts(kind, directory)
     if "uv-project" in kinds:
         entries += _uv_lock_artifacts(directory)
     problems = []
@@ -475,12 +533,27 @@ def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
     environments the install may use, whose pip.conf pip reads."""
     ecosystems = {r.ecosystem for r in parsed.requests}
     managers = {r.manager for r in parsed.requests}
-    kinds = {m.kind for m in parsed.manifests}
+    # pnpm, Bun and Yarn install from package.json and node_modules: every npm
+    # source check applies to them as well.
+    kinds = {"npm" if m.kind in ("npm", "pnpm", "bun", "yarn") else m.kind
+             for m in parsed.manifests}
     problems = []
     if "npm" in ecosystems or "npm" in kinds:
-        problems += npm_config_problems(directory, home, environ)
+        # pnpm reads `pnpm_config_*` by the same rules as `npm_config_*`.
+        uses_pnpm = "pnpm" in pg_parser.pm_kinds(parsed)
+        problems += npm_config_problems(
+            directory, home, environ,
+            prefixes=("npm_config_", "pnpm_config_") if uses_pnpm else ("npm_config_",))
     if "npm" in kinds:
         problems += npm_manifest_problems(directory) + npm_lock_problems(directory)
+    pm_kinds = sorted({m.kind for m in parsed.manifests if m.kind in _PM_LOCK_MODULES})
+    for kind in pm_kinds:
+        problems += pm_lock_problems(kind, directory)
+    # Configuration the manager reads itself, for every pnpm, Bun and Yarn the
+    # command reaches, including the one-shot runners (`pnpm dlx`, `bunx`,
+    # `yarn dlx`: Yarn copies .yarnrc.yml into its temp project).
+    for kind, scoped in sorted(pg_parser.pm_kinds(parsed).items()):
+        problems += pm_config_problems(kind, directory, home, environ, require_linker=scoped)
     # A local build fetches build-system.requires through pip or uv; the
     # scope does not say which, so both configurations are checked.
     pypi = "pypi" in ecosystems or kinds & {"requirements", "uv-project", "build-requires"}
@@ -495,6 +568,6 @@ def problems_for(parsed, directory, home=None, environ=None, artifacts_of=None,
     if "uv-project" in kinds:
         problems += uv_lock_problems(directory)
     if artifacts_of is not None:
-        problems += artifact_problems(kinds, directory, artifacts_of)
+        problems += artifact_problems(kinds, directory, artifacts_of, pm_kinds)
     seen = set()
     return [p for p in problems if not (p in seen or seen.add(p))]

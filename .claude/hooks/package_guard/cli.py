@@ -2,7 +2,10 @@
 # /// script
 # requires-python = "==3.11.*"
 # ///
-"""Package Guard CLI: show / approve / decline / undecline / revoke / reconcile / audit.
+"""Package Guard CLI: show / approve / decline / undecline / revoke / reconcile / audit / mode.
+
+`mode` shows or changes the guard's mode (enforce, warn, off; see mode.py).
+Turning it down needs a person at a terminal; the hook refuses it from Claude.
 
 Every subcommand accepts one or more review ids — never a free-form package
 identity. The PreToolUse hook intercepts every state-changing verb and asks
@@ -43,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
     import disk_guard  # noqa: E402
     import manifest as pg_manifest  # noqa: E402
+    import mode as pg_mode  # noqa: E402
     import store  # noqa: E402
     import vetting  # noqa: E402
 except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
@@ -56,7 +60,9 @@ except Exception as _exc:  # pragma: no cover - exercised by test_import_guard
 USAGE = (
     "usage: cli.py show <review-id>... | cli.py approve <review-id>... | "
     "cli.py decline <review-id>... | cli.py undecline <review-id>... | "
-    "cli.py revoke <review-id>... | cli.py reconcile | cli.py audit "
+    "cli.py revoke <review-id>... | cli.py reconcile | cli.py audit | "
+    "cli.py mode [enforce [--project] | warn|off --reason <why> [--project] "
+    "[--for 90m|8h|7d | --permanent]] "
     "(optionally `<subcommand> --root <project>` to name the project)"
 )
 _COMMANDS = ("show", "approve", "decline", "undecline", "revoke")
@@ -373,6 +379,11 @@ def _reconcile(root) -> int:
             # anyway. Removal is the resolution, not a fresh review.
             blocked.append(f"{label} was declined by the user; remove it, do not review it")
             continue
+        if finding["version"] == disk_guard.inventory.UNIDENTIFIED:
+            # No registry identity exists to review or approve.
+            blocked.append(f"{label} could not be identified from disk; remove it: "
+                           f"{disk_guard.removal_command(finding)}")
+            continue
         review_id = finding.get("review_id")
         if not review_id:
             request = pg_manifest.as_request(
@@ -426,7 +437,7 @@ def _reconcile(root) -> int:
                   "report is in, approve in this order, never both kinds in one approve, at "
                   f"most {pg_hook._APPROVE_BATCH_MAX} ids per approve, each a simple standalone "
                   "command: the RECOMMEND ids first, then, after one short chat line per package "
-                  "with your suggestion, the NEEDS_HUMAN_REVIEW ids.")
+                  "naming its red flags first, then your suggestion, the NEEDS_HUMAN_REVIEW ids.")
             print(f"  {store.cli_command(root, 'approve', '<RECOMMEND ids>')}")
             print(f"  {store.cli_command(root, 'approve', '<NEEDS_HUMAN_REVIEW ids>')}")
             print("A DO_NOT_RECOMMEND, TYPO_SQUAT or lookalike id gets no approve command: "
@@ -509,6 +520,163 @@ def _audit(root) -> int:
     return 1 if malware else 0
 
 
+_MODE_VALUE_OPTIONS = ("--reason", "--for")
+_MODE_FLAG_OPTIONS = ("--project", "--permanent")
+_MODE_LOG_LINES = 10
+
+
+def _parse_mode(args):
+    """(mode or None, {option: value}). Raises ValueError on anything else:
+    an unknown or repeated option, a second mode, a missing reason, or `--for`
+    with `--permanent`."""
+    chosen, options, i = None, {}, 0
+    while i < len(args):
+        token = args[i]
+        if token in _MODE_VALUE_OPTIONS or token in _MODE_FLAG_OPTIONS:
+            if token in options:
+                raise ValueError(f"{token} is given twice")
+            if token in _MODE_FLAG_OPTIONS:
+                options[token] = True
+                i += 1
+                continue
+            if i + 1 >= len(args):
+                raise ValueError(f"{token} needs a value")
+            options[token] = args[i + 1]
+            i += 2
+            continue
+        if token.startswith("-"):
+            raise ValueError(f"unknown option {token!r}")
+        if chosen is not None:
+            raise ValueError(f"name one mode, not {chosen!r} and {token!r}")
+        if token not in pg_mode.MODES:
+            raise ValueError(f"unknown mode {token!r}; use enforce, warn or off")
+        chosen = token
+        i += 1
+    if chosen is None and options:
+        raise ValueError("options need a mode: enforce, warn or off")
+    if chosen == "enforce" and set(options) - {"--project"}:
+        raise ValueError("enforce takes only --project")
+    if chosen in ("warn", "off"):
+        if not str(options.get("--reason") or "").strip():
+            raise ValueError(f'{chosen} needs a reason: --reason "<why>"')
+        if "--for" in options and "--permanent" in options:
+            raise ValueError("use --for or --permanent, not both")
+    return chosen, options
+
+
+def _mode_status(root) -> int:
+    print(pg_mode.describe(pg_mode.effective(root)))
+    print()
+    for layer, path, state in pg_mode.layers(root):
+        print(f"  {layer:<9}{state}")
+        if path is not None:
+            print(f"  {'':<9}{path}")
+    entries = pg_mode.read_log(root, _MODE_LOG_LINES)
+    if entries:
+        print("\nRecent changes (newest last):")
+        for entry in entries:
+            details = " ".join(f"{k}={entry[k]}" for k in
+                               ("scope", "mode", "reason", "by", "expires_at", "code", "command")
+                               if entry.get(k) is not None)
+            print(f"  {entry.get('at', '?')}  {entry.get('event', '?')}  {details}")
+    return 0
+
+
+def _mode_enforce(root, scope) -> int:
+    pg_mode.set_mode(root, "enforce", scope)
+    print("Cleared your personal setting." if scope == "local" else
+          "Cleared the project setting (.claude/package-guard/mode.json); commit the removal.")
+    current = pg_mode.effective(root)
+    print(pg_mode.describe(current))
+    if current.mode != "enforce" and current.scope == "project":
+        print("The project setting still applies. To clear it:\n  "
+              + store.human_command(root, "mode", "enforce --project"))
+    elif current.mode != "enforce" and current.scope == "local":
+        print("Your personal setting still applies. To clear it:\n  "
+              + store.human_command(root, "mode", "enforce"))
+    try:
+        caught = disk_guard.follow_mode(root, current.mode)
+        if caught:
+            pg_mode.append_log(root, {"event": "caught-up", "count": len(caught)})
+        findings = disk_guard.open_findings(root)
+    except store.StoreError as exc:
+        print(f"The disk-findings record is unreadable ({exc}); package commands stay blocked "
+              "until it is repaired.")
+        return 0
+    if findings:
+        count = len(findings)
+        print(f"\n{count} unreviewed package{'' if count == 1 else 's'} on disk "
+              f"wait{'s' if count == 1 else ''} for review; package commands stay blocked "
+              "until each is approved or removed:")
+        for finding in findings:
+            print(f"  - {disk_guard._label(finding)}  [{finding.get('source')}]")
+    return 0
+
+
+def _mode_down(root, chosen, scope, options) -> int:
+    current = pg_mode.effective(root)
+    if current.scope == "policy" and current.locked:
+        print(f"error: {pg_mode.describe(current)} Nothing was changed.", file=sys.stderr)
+        return 1
+    try:
+        duration = (None if options.get("--permanent") else
+                    pg_mode.parse_duration(options["--for"]) if "--for" in options else
+                    pg_mode.DEFAULT_DURATION)
+    except ValueError as exc:
+        print(f"error: {exc}. Nothing was changed.", file=sys.stderr)
+        return 1
+    # Claude's Bash tool has no terminal on stdin; the hook refuses this call
+    # from Claude before it gets here, and this is the second lock.
+    if not sys.stdin.isatty():
+        print(f"error: `mode {chosen}` must be run by a person in their own terminal. "
+              "Claude's commands, and `!` commands in Claude Code, have no terminal to "
+              "confirm in; open a separate terminal window. Nothing was changed.",
+              file=sys.stderr)
+        return 1
+    who = "you in this project" if scope == "local" else "everyone on this project"
+    span = "with no expiry" if duration is None else f"for {options.get('--for') or '24h'}"
+    effect = ("its refusals become warnings" if chosen == "warn"
+              else "Claude's package installs are not checked")
+    print(f"This turns Package Guard {chosen.upper()} for {who}, {span}: {effect}.")
+    try:
+        answer = input(f"Type '{chosen}' to confirm: ")
+    except EOFError:
+        answer = ""
+    if answer.strip() != chosen:
+        print("error: not confirmed. Nothing was changed.", file=sys.stderr)
+        return 1
+    # What is installed now, so that what arrives while the guard is down is
+    # reviewed once it is back. The hooks take it too if this one fails.
+    try:
+        disk_guard.take_snapshot(root)
+    except (OSError, store.StoreError) as exc:
+        print(f"warning: could not record what is installed now ({exc}); the hooks will try "
+              "again.", file=sys.stderr)
+    pg_mode.set_mode(root, chosen, scope, options["--reason"], duration)
+    print(pg_mode.describe(pg_mode.effective(root)))
+    if scope == "project":
+        print("Commit .claude/package-guard/mode.json so the team sees the change in review.")
+    back = "enforce --project" if scope == "project" else "enforce"
+    print("Turn it back on with:\n  " + store.human_command(root, "mode", back))
+    return 0
+
+
+def _mode(root, args) -> int:
+    """`mode` shows every layer; `mode enforce` clears one; `mode warn|off`
+    sets one, for a person at a terminal only."""
+    try:
+        chosen, options = _parse_mode(args)
+    except ValueError as exc:
+        print(f"error: {exc}. Nothing was changed.\n{USAGE}", file=sys.stderr)
+        return 1
+    if chosen is None:
+        return _mode_status(root)
+    scope = "project" if options.get("--project") else "local"
+    if chosen == "enforce":
+        return _mode_enforce(root, scope)
+    return _mode_down(root, chosen, scope, options)
+
+
 def _explicit_root(argv):
     """(argv without `--root <dir>`, root or None). `--root` is accepted only
     directly after the subcommand: the form the hook prints and recognises."""
@@ -533,6 +701,12 @@ def main(argv) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     project = (lambda: explicit) if explicit is not None else (lambda: store.project_root(__file__))
+    if argv and argv[0] == "mode":
+        try:
+            return _mode(project(), argv[1:])
+        except (store.StoreError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     if argv and argv[0] in _NO_ARGUMENT_COMMANDS:
         run = {"reconcile": _reconcile, "audit": _audit}[argv[0]]
         try:

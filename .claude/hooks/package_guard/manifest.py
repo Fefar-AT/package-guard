@@ -24,12 +24,21 @@ import re
 import tomllib
 from pathlib import Path
 
+import bun_lock
+import pnpm_lock
+import yarn_lock
+from lock_errors import LockReadError
+
 # A bare, fully-qualified semver: the only spec form we accept as an exact pin.
 # Deliberately strict — `^1.2.3`, `~1.2.3`, `1.x`, `>=1`, `*`, `latest`, URLs,
 # `npm:` aliases and git specs all fail this and fall through to the lockfile.
 _EXACT = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?(?:\+[0-9A-Za-z.\-]+)?$")
 
 _DEP_FIELDS = ("dependencies", "devDependencies", "optionalDependencies")
+# pnpm (auto-install-peers) and Bun install the ROOT project's own peerDependencies; npm's
+# reader and Yarn's do not read them here, and neither behaviour changes (v1.10.0 hardening, A7).
+_PEER_FIELD = "peerDependencies"
+PM_PEER_KINDS = ("pnpm", "bun")
 
 
 class ManifestError(Exception):
@@ -396,9 +405,15 @@ _LIFECYCLE = ("preinstall", "install", "postinstall", "prepublish", "preprepare"
               "prepare", "postprepare")
 
 
-def npm_root_lifecycle_scripts(directory) -> list:
-    """[(name, body)] of the lifecycle scripts `npm install` runs from the root
-    package.json itself. Empty without a manifest."""
+# pnpm also runs a root `pnpm:devPreinstall` before it installs.
+_PNPM_LIFECYCLE = ("pnpm:devPreinstall",) + _LIFECYCLE
+
+
+def npm_root_lifecycle_scripts(directory, kind="npm") -> list:
+    """[(name, body)] of the lifecycle scripts `npm install` (or the pnpm, Bun
+    or Yarn install of `kind`) runs from the root package.json itself. Each
+    manager runs a subset of these; the union is checked. Empty without a
+    manifest."""
     path = manifest_path(directory)
     if not path.is_file():
         return []
@@ -406,7 +421,8 @@ def npm_root_lifecycle_scripts(directory) -> list:
     scripts = data.get("scripts") if isinstance(data, dict) else None
     if not isinstance(scripts, dict):
         return []
-    return [(name, scripts[name]) for name in _LIFECYCLE if isinstance(scripts.get(name), str)]
+    names = _PNPM_LIFECYCLE if kind == "pnpm" else _LIFECYCLE
+    return [(name, scripts[name]) for name in names if isinstance(scripts.get(name), str)]
 
 
 def npm_install_script_packages(directory) -> list:
@@ -453,6 +469,132 @@ def npm_locked_tree(directory) -> list:
     return tree
 
 
+# ---------------------------------------------------------------------------
+# pnpm, Bun and Yarn
+#
+# Their locks are read by bun_lock / pnpm_lock / yarn_lock, which fail closed.
+# Unlike npm's, the lock is NEVER optional here: an exact pin in package.json
+# does not stand in for a lock entry. Whatever the manager installs is the
+# lock's tree, so a dependency the lock does not record (or records for another
+# spec) is a stale lock, and the tree it would re-resolve is nobody's review.
+# ---------------------------------------------------------------------------
+
+PM_LOCKFILES = {"pnpm": "pnpm-lock.yaml", "bun": "bun.lock", "yarn": "yarn.lock"}
+_PM_READERS = {"pnpm": pnpm_lock, "bun": bun_lock, "yarn": yarn_lock}
+
+
+def pm_lock_path(directory, kind) -> Path:
+    return Path(directory) / PM_LOCKFILES[kind]
+
+
+def _pm_read(directory, kind, call):
+    """`call(reader_module, lock_path)`, with any lock error as a ManifestError
+    and a missing lock an error too: never an empty answer."""
+    path = pm_lock_path(directory, kind)
+    if not path.is_file():
+        raise ManifestError(f"{path.name} does not exist")
+    try:
+        return call(_PM_READERS[kind], path)
+    except LockReadError as exc:
+        raise ManifestError(str(exc)) from exc
+
+
+def pm_locked_tree(directory, kind) -> list:
+    """Every registry (name, version) the lock would install. A directory that needs no
+    lock (`no_lock_needed`) installs nothing: an empty tree, which is the one case where
+    a missing lock is not an error."""
+    if no_lock_needed(directory):
+        return []
+    return _pm_read(directory, kind, lambda reader, path: reader.locked_tree(path))
+
+
+def pm_expected_spec(kind, spec: str) -> str:
+    """The text a lock's root records for a package.json spec. Berry writes a
+    bare range with an `npm:` prefix; pnpm and Bun record the spec as written."""
+    if kind == "yarn" and ":" not in spec and "/" not in spec:
+        return "npm:" + spec
+    return spec
+
+
+def pm_direct_dependencies(directory, kind):
+    """(resolved, unresolved) for a pnpm, Bun or Yarn manifest, as
+    `direct_dependencies` is for npm's, but only from the lock.
+
+    A dependency resolves when the lock's root records exactly the spec
+    package.json declares and a registry package of that name answers it.
+    Anything else (absent, another spec, an alias, a non-registry source) is
+    unresolved: the lock is stale or the dependency is not a registry one."""
+    specs = _npm_dep_specs(directory, peers=kind in PM_PEER_KINDS)
+    if not specs:
+        return [], []
+    peer_only, optional = _root_peers(directory) if kind in PM_PEER_KINDS else (set(), set())
+    recorded, locked, skip = _pm_read(directory, kind, lambda reader, path: (
+        reader.root_specs(path), reader.direct_specs(path),
+        reader.skippable_root_peers(path, peer_only, optional) if peer_only else set()))
+    specs = [(name, spec) for name, spec in specs if name not in skip]
+    name_of_lock = PM_LOCKFILES[kind]
+    resolved, unresolved = [], []
+    for name, spec in specs:
+        if not isinstance(spec, str):
+            unresolved.append((name, repr(spec)))
+        elif name not in recorded:
+            unresolved.append((name, f"{spec} ({name_of_lock} does not list it)"))
+        elif recorded[name] != pm_expected_spec(kind, spec):
+            unresolved.append((name, f"{spec} ({name_of_lock} is stale: it was resolved for "
+                                     f"{recorded[name]!r})"))
+        elif name not in locked:
+            unresolved.append((name, f"{spec} ({name_of_lock} resolves it to something other "
+                                     "than a registry package of that name)"))
+        else:
+            resolved.append((name, locked[name], "lockfile"))
+    resolved.sort(key=lambda item: item[0])
+    unresolved.sort(key=lambda item: item[0])
+    return resolved, unresolved
+
+
+def _root_peers(directory):
+    """(names only a root peerDependencies declares, names its peerDependenciesMeta marks
+    optional). The first are what pnpm and Bun add beside the other fields; the lock may
+    legitimately not record some of them (v1.10.0 hardening)."""
+    data = _load_json(manifest_path(directory))
+    if not isinstance(data, dict):
+        return set(), set()
+    other = {name for field in _DEP_FIELDS if isinstance(data.get(field), dict)
+             for name in data[field]}
+    peers = data.get(_PEER_FIELD)
+    peer_only = {n for n in peers if isinstance(n, str) and n not in other} \
+        if isinstance(peers, dict) else set()
+    meta = data.get("peerDependenciesMeta")
+    optional = {n for n, m in meta.items() if isinstance(m, dict) and m.get("optional") is True} \
+        if isinstance(meta, dict) else set()
+    return peer_only, optional
+
+
+def pm_declares_dependencies(directory, kind=None) -> bool:
+    return bool(_npm_dep_specs(directory, peers=kind in PM_PEER_KINDS))
+
+
+def declares_any_dependencies(directory) -> bool:
+    """True when package.json declares a dependency of ANY kind (dependencies,
+    devDependencies, optionalDependencies, peerDependencies), whatever the manager."""
+    return bool(_npm_dep_specs(directory, peers=True))
+
+
+# Every lock file of the npm family: the presence of one of them means a manager already
+# decided a tree for this directory.
+_ANY_LOCK = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "bun.lock",
+             "bun.lockb", "yarn.lock")
+
+
+def no_lock_needed(directory) -> bool:
+    """A directory with no lock of any manager whose package.json declares no dependency
+    of any kind: its locked tree is empty, and a lock cannot exist for it (`bun install
+    --lockfile-only` deletes an empty one: "No packages! Deleted empty lockfile"), so
+    the first `add` could never otherwise be allowed (v1.10.0 hardening, B2)."""
+    base = Path(directory)
+    return not any((base / name).exists() for name in _ANY_LOCK) and not declares_any_dependencies(base)
+
+
 def uv_locked_tree(directory) -> list:
     """Every (name, version) uv.lock records, the virtual root excluded."""
     data, _missing = _uv_lock_data(directory)
@@ -475,12 +617,13 @@ def uv_locked_tree(directory) -> list:
     return tree
 
 
-def _npm_dep_specs(directory):
+def _npm_dep_specs(directory, peers=False):
     """[(name, spec)] declared by package.json's dependency fields, deduped.
 
     The single enumeration of "what this manifest declares". Both the pinning
     reader (direct_dependencies) and the names-only reader (npm_direct_names)
-    go through it, so they can never disagree about the direct set.
+    go through it, so they can never disagree about the direct set. `peers` adds the
+    root `peerDependencies`, which pnpm and Bun install; it is False for npm.
     """
     path = manifest_path(directory)
     if not path.is_file():
@@ -489,7 +632,7 @@ def _npm_dep_specs(directory):
     if not isinstance(data, dict):
         raise ManifestError("package.json is not a JSON object")
     out, seen = [], set()
-    for field in _DEP_FIELDS:
+    for field in _DEP_FIELDS + ((_PEER_FIELD,) if peers else ()):
         block = data.get(field)
         if not isinstance(block, dict):
             continue
@@ -550,9 +693,10 @@ def direct_dependencies(directory):
 # layers cannot drift into disagreeing about what "direct" means.
 # ---------------------------------------------------------------------------
 
-def npm_direct_names(directory):
-    """Every dependency name package.json declares, pinnable or not."""
-    return sorted({name for name, _spec in _npm_dep_specs(directory)})
+def npm_direct_names(directory, peers=False):
+    """Every dependency name package.json declares, pinnable or not. `peers` adds the root
+    peerDependencies, for a pnpm or Bun project that installs them."""
+    return sorted({name for name, _spec in _npm_dep_specs(directory, peers=peers)})
 
 
 def uv_project_direct_names(directory):

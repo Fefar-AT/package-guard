@@ -12,7 +12,9 @@ reconciled against disk afterwards. Before adding, syncing, or running any
 dependency-touching command, invoke the `package-guard` skill and follow it.
 
 Never: hand-edit `package.json` / `pyproject.toml` / lockfiles to add a
-dependency, use `pnpm`/`yarn`/`bun`, wrap installs in `sh -c`/`eval`, use any
+dependency, use a package manager other than `npm`/`npx`, `pip`, `uv`, `pnpm`,
+`bun` or Yarn Berry 4.14+ (`pipx`, `poetry`, `conda`, `corepack`, Yarn Classic
+and Yarn Plug'n'Play are refused), wrap installs in `sh -c`/`eval`, use any
 other installer or wrapper to get packages onto disk, or edit anything under
 `.claude/hooks/package_guard/` or `.claude/package-guard/`. Package Guard is
 the only gate in this project; if a Bash denial does not start with

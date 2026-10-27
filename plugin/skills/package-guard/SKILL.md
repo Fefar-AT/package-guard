@@ -2,10 +2,11 @@
 name: package-guard
 description: >-
   Package Guard protocol for this project. Invoke BEFORE any command that
-  acquires, adds, or syncs a dependency (npm/npx/pip/uv), before writing or
-  editing package.json / pyproject.toml / requirements / a lockfile, and before
-  running anything that executes commands from a file (npm run, npm start, make,
-  just, bash *.sh, uv run <script>). Also invoke on any PACKAGE_GUARD_ denial.
+  acquires, adds, or syncs a dependency (npm/npx/pip/uv/pnpm/pnpx/bun/bunx/
+  yarn/yarn dlx), before writing or editing package.json / pyproject.toml /
+  requirements / a lockfile, and before running anything that executes commands
+  from a file (npm run, pnpm run, bun run, yarn run, npm start, make, just,
+  bash *.sh, uv run <script>). Also invoke on any PACKAGE_GUARD_ denial.
 ---
 
 # Package Guard protocol (mandatory)
@@ -33,8 +34,8 @@ yourself. Approval in another project does not authorize this project.
 ## Installation protocol
 
 This project runs a Package Guard hook on every Bash command. Any `npm`, `npx`,
-`npm create`, `pip`, `uv add`, `uv pip`, `uvx`, or `uv tool` command that
-acquires a package is blocked unless the **exact version** is already vetted in
+`npm create`, `pip`, `uv add`, `uv pip`, `uvx`, `uv tool`, `pnpm`, `pnpx`,
+`bun`, `bunx`, `yarn` or `yarn dlx` command that acquires a package is blocked unless the **exact version** is already vetted in
 `.claude/package-guard/vetted.json`. Follow this protocol exactly:
 
 1. **Batch first.** When a task needs packages, put ALL of them in ONE install
@@ -71,8 +72,12 @@ acquires a package is blocked unless the **exact version** is already vetted in
    one line per package — its `VERDICT`, confidence, every red-flag code and
    its `Alternative`. Never soften it, never drop a red flag. Paste a
    package's full human block only when the user asks for it. For a
-   `NEEDS_HUMAN_REVIEW` package, end that line with your suggestion: approve
-   it, or use the alternative the subagent named.
+   `NEEDS_HUMAN_REVIEW` package, lead that line with its red flags in plain
+   words and the risk they carry (`PUBLISHER_NOT_MAINTAINER`: the account
+   that published this version is not one of the package's maintainers), then
+   end that line with your suggestion: use the alternative the subagent named,
+   or approve only if the user needs this exact package. Never suggest
+   approving it outright; say no more for it than the permission prompt does.
    - **Approve the recommended ids first.** Run ONE approve command with every
      `RECOMMEND` id together (the established ids were approved in step 2).
      Copy it **verbatim from the denial message** — it gives an absolute path
@@ -192,8 +197,72 @@ acquires a package is blocked unless the **exact version** is already vetted in
    command (run it as its own command first), and a package name built from a
    variable or glob (name the exact package and version).
 
-   `pnpm`, `yarn`, `bun`, `pipx`, `poetry`, `conda` and friends are now
-   **refused by the hook**, not merely discouraged in this file.
+   `pipx`, `poetry`, `conda`, `corepack`, Yarn Classic and Yarn Plug'n'Play are
+   **refused by the hook**, not merely discouraged in this file. So are Frappe's
+   installing `bench` verbs (`init`, `get-app`, `update`, `setup requirements`,
+   `setup env`, `new-app`, `pip`, `switch-to-branch`, `remove-app`): bench runs
+   `yarn install` with scripts on and pip from Python, out of the hook's sight.
+   Other bench commands (`build`, `start`, `migrate`, site commands) run as
+   usual. **pnpm, Bun and Yarn Berry are gated like npm**, next.
+
+   **pnpm, Bun and Yarn Berry (v1.10.0).** The same rules as npm: every package
+   is named with an exact version, reviewed and approved before it is
+   installed; a bare `pnpm install`, `bun install` or `yarn` (bare `yarn` IS an
+   install) is gated on what the manifest and lock say; decoration does not
+   change any of it. What differs:
+   - Locks. The project needs exactly one manager's lock, and the guard reads
+     it in full: `pnpm-lock.yaml` (v9), a text `bun.lock` (a binary `bun.lockb`
+     is refused), or a Berry `yarn.lock` (Classic v1 locks are refused). A fresh
+     project with no dependencies may run its first add without a lock. Root
+     `peerDependencies` must be in the lock (pnpm, Bun). It works both ways:
+     npm is refused in a project whose lock or `packageManager` belongs to
+     pnpm, Bun or Yarn. Use that project's manager.
+   - Manager pin. The project's `packageManager` (`pnpm@X.Y.Z`, or `yarn@4.X.Y`
+     with X at least 14) is reviewed once like a package (the npm packages
+     `pnpm` and `@yarnpkg/cli-dist`) and checked on every pnpm and Yarn command.
+     Yarn needs `nodeLinker: node-modules`. `COREPACK_*` variables are refused.
+   - Scripts off or an allow-list. Dependency install scripts must be off:
+     `--ignore-scripts` for pnpm and Bun, `--mode=skip-build` for Yarn (Berry
+     has no `--ignore-scripts`), or an explicit reviewed allow-list: pnpm
+     `onlyBuiltDependencies` (in `pnpm-workspace.yaml` or the `pnpm` key of
+     `package.json`), Bun `trustedDependencies` (`package.json`), Yarn
+     `dependenciesMeta.<pkg>.built`. Without one, Bun and pnpm 9 would run the
+     default trusted list. The human edits the allow-list, not you.
+   - No code loading, no redirects, allow-listed config. `.pnpmfile.cjs`, a Bun
+     `preload`, a Yarn `yarnPath`, plugins, another registry in `.npmrc`,
+     `bunfig.toml`, `pnpm-workspace.yaml` or `.yarnrc.yml`, workspaces and
+     catalogs are refused. The config files are read, not refused outright:
+     only known-safe keys pass, and an unknown key is refused by name. Never
+     edit those files, a lock, or a manager's config to make a gate pass; tell
+     the user which file and setting the denial names.
+   - Runners. `pnpm dlx`, `bunx` / `bun x`, `pnpx` / `pnx` and `yarn dlx` take
+     an exact `<pkg>@<version>` and are reviewed like `npx` (`--no-install`
+     counts only before the package name). `pnpm run|exec|test|start`,
+     `bun run|test|<file>` and `yarn run` run project code: read what they run
+     first (as for `npm run`). Use `yarn run <script>`, never `yarn <script>`.
+     A Bun run cannot share a command with anything that could change
+     `node_modules`. With no `node_modules`, Bun installs what a file imports
+     at run time, and Yarn needs an install state, so run `bun install` /
+     `yarn install` first, as its own reviewed command.
+   - Refused. Flags `-r`/`--recursive`, `--filter`, `-w`, `-g`/`--global`,
+     `-C`/`--dir` and `--cwd` (to use a subdirectory, `cd` there in its own
+     command first), and every alternate-registry or config flag. Verbs that
+     run, publish or fetch code outside the gate: pnpm `init`, `link`,
+     `rebuild`, `approve-builds`, `import`, `self-update`, `env`, `deploy`,
+     `pack`, `publish`, `patch`, `store add`; Bun `create`, `init`, `build`,
+     `upgrade`, `pm trust|cache|pack`, `patch`; Yarn `exec`, `set`,
+     `workspace(s)`, `create`, `init`, `upgrade`, `global`, `npm publish`,
+     `pack`, `patch`, `plugin`, `constraints`, `rebuild`, `unplug`, `node`.
+     `pnpm create <x>@<exact>` is reviewed like `npm init`.
+   - Missing or stale lock. The remedies install nothing and are always
+     allowed: `pnpm install --lockfile-only --ignore-scripts`,
+     `bun install --lockfile-only --ignore-scripts`, or
+     `yarn install --mode=update-lockfile` (refused if the root `package.json`
+     has an install-time script). pnpm `--dry-run` is not a remedy.
+   - Removal. `remove` / `rm` / `uninstall` is checked like the lock-only forms
+     (config, mixed locks, pinned manager, root install scripts). When a finding
+     is on disk, run `pnpm remove <pkg>`, `bun remove <pkg> --ignore-scripts` or
+     `yarn remove <pkg> --mode=skip-build`.
 
    Package Guard never guesses what a version range means. If a dependency is
    not pinned to an exact version you get `PACKAGE_GUARD_MANIFEST_UNPINNED`.
@@ -258,10 +327,23 @@ own reputation facts instead.
 - describe any package as "safe". The guard checked evidence; it did not
   establish safety.
 
+**The mode belongs to the user.** Package Guard runs in `enforce`, `warn` or
+`off` (`cli.py mode` shows which, and why). Never change the mode unless the
+user asks. You may run `cli.py mode` and `cli.py mode enforce [--project]`.
+`mode warn` and `mode off` from you are refused
+(`PACKAGE_GUARD_MODE_HUMAN_ONLY`) and need a terminal: when the user wants the
+guard down, give them the short `sh .claude/hooks/package_guard/pg …` command
+from the denial, to run in a separate terminal window in the project folder,
+not with `!`. Never run `pg` yourself; it is refused. In `warn`, a refusal arrives as a warning and the
+user's own permission prompt still decides; follow this protocol anyway. When
+`enforce` returns, packages that arrived while it was down become open
+findings; handle them like any other.
+
 **Read what an opaque executor runs before you run it.** `npm run <script>`,
 `npm start`, `make <target>`, `just <recipe>`, `bash ./x.sh` and a `uv run`
 script all take their commands from a file, so the recognizer sees the outer
-verb and nothing else. Before running one, read the script body — the `scripts`
+verb and nothing else. `pnpm run`, `pnpm exec`, `bun run`, `bun <file>`,
+`bun test` and `yarn run` are the same kind of executor. Before running one, read the script body — the `scripts`
 block of `package.json`, the Makefile or justfile target, the shell script — and
 follow it into whatever it calls. If anything it runs acquires a package, run
 that acquisition as its own bare command first, so the gate sees it. The disk
