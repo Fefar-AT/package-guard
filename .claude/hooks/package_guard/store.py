@@ -318,6 +318,19 @@ def is_vetted(root: Path, identity: dict) -> bool:
     return any(_valid_entry(e) and _identity_key(e) == key for e in data["packages"])
 
 
+def vetted_names(root: Path, ecosystem: str) -> set:
+    """Every package name of `ecosystem` that has an approved version (as the store spells it)."""
+    return {e["name"] for e in load_vetted(root)["packages"] if _valid_entry(e) and e["ecosystem"] == ecosystem}
+
+
+def vetted_versions(root: Path, ecosystem: str, name: str, registry: str, normalise=lambda n: n) -> list:
+    """Every version of `name` (compared as `normalise` maps both sides) a person approved."""
+    wanted = normalise(name)
+    return [e["version"] for e in load_vetted(root)["packages"]
+            if _valid_entry(e) and e["ecosystem"] == ecosystem and e["registry"] == registry
+            and normalise(e["name"]) == wanted]
+
+
 def add_vetted(root: Path, identity: dict, review_id: str, artifacts=None) -> bool:
     """Append one exact identity. Returns False if it was already vetted.
 

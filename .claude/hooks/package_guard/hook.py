@@ -864,7 +864,12 @@ def _precise_guard_write(command: str, root, cwd, locked: bool):
             elif _venv_creation(name, args) is not None:
                 # `uv venv`, `python -m venv`, `virtualenv`: with `--clear` (or over an existing env) they
                 # remove the guard's `env/pip.conf`, and `--seed` fetches pip and setuptools unreviewed.
-                found = check(_venv_creation(name, args) or [".venv"])
+                # A target the shell builds (`$PWD/env`, `` `pwd`/env ``) may be the env: a guard write.
+                targets = _venv_creation(name, args)
+                found = ("config" if any(re.search(r"[$`{\\]", t) or (t.startswith("~") and t != "~"
+                                                                      and not t.startswith("~/"))
+                                         for t in targets)
+                         else check(targets or [".venv"]))
             elif name in _READERS:
                 if name == "find":
                     for i, a in enumerate(args):
@@ -963,6 +968,37 @@ _VENV_VALUE_OPTIONS = {"--python", "-p", "--prompt", "--python-preference", "--i
                        "--try-first-with", "--system-site-packages-dir"}
 
 
+def _python_module_args(args):
+    """(module, the arguments after it) of the `-m <module>` a python command line runs, read as CPython
+    reads its options (`-mvenv`, `-Imvenv`, `-X dev -m venv`; `-c`, `--` and the first operand end
+    them); None when it runs no module."""
+    i = 0
+    while i < len(args):
+        text = args[i]
+        if text in ("-", "--") or not text.startswith("-"):
+            return None
+        if text.startswith("--"):
+            i += 2 if text in pg_parser._PYTHON_VALUE_LONG else 1
+            continue
+        for j, flag in enumerate(text[1:], 1):
+            if flag == "c":
+                return None
+            if flag == "m":
+                attached = text[j + 1:]
+                if not attached:
+                    i += 1
+                    if i >= len(args):
+                        return None
+                    attached = args[i]
+                return attached.casefold(), list(args[i + 1:])
+            if flag in pg_parser._PYTHON_VALUE_FLAGS:
+                if j == len(text) - 1:
+                    i += 1
+                break
+        i += 1
+    return None
+
+
 def _venv_creation(name, args):
     """The operands that name the directory of a virtual environment `uv venv`, `python -m venv` or
     `virtualenv` would create (every operand: one that is not the target is only checked, it is not
@@ -975,11 +1011,10 @@ def _venv_creation(name, args):
             return None
         rest = args[args.index("venv") + 1:]
     elif _PYTHON_NAME.match(name):
-        at = next((i for i, a in enumerate(args) if a == "-m" or (a.startswith("-") and not a.startswith("--")
-                                                                  and a.endswith("m"))), None)
-        if at is None or at + 1 >= len(args) or args[at + 1] != "venv":
+        module = _python_module_args(args)
+        if module is None or module[0].split(".")[0] not in ("venv", "virtualenv"):
             return None
-        rest = args[at + 2:]
+        rest = module[1]
     else:
         return None
     targets, skip = [], False
@@ -993,6 +1028,9 @@ def _venv_creation(name, args):
     return targets
 
 
+_VENV_CREATION_TEXT = re.compile(r"(?<![\w-])(?:virtualenv|uv\s+venv)(?![\w-])|\s-[a-z]*m\s*(?:venv|virtualenv)\b")
+
+
 def _coarse_config_write(command: str, root):
     """'config' when a command that this pass cannot read names a file the CLI wrote for an
     installer and has a writer in it, as `_coarse_guard_write` does for guard state."""
@@ -1000,6 +1038,10 @@ def _coarse_config_write(command: str, root):
         return None
     names = {Path(p).name.casefold() for p in bench_config.recorded_paths(root)}
     lowered = command.casefold()
+    # A virtual environment created by a command this pass cannot read (`` `pwd`/env ``, `${PWD}/env`) may
+    # be the bench's env, whose `pip.conf` it removes: refused like any other write.
+    if names and _VENV_CREATION_TEXT.search(lowered):
+        return "config"
     named = [n for n in names if n in lowered]
     if not named:
         return None
@@ -5142,7 +5184,7 @@ def _bench_requests(unreviewed, command, app=None):
         spec = f"=={version}" if (version and ecosystem == "pypi") else version
         if ecosystem == "pypi" and version is None and app is not None:
             text = bench_config.pyproject_requirement_text(Path(app) / "pyproject.toml", name)
-            pick = vetting.suggest_build_pin(text) if text else None
+            pick = vetting.suggest_build_pin(text.split(";", 1)[0]) if text else None
             if pick:
                 version, spec = pick[1], f"=={pick[1]}"
         requests.append(pg_parser.PackageRequest(
@@ -5151,6 +5193,17 @@ def _bench_requests(unreviewed, command, app=None):
             registry=pg_parser.NPM_REGISTRY if ecosystem == "npm" else pg_parser.PYPI_REGISTRY,
             original_command=command))
     return requests
+
+
+def _unapproved(root, request) -> bool:
+    """True when `request` names a release no person approved for this project (or none at all)."""
+    if not request.exact_version:
+        return True
+    try:
+        return not store.is_vetted(root, {"ecosystem": request.ecosystem, "name": request.name,
+                                          "version": request.exact_version, "registry": request.registry})
+    except store.StoreError:
+        return True
 
 
 def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=None, notes=None):
@@ -5213,6 +5266,12 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
                     "(`bench init`, `bench setup env`) is a step for the user, in their own terminal.")
 
     apps_all = bench_config.bench_apps(bench)
+    if scope.verb in ("build", "update-run"):
+        strays = bench_config.apps_txt_strays(bench)
+        if strays:
+            return deny("PACKAGE_GUARD_UNSUPPORTED", "sites/apps.txt lists " + ", ".join(strays[:3])
+                        + ", which is not a folder directly in apps/: Frappe's build changes into it and runs "
+                        "yarn there, and no app rule covers it. Tell the user.")
     by_name = {Path(a).name: a for a in apps_all}
     if env_install or runner and not scope.apps:
         involved = list(apps_all)
@@ -5220,7 +5279,7 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
         unknown = [n for n in scope.apps if n not in by_name]
         if unknown:
             return deny("PACKAGE_GUARD_UNSUPPORTED", f"{', '.join(unknown)} is not an app of the bench at {bench} (its "
-                        "directory in apps/ needs hooks.py, modules.txt and patches.txt).")
+                        "directory in apps/ needs hooks.py, modules.txt and patches.txt, or a line in sites/apps.txt).")
         involved = [by_name[n] for n in scope.apps] if scope.apps else list(apps_all)
     if scope.verb == "build":
         involved = [by_name[n] for n in scope.apps if n in by_name]
@@ -5287,6 +5346,7 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
     # The installer files, recomputed, and what pip, uv and yarn would really read.
     home = Path.home()
     config_cwd = bench if not env_install else cwd
+    config = None
     try:
         if runner:
             problems = bench_config.verify_recorded(bench, root, cwd=config_cwd, home=home, environ=os.environ)
@@ -5345,6 +5405,22 @@ def _bench_scope_check(scope, parsed, event, root, cwd, command, yarn_targets=No
                 problems = sources.npm_config_problems(directory) + sources.yarn_npmrc_problems(directory)
                 if problems:
                     return _decision("deny", _render_alternate_source(problems)), [], []
+    # A version range of a custom app is installed at the release a constraint names, so every range
+    # uv will install must have its pin line, and nothing a review can approve changes that: the verb
+    # is refused whatever requests are open, except that a request for a release nobody approved is
+    # returned as it is (the caller denies it with the review, which is how the release gets approved;
+    # the next run is refused until `apply` has written the pin).
+    stuck = [] if config is None or env_install else [
+        entry for entry in config.unpinned if entry[0] in {Path(a).name for a in involved}]
+    if stuck and not any(_unapproved(root, request) for request in extras):
+        return deny("PACKAGE_GUARD_UNSUPPORTED", (
+            "a custom app declares a version range that is not pinned to a release it can install, so uv would "
+            "take the newest release there is, not the one reviewed: "
+            + "; ".join(f"apps/{app} {name} ({'build requirement' if section == 'build' else 'requirement'}): {why}"
+                        for app, name, section, why in stuck[:5])
+            + ". If a release is approved, `" + _bench_apply_command(root) + "` writes the pin (ask the user). "
+            "Otherwise ask the user to pin each to one exact version (`name==X.Y.Z`) in the app's own files "
+            "and to make its extras and groups agree with it; an exact version is reviewed like any package."))
     return None, extras, covered
 
 
@@ -5406,25 +5482,41 @@ def _bench_yarn_run_dirs(bench, app) -> list:
 
 
 def _baseline_vouches(root, directory) -> bool:
-    """True when `directory` is inside an app of a Frappe bench that an approved baseline covers
-    (its package.json and yarn.lock files, at every depth, match the baseline by digest, and its
-    audit is fresh and clean), and has a yarn.lock: the baseline, not a review per package,
-    vouches for what the install fetches."""
+    """True when the baseline of the Frappe-bench app that holds `directory` lists THIS folder: its own
+    `package.json` and `yarn.lock` are entries of the matching approved baseline, and the files on disk
+    still have those digests. Then the baseline, not a review per package, vouches for what the install
+    fetches. A folder the baseline's walk skips (inside node_modules, .git, __pycache__, .hg, .svn), a
+    folder that is new, or a symbolic link is never vouched for: the full direct-install checks run."""
     if not pg_parser.FRAPPE_ENABLED:
         return False
     try:
+        import baseline
+        folder = Path(os.path.realpath(directory))
         bench = bench_config.bench_root(directory)
-        if bench is None or not (Path(directory) / "yarn.lock").is_file():
+        if bench is None or not (folder / "yarn.lock").is_file() or not (folder / "package.json").is_file():
             return False
         apps = bench_config.bench_apps(bench)
-        app = next((a for a in apps if _within(directory, a)), None)
+        app = next((Path(os.path.realpath(a)) for a in apps if _within(directory, a)), None)
         if app is None:
             return False
+        parts = folder.relative_to(app).parts
+        if set(parts) & baseline._SKIP_DIRS:
+            return False
+        prefix = "/".join(parts) + "/" if parts else ""
         names = bench_gate.local_names(bench, apps)
-        covering = bench_gate.covering_of(root, [app], names)[Path(app)]
+        covering = bench_gate.covering_of(root, [app], names)[app]
+        if covering.get("kind") != "baseline":
+            return False
+        recorded = {m["path"]: m["sha256"] for m in covering["baseline"]["manifests"]}
+        for name in ("package.json", "yarn.lock"):
+            path = folder / name
+            if path.is_symlink() or (prefix + name) not in recorded:
+                return False
+            if baseline.sha256_text_file(path.read_bytes(), prefix + name) != recorded[prefix + name]:
+                return False
     except Exception:  # noqa: BLE001 - what cannot be read vouches for nothing
         return False
-    return covering.get("kind") == "baseline"
+    return True
 
 
 # The `verb` of the ManifestScope for a yarn directory a bench verb installs in: the lock, the
@@ -5434,7 +5526,7 @@ _BENCH_YARN = "bench-yarn"
 
 
 def _builds_with_yarn(app) -> bool:
-    """True when running Frappe's build would run `yarn install` in this app: a `scripts.build` and
+    """True when running Frappe's build would run `yarn install` in this app: a `build` key in scripts and
     no node_modules. A package.json that cannot be read counts as one that does."""
     app = Path(app)
     if (app / "node_modules").is_dir() or not (app / "package.json").is_file():
@@ -5446,7 +5538,9 @@ def _builds_with_yarn(app) -> bool:
     if not isinstance(data, dict):
         return True
     scripts = data.get("scripts")
-    return isinstance(scripts, dict) and isinstance(scripts.get("build"), str)
+    # Frappe's build tests `!scripts?.build`, so any truthy value counts (a list, 1, true, {}); the guard
+    # is stricter still: a `build` key with any value at all (false, null, "") is a build.
+    return isinstance(scripts, dict) and "build" in scripts
 
 
 _NPM_EXACT = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?$")

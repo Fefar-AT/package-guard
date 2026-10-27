@@ -304,12 +304,27 @@ def unapproved_builds(docs) -> list:
     return found
 
 
-def config_input(root, bench, now=None) -> bench_config.ConfigInput:
+def new_app_problem(config) -> str | None:
+    """Why the apps named for `bench new-app` cannot be listed for uv to build: a requirement of the
+    bench names a package of the same name (None when none does)."""
+    clash = sorted(set(config.new_apps) & {bench_config._normalize(n) for n in config.requirement_names})
+    if not clash:
+        return None
+    return (f"{', '.join(clash)} cannot be named as an app `bench new-app` is about to create: a requirement of "
+            "this bench asks for a package of that name, and an app named like it would let uv build that "
+            "package from source (running its setup code) instead of installing the reviewed wheel. Pick "
+            "another name for the app")
+
+
+def config_input(root, bench, now=None, new_apps=None) -> bench_config.ConfigInput:
     """The `ConfigInput` for a bench, from `baseline.config_input` and the choices `apply` recorded
     (the toolchain the person chose, whether symlinks are avoided): `apply` and the hook's
     recomputation both call this one function, so they cannot disagree. Raises BenchConfigError
     with the reason when it cannot be built (an upstream app no baseline covers, a local app whose
-    version cannot be pinned, two baselines that disagree about a pin)."""
+    version cannot be pinned, two baselines that disagree about a pin, an app name `apply --new-app`
+    was given that a requirement of the bench names too). `new_apps`, when given, replaces the names
+    the record holds: `apply` passes exactly the names of its own command line, so a name lasts until
+    the next `apply`."""
     import baseline
     options = bench_config.read_options(root)
     toolchain = tuple((t["name"], t["version"]) for t in options.get("toolchain") or [])
@@ -318,8 +333,13 @@ def config_input(root, bench, now=None) -> bench_config.ConfigInput:
         # Apps the person named before `bench new-app`, until the app is there and is listed as any app.
         present = {bench_config._normalize(Path(app).name) for app in bench_config.bench_apps(bench)}
         present |= {bench_config._normalize(name) for name, _version in config.local_apps}
-        new_apps = tuple(sorted({bench_config._normalize(n) for n in options.get("new_apps") or []} - present))
-        return dataclasses.replace(config, new_apps=new_apps) if new_apps else config
+        named = options.get("new_apps") or [] if new_apps is None else new_apps
+        new_apps = tuple(sorted({bench_config._normalize(n) for n in named} - present))
+        config = dataclasses.replace(config, new_apps=new_apps)
+        why = new_app_problem(config)
+        if why:
+            raise bench_config.BenchConfigError(why)
+        return config
     except baseline.BaselineError as exc:
         error = bench_config.BenchConfigError(str(exc))
         error.baseline = True  # the hook answers with the baseline message, not the config one

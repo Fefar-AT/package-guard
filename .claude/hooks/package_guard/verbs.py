@@ -43,6 +43,11 @@ ENV_SHARED_REFUSE = TABLE.get("env_shared_refuse") or {}
 ENV_REACH = TABLE.get("env_reach") or {}
 # A `bench` head names several families at once and these swap-the-program names.
 BENCH_ENV = TABLE.get("bench_env") or {}
+# The variables that choose which release uv takes. Other projects let them pass (every package there is
+# named with an exact version); a bench's uv resolves ranges and its default build requirement, so the
+# bench verbs refuse them, inline and in the environment the hook runs in.
+BENCH_RESOLUTION_VARS = frozenset({"UV_PRERELEASE", "UV_RESOLUTION", "UV_FORK_STRATEGY", "UV_EXCLUDE_NEWER",
+                                   "UV_EXCLUDE_NEWER_PACKAGE", "UV_INDEX_STRATEGY"})
 
 _FILES = TABLE.get("installer_files") or {}
 _FILE_NAMES = {name.casefold() for name in _FILES.get("names", ())}
@@ -368,11 +373,11 @@ def _build_hint():
     # `-m venv --upgrade-deps` runs pip against the index.
     alternatives.append(r"%s\s+-[A-Za-z]*m\s*['\"]?venv['\"]?\s+(?:\S+\s+)*?--upgrade-"
                         % interpreter)
-    # `python setup.py develop|install|easy_install|bdist_egg|test|upload`: installs the project and
-    # fetches its dependencies (the parser reads the interpreter forms; this reads the words of a
-    # command it does not parse, `flock /tmp/l python setup.py develop`).
-    alternatives.append(r"setup\.py\s+(?:\S+\s+)*?(?:develop|easy_install|bdist_egg|install\w*|test|pytest|"
-                        r"upload\w*|register)(?:\s|$)")
+    # `python setup.py <command>`: `develop|install|easy_install|bdist_egg|test|upload` install the project
+    # and fetch its dependencies, and a setup.cfg `[aliases]` makes any command word one of them (the
+    # parser reads the interpreter forms; this reads the words of a command it does not parse,
+    # `flock /tmp/l python setup.py sdist`). Any word after the options is a command.
+    alternatives.append(r"setup\.py\s+(?:-\S*\s+)*[A-Za-z_]\w*(?:\s|$)")
     # The legacy installer executable: `easy_install`, `easy_install-3.9`.
     alternatives.append(r"easy_install(?:-[0-9.]+)?%s(?:\s+|$)" % _HEAD_SUFFIX)
     # bench's refused verbs, past the options of its click group (`--use-feature x`).

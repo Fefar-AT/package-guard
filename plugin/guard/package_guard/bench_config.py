@@ -65,27 +65,112 @@ def bench_env(directory) -> Path | None:
     return None
 
 
-# What bench calls an app (`bench.utils.is_frappe_app`): an entry of `apps/`, whatever its name (a `.`
-# included), with `hooks.py`, `modules.txt` and `patches.txt` each found by `glob(<app>/**/<file>)`,
-# which without `recursive` is exactly one directory below the app (and not under a hidden directory).
-# This is the one definition: the gate, `baseline.config_input`, the local names of D7, the `.yarnrc`
-# directories and the scan of the env all call `bench_apps`, so a stray directory in `apps/` is not an
-# app anywhere.
+# What is an app of the bench: every entry of `apps/` that ANY of the programs that run in it would
+# treat as one. `bench.utils.is_frappe_app` finds `hooks.py`, `modules.txt` and `patches.txt` one
+# directory below the app (`glob(<app>/**/<file>)` without `recursive`). Frappe v16's build
+# (`esbuild/utils.js` `get_cloned_apps`) finds each of them at ANY depth, the app root and hidden
+# folders included, and builds the app. Frappe v15's build takes the lines of `sites/apps.txt` and needs
+# no app files at all. `yarn install` and `yarn build` run in what the build finds, so an app is the
+# union of the three rules. This is the one definition: the gate, `baseline.config_input`, the local
+# names of D7, the `.yarnrc` directories and the scan of the env all call `bench_apps`, so a stray
+# directory in `apps/` is not an app anywhere and a directory any of them builds is one everywhere.
 _APP_FILES = ("hooks.py", "modules.txt", "patches.txt")
+_WALK_LIMIT = 200000
 
 
 def _has_app_files(app) -> bool:
-    return all(glob.glob(os.path.join(glob.escape(str(app)), "**", name)) for name in _APP_FILES)
+    """True when all three app files are in `app`: one directory below it (bench), or at any depth
+    (Frappe v16's build, which follows symlinks and reads hidden folders). A tree too large to walk
+    counts as an app, the stricter answer."""
+    missing = {name for name in _APP_FILES
+               if not glob.glob(os.path.join(glob.escape(str(app)), "**", name))}
+    if not missing:
+        return True
+    seen, count = set(), 0
+    for here, dirs, files in os.walk(str(app), followlinks=True):
+        real = os.path.realpath(here)
+        if real in seen:
+            dirs[:] = []
+            continue
+        seen.add(real)
+        count += len(dirs) + len(files)
+        if count > _WALK_LIMIT:
+            return True
+        missing.difference_update(files)
+        if not missing:
+            return True
+    return False
+
+
+def apps_txt_names(bench) -> list:
+    """The lines of `sites/apps.txt` as Frappe v15's build reads them (split on newlines, empty ones
+    dropped), the text kept as written. [] when the file cannot be read."""
+    try:
+        text = (Path(bench) / "sites" / "apps.txt").read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return [line for line in text.split("\n") if line]
+
+
+def apps_txt_resolve(bench) -> tuple:
+    """(names of the entries of `apps/` that `sites/apps.txt` lists, lines it cannot map).
+
+    A line is read the way the builds and bench read it: as written and stripped (CRLF, spaces),
+    joined to `apps/` and path-normalised (`./plain`, `plain/`, `plain/.`, `x/../plain`), and matched
+    to an entry by the folder itself, so `PLAIN` finds `plain` on a disk that ignores case. A line that
+    names nothing is ignored (the build finds nothing there). A line that names a folder that is not
+    exactly one entry directly in `apps/` (outside it, below an app, or two entries for one folder)
+    cannot be mapped; the build verbs refuse it."""
+    bench = Path(bench)
+    apps = os.path.join(os.path.realpath(bench), "apps")
+    try:
+        entries = [e for e in os.scandir(apps) if e.is_dir()]
+    except OSError:
+        entries = []
+    by_id = {}
+    for entry in entries:
+        try:
+            info = os.stat(entry.path)
+        except OSError:
+            continue
+        by_id.setdefault((info.st_dev, info.st_ino), []).append(entry.name)
+    mapped, unmapped = set(), []
+    for line in apps_txt_names(bench):
+        for variant in dict.fromkeys((line, line.strip())):
+            if not variant:
+                continue
+            target = os.path.normpath(os.path.join(apps, variant))
+            try:
+                info = os.stat(target)
+            except (OSError, ValueError):
+                continue
+            if not os.path.isdir(target):
+                continue
+            hit = by_id.get((info.st_dev, info.st_ino), [])
+            if len(hit) == 1 and os.path.dirname(target) == apps:
+                mapped.add(hit[0])
+            elif line not in unmapped:
+                unmapped.append(line)
+    return mapped, unmapped
+
+
+def apps_txt_strays(bench) -> list:
+    """The lines of `sites/apps.txt` that name an existing folder which is not exactly one entry
+    directly in `apps/` (`../x`, `a/b`, an absolute path, two entries for one folder): a build
+    changes into it and runs `yarn` there, and no app rule can cover it."""
+    return apps_txt_resolve(bench)[1]
 
 
 def bench_apps(bench) -> list:
     """The apps of the bench at `bench`, as directories, sorted by name."""
+    bench = Path(bench)
     try:
-        entries = sorted(os.scandir(Path(bench) / "apps"), key=lambda e: e.name)
+        entries = sorted(os.scandir(bench / "apps"), key=lambda e: e.name)
     except OSError:
         return []
+    listed = apps_txt_resolve(bench)[0]
     return [Path(entry.path) for entry in entries
-            if entry.is_dir() and _has_app_files(entry.path)]
+            if entry.is_dir() and (entry.name in listed or _has_app_files(entry.path))]
 
 
 def app_names(root) -> dict:
@@ -373,6 +458,11 @@ class ConfigInput:
                       them (see `constraint_lines`), the field is kept for the baselines
     new_apps          normalised names of apps the person said they are about to create with
                       `bench new-app` (`apply --new-app`): uv may build them (see `_uv_toml_text`)
+    unpinned          (app, name, section, why) of a custom app's version range that no approved release
+                      satisfies, or that an extra or group of the app contradicts, so the pin is not
+                      one the app can install (the bench verbs refuse; see `hook`)
+    requirement_names every package name some requirement of the bench names (the baselines' pins, the
+                      toolchain, the allowed builds, the custom apps' declarations)
     """
     runtime: tuple = ()
     build: tuple = ()
@@ -383,6 +473,8 @@ class ConfigInput:
     index: str = PYPI_INDEX
     no_symlinks: bool = False
     new_apps: tuple = ()
+    unpinned: tuple = ()
+    requirement_names: tuple = ()
 
 
 def _marker(pin) -> str:
@@ -420,7 +512,11 @@ def constraint_lines(config: ConfigInput) -> tuple:
     absent app is not installed by anything the guard lets through."""
     local = [Pin(_normalize(dist), version, "", "apps/") for dist, version in config.local_apps]
     runtime = _union((*config.runtime, *config.toolchain, *local))
-    build = _union((*config.build, *config.toolchain))
+    # A build can ask for runtime packages too (flit_core reports an app's dependencies as build
+    # requirements when it must import the app to read a dynamic description or version), so every
+    # runtime pin also holds in the build environments, unless a build pin of its own names it.
+    built = {_normalize(p.name) for p in (*config.build, *config.toolchain)}
+    build = _union((*config.build, *config.toolchain, *(p for p in runtime.values() if p.name not in built)))
 
     def render(table):
         return tuple(f"{p.name}=={p.version}{_marker(p)}" for _key, p in sorted(table.items()))
@@ -888,6 +984,7 @@ UV_USER_PIP_KEYS = frozenset({"compile-bytecode", "link-mode"})
 # The guard runs under `uv run` (run.sh, `pg`), so its own environment carries it. It selects no source,
 # index, build or version, so it passes when it is a plain number; any other `UV_` name stays refused.
 UV_RUN_CHILD_VARS = frozenset({"UV_RUN_RECURSION_DEPTH"})
+UV_RESOLUTION_VARS = verbs.BENCH_RESOLUTION_VARS
 
 # The name `bench new-app` accepts for the app it makes (bench_table's own rule).
 NEW_APP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
@@ -1189,6 +1286,10 @@ def effective_uv(bench, cwd, *, home, environ=None, system_dirs=None) -> list:
         if not name.upper().startswith("UV_"):
             continue
         if name.upper() in UV_RUN_CHILD_VARS and environ[name].strip().isdigit():
+            continue
+        if name.upper() in UV_RESOLUTION_VARS:
+            problems.append(f"environment: {name} changes which release uv picks (a pre-release, the lowest, "
+                            "one newer than the cool-down); the bench installs the releases that were approved")
             continue
         category = verbs.classify_env("uv", name, shared=False)
         if category not in (None, "allow", "locked", "path"):

@@ -1249,6 +1249,13 @@ def _python_requirement(text):
 
 
 _KNOWN_APPS = frozenset(normalize_py(n) for n in FRAPPE_APP_NAMES)
+# The build backends whose extra build requirements are all in files the guard reads: flit_core asks for
+# none, setuptools for `setup_requires` (setup.cfg, setup.py). Any other backend (hatchling's
+# `tool.hatch...dependencies`, a plugin, an in-tree `backend-path`) can ask for packages nobody reviewed.
+_READABLE_BACKENDS = ("flit_core.buildapi", "setuptools.build_meta", "setuptools.build_meta:__legacy__")
+_READABLE_BACKENDS_TEXT = "flit_core (`flit_core.buildapi`) or setuptools (`setuptools.build_meta`)"
+UV_DEFAULT_BUILD_REQUIREMENT = "setuptools>=40.8.0"
+_DEFAULT_BUILD_WHERE = "build-system.requires (uv's default: the app declares no [build-system])"
 # `[tool.uv]` keys that change where a package comes from, or which versions can be chosen, when uv
 # installs the app (`uv pip install -e apps/<app>` reads them): approving a name and a version
 # would not cover what is installed.
@@ -1256,12 +1263,13 @@ _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-lin
                    "constraint-dependencies", "workspace")
 
 
-def declared_dependencies(app_dir, local_names=()):
+def declared_dependencies(app_dir, local_names=(), specs=None):
     """(declared, refused) for a custom app: every direct dependency it names, as
     (ecosystem, name, exact version or None, where), and the reasons the declared
     set cannot be read at all (dynamic dependencies, an option line, a source that
     is not the registry). Names in `local_names` are the bench's own apps and are
-    not packages to review."""
+    not packages to review. A list passed as `specs` receives (name, requirement text, where)
+    of every Python requirement, so a range can be judged as it was written."""
     app_dir = Path(app_dir)
     local = {normalize_py(n) for n in local_names}
     declared, refused = [], []
@@ -1281,6 +1289,8 @@ def declared_dependencies(app_dir, local_names=()):
                            "not review it as a package")
         else:
             declared.append(("pypi", name, version, where))
+            if specs is not None:
+                specs.append((name, text, where))
 
     def read_text(path):
         try:
@@ -1325,8 +1335,29 @@ def declared_dependencies(app_dir, local_names=()):
             add_python("pyproject.toml tool.bench.dev-dependencies",
                        f"{name}{spec}" if str(spec)[:1] in "=~<>!" else f"{name}=={spec}")
         build = data.get("build-system") if isinstance(data.get("build-system"), dict) else {}
-        for text in build.get("requires") or []:
-            add_python("pyproject.toml build-system.requires", text)
+        has_build_system = isinstance(data.get("build-system"), dict)
+        requires = build.get("requires")
+        if has_build_system and not (isinstance(requires, list) and requires
+                                     and all(isinstance(text, str) for text in requires)):
+            # A [build-system] with no `requires` list leaves the build requirement to the
+            # installer's own default, which nothing names or pins.
+            refused.append(f"pyproject.toml build-system.requires {requires!r}: [build-system] must list its "
+                           "build requirements, for example requires = [\"flit_core>=3.4,<4\"]")
+        for text in requires if isinstance(requires, list) else ():
+            if isinstance(text, str):
+                add_python("pyproject.toml build-system.requires", text)
+        backend = build.get("build-backend")
+        if has_build_system and backend is not None and not (
+                isinstance(backend, str) and backend.strip() in _READABLE_BACKENDS) or "backend-path" in build:
+            refused.append(f"pyproject.toml build-backend {backend!r}: a build backend adds build requirements of its "
+                           "own (a plugin, a hook, a configured dependency) that Package Guard cannot read, so none "
+                           f"is reviewed or pinned. A custom app may use only {_READABLE_BACKENDS_TEXT}")
+    else:
+        has_build_system = False
+    if not has_build_system:
+        # No `[build-system]`: uv builds with its default requirement, which nothing names (uv 0.13.5:
+        # `setuptools >= 40.8.0`, backend `setuptools.build_meta:__legacy__`); it is pinned like any other.
+        add_python(_DEFAULT_BUILD_WHERE, UV_DEFAULT_BUILD_REQUIREMENT)
     requirement_files = set(p.name for p in app_dir.glob("*.txt") if _REQUIREMENTS_NAME.match(p.name))
     cfg = app_dir / "setup.cfg"
     if cfg.is_file():
@@ -1396,7 +1427,8 @@ def custom_app_problems(root, app_dir, local_names=()) -> dict:
     "unreviewed": [(ecosystem, name, version or None, where)]}: a name that is not
     an exact pin, or is not vetted, needs a review; nothing here is ever covered
     by a baseline."""
-    declared, refused = declared_dependencies(app_dir, local_names)
+    specs = []
+    declared, refused = declared_dependencies(app_dir, local_names, specs)
     unreviewed, seen = [], set()
     for ecosystem, name, version, where in declared:
         key = (ecosystem, name, version)
@@ -1404,6 +1436,10 @@ def custom_app_problems(root, app_dir, local_names=()) -> dict:
             continue
         seen.add(key)
         if version is None:
+            # A range is reviewed at one release: the newest approved one every declaration of the name
+            # admits is what `config_input` pins, so it needs no review of another.
+            if ecosystem == "pypi" and vetted_range_pick(root, name, _installed_texts(specs, name)):
+                continue
             unreviewed.append((ecosystem, name, None, where))
             continue
         registry = "https://registry.npmjs.org" if ecosystem == "npm" else "https://pypi.org"
@@ -1683,6 +1719,85 @@ def _spec_name(spec: str) -> str:
     return normalize_py(spec.split("@", 1)[0])
 
 
+def vetted_range_pick(root, name, requirements):
+    """The newest release of the PyPI package `name` that a person approved for this project and that
+    every one of `requirements` admits; None when there is none or a requirement cannot be judged."""
+    import vetting
+    try:
+        versions = store.vetted_versions(root, "pypi", name, "https://pypi.org", normalize_py)
+    except store.StoreError as exc:
+        raise BaselineError(f"vetted.json cannot be read ({exc})") from exc
+    return vetting.newest_admitted(versions, requirements)
+
+
+_BUILD_WHERE = "pyproject.toml build-system.requires"
+# Declarations that `uv pip install -e apps/<app>` (and a build of it) never installs: an extra, a
+# dependency group. They cannot choose the pinned release, but a pin they contradict is refused.
+_NOT_INSTALLED = ("pyproject.toml optional-dependencies", "pyproject.toml dependency-groups")
+
+
+def _installed_texts(specs, name):
+    """The requirement texts of `name` that uv installs; its other declarations when it has none."""
+    installed = [t for n, t, w in specs if n == name and not w.startswith(_NOT_INSTALLED)]
+    return installed or [t for n, t, _w in specs if n == name]
+
+
+def vetted_range_pick_of(versions, requirements):
+    """The newest of `versions` that every one of `requirements` admits, or None."""
+    import vetting
+    return vetting.newest_admitted(versions, requirements)
+
+
+def custom_range_pins(root, apps, local_names, runtime, build):
+    """([runtime Pin], [build Pin], [(app, name, section, why)] unpinned, {every Python name the custom
+    `apps` declare}) for the version ranges the custom `apps` declare.
+
+    `uv pip install` resolves a range to the newest release there is, so the release a person
+    approved is not what it installs unless a constraint names it. Each range requirement gets the
+    newest approved release that every declaration uv installs admits (in any custom app, exact ones
+    included): into the runtime constraint, and for `build-system.requires` into the build
+    constraint too (a `setup.cfg` requirement may be either, so both). A declaration uv does not
+    install (an extra, a dependency group) does not choose the release, but one that the chosen
+    release contradicts makes the name `unpinned` with the pin kept, and so does a range no approved
+    release satisfies: the bench verb refuses until the declarations agree. A name that `runtime` /
+    `build` (the baselines, the toolchain, the local apps) already pin without a marker has its line;
+    no second is written."""
+    import bench_config as bc
+    wanted = {"runtime": {}, "build": {}}  # section -> {name: [(app, text, installed?)]}
+    ranges, names = set(), set()           # ranges: (section, name) with an installed declaration without ==
+    for app in apps:
+        specs = []
+        declared, _refused = declared_dependencies(app, local_names, specs)
+        names |= {name for ecosystem, name, _v, _w in declared if ecosystem == "pypi"}
+        open_names = {name for _e, name, version, where in declared
+                      if version is None and not where.startswith(_NOT_INSTALLED)}
+        for name, text, where in specs:
+            installed = not where.startswith(_NOT_INSTALLED)
+            sections = ("build",) if where in (_BUILD_WHERE, _DEFAULT_BUILD_WHERE) else ("runtime", "build") if where == "setup.cfg" else ("runtime",)
+            for section in sections:
+                wanted[section].setdefault(name, []).append((Path(app).name, text, installed))
+                if name in open_names:
+                    ranges.add((section, name))
+    pinned = {"runtime": {normalize_py(p.name) for p in runtime if not p.marker},
+              "build": {normalize_py(p.name) for p in build if not p.marker}}
+    picked, unpinned = {"runtime": [], "build": []}, []
+    for section, name in sorted(ranges):
+        if name in pinned[section]:
+            continue
+        found = wanted[section][name]
+        version = vetted_range_pick(root, name, [text for _a, text, installed in found if installed])
+        apps_of = sorted({a for a, _t, _i in found})
+        if not version:
+            unpinned.extend((app, name, section, "no approved release satisfies it") for app in apps_of)
+            continue
+        picked[section].append(bc.Pin(name, version, "", "a custom app"))
+        others = [text for _a, text, installed in found if not installed]
+        if others and vetted_range_pick_of([version], others) != version:
+            unpinned.extend((app, name, section, f"an extra or dependency group of it excludes the approved "
+                             f"release {version}") for app in apps_of)
+    return picked["runtime"], picked["build"], unpinned, names
+
+
 def config_input(root, bench, toolchain=(), no_symlinks=False, now=None):
     """The `bench_config.ConfigInput` for `bench`, built from the approved
     baselines of its apps: the union of their pins (run and dev into
@@ -1730,10 +1845,22 @@ def config_input(root, bench, toolchain=(), no_symlinks=False, now=None):
         dist = (data.get("project") or {}).get("name") if isinstance(data.get("project"), dict) else None
         local.append((normalize_py(dist if isinstance(dist, str) else app.name), version))
     present = {name for name, _v in local}
+    toolchain = tuple(bc.Pin(normalize_py(t[0]), t[1], "", "toolchain") if not isinstance(t, bc.Pin) else t
+                      for t in toolchain)
+    custom = [app for app in bench_config.bench_apps(bench) if app.name not in covered]
+    names = present | {normalize_py(app.name) for app in custom}
+    extra_runtime, extra_build, unpinned, declared_names = custom_range_pins(
+        root, custom, names, [*runtime, *toolchain, *(bc.Pin(n, v) for n, v in local)], [*build, *toolchain])
+    runtime, build = [*runtime, *extra_runtime], [*build, *extra_build]
+    try:  # a package a person approved is a requirement of the bench, whichever package asked for it
+        approved = {normalize_py(n) for n in store.vetted_names(root, "pypi")}
+    except store.StoreError as exc:
+        raise BaselineError(f"vetted.json cannot be read ({exc})") from exc
     config = bc.ConfigInput(
-        runtime=tuple(runtime), build=tuple(build),
-        toolchain=tuple(bc.Pin(normalize_py(t[0]), t[1], "", "toolchain") if not isinstance(t, bc.Pin) else t
-                        for t in toolchain),
+        runtime=tuple(runtime), build=tuple(build), unpinned=tuple(unpinned),
+        requirement_names=tuple(sorted({normalize_py(p.name) for p in (*runtime, *build, *toolchain)}
+                                       | declared_names | allowed | approved)),
+        toolchain=toolchain,
         allowed_builds=tuple(sorted(allowed)), local_apps=tuple(sorted(local)),
         other_local_names=tuple(sorted(other - present)), no_symlinks=no_symlinks)
     try:

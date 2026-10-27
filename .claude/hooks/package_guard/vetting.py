@@ -1995,6 +1995,46 @@ def _specifier_allows(version: str, op: str, bound: str) -> bool:
             "<=": key <= bound_key, "<": key < bound_key}[op]
 
 
+def pypi_project_exists(name):
+    """True when `name` is a project on PyPI, False when PyPI says it is not (404), None when that could
+    not be found out (offline, an error, a reply of another shape)."""
+    try:
+        meta = _mandatory_json(f"https://pypi.org/pypi/{_pypi_normalise(name)}/json")
+    except (ProviderError, *_SHAPE_ERRORS):
+        return None
+    return meta is not None
+
+
+def requirement_specifiers(requirement):
+    """([(op, version)], name with extras) of a PyPI requirement string, its environment marker
+    dropped; None when a specifier is not one this can judge a final release against (`===`, a
+    pre-release or local version, a `.*` wildcard after anything but `==` / `!=`)."""
+    if not isinstance(requirement, str):
+        return None
+    match = _BUILD_REQUIREMENT.match(requirement.split(";", 1)[0])
+    if not match:
+        return None
+    specifiers = []
+    for part in [p for p in match.group("specs").split(",") if p.strip()]:
+        found = _SPECIFIER.match(part)
+        if not found or (found.group("version").endswith(".*") and found.group("op") not in ("==", "!=")):
+            return None
+        specifiers.append((found.group("op"), found.group("version")))
+    return specifiers, match.group("name") + re.sub(r"\s+", "", match.group("extras") or "")
+
+
+def newest_admitted(versions, requirements):
+    """The newest final release among `versions` that every requirement string admits, or None
+    (none does, or a requirement cannot be judged). Local, no network: it picks among releases a
+    person has already approved."""
+    parsed = [requirement_specifiers(text) for text in requirements]
+    if any(p is None for p in parsed):
+        return None
+    admitted = [v for v in versions if _stable_key("pypi", v) is not None
+                and all(_specifier_allows(v, op, bound) for specifiers, _n in parsed for op, bound in specifiers)]
+    return max(admitted, key=lambda v: _stable_key("pypi", v)) if admitted else None
+
+
 def suggest_build_pin(requirement: str, registry: str = "https://pypi.org"):
     """(name with extras, version) the denial of an unpinned build requirement
     names, or None.

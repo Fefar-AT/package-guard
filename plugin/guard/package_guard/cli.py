@@ -1080,19 +1080,29 @@ def _bench_config(root, args) -> int:
             print(f"error: {token!r} is not an option of `bench-config {verb}`\n{_bench_config_usage()}",
                   file=sys.stderr)
             return 2
+    for name in new_apps:
+        # uv is told it may BUILD a package named like the new app, from source, running its setup code: a
+        # name that is a project on PyPI (or may be: offline) could be built from the index instead.
+        if vetting.pypi_project_exists(name) is not False:
+            print(f"error: --new-app {name}: {name} is a project on PyPI, or PyPI could not be asked, and a "
+                  "package of that name would be built from source by uv. Choose another name for the app",
+                  file=sys.stderr)
+            return 1
     bench = bench_config.bench_root(bench_dir or os.getcwd())
     if bench is None:
         print("error: no Frappe bench (a directory with apps/ and sites/) holds "
               f"{bench_dir or os.getcwd()}; use --bench <dir>", file=sys.stderr)
         return 2
     try:
-        config = bench_gate.config_input(root, bench)
+        # A name given to `apply --new-app` lasts until the next `apply`: that one passes only its own.
+        config = bench_gate.config_input(root, bench, new_apps=new_apps if verb == "apply" else None)
         if toolchain:
-            config = dataclasses.replace(config, toolchain=tuple(toolchain))
+            config = dataclasses.replace(config, toolchain=tuple(toolchain), requirement_names=tuple(sorted(
+                {*config.requirement_names, *(bench_config._normalize(p.name) for p in toolchain)})))
+            if bench_gate.new_app_problem(config):
+                raise bench_config.BenchConfigError(bench_gate.new_app_problem(config))
         if no_symlinks:
             config = dataclasses.replace(config, no_symlinks=True)
-        if new_apps:
-            config = dataclasses.replace(config, new_apps=tuple(sorted({*config.new_apps, *new_apps})))
         if verb == "check":
             problems = bench_config.verify(bench, root, config, home=Path.home())
             if not problems:
@@ -1110,6 +1120,9 @@ def _bench_config(root, args) -> int:
         print(f"wrote {path}")
     for note in result.notes:
         print(f"note: {note}")
+    for app, name, _section, why in config.unpinned:
+        print(f"note: apps/{app} asks for {name} in a version range and {why}, so it is not pinned to a "
+              "release the app can install; approve one (the bench command asks), then run apply again")
     for path in result.dropped:
         print(f"no longer recorded: {path} (its app is not in the bench any more; the file itself is left as it is)")
     if not result.written and not result.dropped:

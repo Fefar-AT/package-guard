@@ -1,5 +1,42 @@
 # Release notes
 
+## v1.12.1
+
+Closes holes found after v1.12.0 shipped; upgrade if you use a Frappe bench. **After
+upgrading, run `sh .claude/hooks/package_guard/pg bench-config apply` once in the bench
+folder**: the guard writes stricter installer files, and bench commands are refused
+until you do.
+
+- **A baseline vouches for a Yarn sub-folder only when it lists that folder.**
+  A folder under `node_modules`, `.git` or `__pycache__`, or a new one, gets
+  the full review and malware check.
+- **`bench build` checks an app whose `build` script is any value**, not only
+  text, as Frappe's own build runs Yarn there too.
+- **`bench build` no longer skips apps Frappe's build finds.** Frappe v16
+  treats a folder as an app when its `hooks.py`, `modules.txt` and
+  `patches.txt` are anywhere inside it, and v15 builds every line of
+  `sites/apps.txt`. Package Guard now checks all of those folders like any
+  other app, and refuses an `apps.txt` line that points outside `apps/` or
+  is not exactly one folder of it (`./plain`, `plain/` and `PLAIN` count as `plain`).
+- **A version range in your own app is installed at the release you approved**, not
+  the newest one. After you approve a range's package, run `bench-config apply`
+  again; the guard checks the pinned release before every bench install, and
+  refuses a range that has none, even while a review is open.
+- **Your own app may use only the `flit_core` or `setuptools` build backend**; any
+  other can ask for packages nobody reviews. An app with no `[build-system]` gets
+  uv's default `setuptools`, which is now reviewed and pinned like any build
+  requirement (run `bench-config apply` after approving it); a `[build-system]`
+  that lists no requirements is refused, and the approved versions also hold
+  while your app is being built. `UV_PRERELEASE`
+  and the other release-choosing variables are refused before a bench command.
+- **Recreating the bench's `env/` is refused in every spelling** (`python3
+  -mvenv --clear env`, `-m virtualenv`, `$PWD/env`).
+- **`python setup.py <command>` is refused in any project**, whatever the command: a
+  `setup.cfg` alias can make `build` install packages. `setup.py --version` still runs.
+  `python -m setup` is refused too.
+- **`bench-config apply --new-app NAME`** is refused when NAME is a project on
+  PyPI or a requirement of the bench, and the name lasts until the next `apply`.
+
 ## v1.12.0
 
 - **Frappe / ERPNext benches now work with the guard** (Frappe v15 and v16

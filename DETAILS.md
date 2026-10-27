@@ -500,7 +500,8 @@ apply`. Either way you answer the prompt for `apply`.
 **Yarn must be visible to the guard.** Every bench command that runs Yarn (an
 install, and a build in an app that has a `build` script and no `node_modules`)
 needs Yarn Classic 1.x on the PATH the guard sees, which is the PATH Claude Code
-was started with. nvm and volta often set `yarn` only inside your shell. If the
+was started with. (Frappe's build counts any `build` entry in `scripts`, whatever
+its value, as something to run; so does the guard.) nvm and volta often set `yarn` only inside your shell. If the
 guard says the `yarn` it finds "is not shown to be Yarn Classic", start Claude
 Code from a shell where `yarn --version` prints 1.x, then try again.
 
@@ -528,9 +529,12 @@ build cannot find its tools. When that is the case the guard says so in the
 answer to `bench build` and names the command: with `apps/erpnext/banking` as the
 working directory, as its own command, run `yarn install --frozen-lockfile
 --ignore-scripts`. An approved ERPNext baseline already covers `banking/yarn.lock`,
-so that command is allowed without a review per package. If the lock was
-changed after the approval, the baseline no longer covers it and every package
-is reviewed instead.
+so that command is allowed without a review per package. This holds only for a
+folder whose own `package.json` and `yarn.lock` are listed in the approved
+baseline with the digests on disk. A folder inside `node_modules`, `.git` or
+`__pycache__`, a new folder, or a lock that was changed after the approval is
+not covered: every package is reviewed and the whole tree is checked for known
+malware, as for any other folder.
 
 **Adding a JavaScript package to your own app.** Your app uses Yarn Classic
 (version 1). A package that `package.json` lists and `yarn.lock` does not have

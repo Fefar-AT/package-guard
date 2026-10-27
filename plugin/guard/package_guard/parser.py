@@ -997,9 +997,14 @@ def _parse_segment(words, assignments, inherited, command, stdin=None):
     if head == "setup.py":
         _check_setup_py(words[1:])
     elif verbs.is_interpreter(head):
-        script = _python_script(words)
+        script = _python_script(words, stdin=True)
         if script is not None and _executable(script[0].text) == "setup.py":
             _check_setup_py(script[1])
+        elif script is not None and script[0].text in ("-", "/dev/stdin", "/dev/fd/0"):
+            _check_setup_stdin(script[1])  # a setup.py piped in cannot be told from any other script
+        module = _python_module(words)
+        if module is not None and module[0] == "setup":   # `python -m setup develop` runs ./setup.py
+            _check_setup_py(module[1])
 
     installer = verbs.lookup(head)
 
@@ -1168,9 +1173,9 @@ def _python_module(words):
     return None
 
 
-def _python_script(words):
+def _python_script(words, stdin=False):
     """(script word, the words after it) of the file an interpreter command line runs; None when it
-    runs a module (`-m`), a string (`-c`) or standard input. The options are read as in
+    runs a module (`-m`), a string (`-c`) or, unless `stdin`, standard input. The options are read as in
     `_python_module`."""
     i = 1
     while i < len(words):
@@ -1178,7 +1183,7 @@ def _python_script(words):
         if text == "--":
             return (words[i + 1], list(words[i + 2:])) if i + 1 < len(words) else None
         if text == "-":
-            return None
+            return (words[i], list(words[i + 1:])) if stdin else None
         if not text.startswith("-"):
             return words[i], list(words[i + 1:])
         if text.startswith("--"):
@@ -1195,26 +1200,40 @@ def _python_script(words):
     return None
 
 
-# What `python setup.py <command>` does, by command (setuptools and distutils): these install the
-# project (`develop` runs `python -m pip install -e .` since setuptools 80, dependencies and
-# `--index-url` included), fetch `install_requires` / `tests_require` through easy_install, or
-# upload. Anything named `install*` is one. The rest build or inspect in place.
-_SETUP_PY_INSTALL = frozenset({"develop", "easy_install", "bdist_egg", "test", "pytest", "upload",
-                               "upload_docs", "register", "bdist_wininst", "bdist_msi", "bdist_rpm"})
-_SETUP_PY_BUILD = frozenset({"sdist", "build", "build_py", "build_ext", "build_clib", "build_scripts",
-                             "bdist", "bdist_wheel", "bdist_dumb", "check", "clean", "egg_info",
-                             "dist_info", "editable_wheel"})
+# What `python setup.py <command>` does: `develop` runs `python -m pip install -e .` since setuptools 80
+# (dependencies and `--index-url` included); `install*`, `easy_install` and `test` fetch `install_requires`
+# / `tests_require`; `upload` publishes. And a `setup.cfg` or `~/.pydistutils.cfg` `[aliases]` section turns
+# ANY command word into another (`build = develop --index-url ...`), so no command word is known to only
+# build: the one thing that is read is a command line with none (`--version`, `--help`, `--name`).
 _SETUP_PY_SOURCE_OPTIONS = ("--index-url", "--find-links", "--allow-hosts", "--index")
 _SETUP_PY_MESSAGE = (
-    "`setup.py {command}` installs this project and its dependencies, or fetches them, out of the "
-    "hook's sight (setuptools 80 and later run `develop` as `pip install -e .`, with an `--index-url` "
-    "of your choosing). Use the route Package Guard reviews: `bench setup requirements` for a Frappe "
-    "app, or `pip install -e .` / `uv pip install -e .` elsewhere, which review every dependency. "
-    "Commands that only build or read the project (`setup.py sdist`, `--version`) are not refused")
+    "`setup.py {command}` may install this project and its dependencies, or fetch them, out of the "
+    "hook's sight: setuptools 80 and later run `develop` as `pip install -e .` (with an `--index-url` "
+    "of your choosing), and an `[aliases]` section of a setup.cfg turns any command word, `build` or "
+    "`sdist` included, into one of those. Use the route Package Guard reviews: `bench setup "
+    "requirements` for a Frappe app, or `pip install -e .` / `uv pip install -e .` elsewhere, which "
+    "review every dependency; `uv build` builds a distribution. Only a command line with no "
+    "command word (`setup.py --version`, `--help`) is not refused")
+
+
+# The setup commands a script that is fed in on standard input is refused for naming (`python - develop
+# < setup.py`): the file is not named, so this is the cheap reading, not the complete one.
+_SETUP_STDIN_COMMANDS = frozenset({
+    "develop", "install", "easy_install", "bdist_egg", "test", "upload", "register", "build", "build_py",
+    "build_ext", "build_clib", "build_scripts", "sdist", "bdist", "bdist_wheel", "bdist_dumb", "egg_info",
+    "dist_info", "editable_wheel", "check", "clean", "install_lib", "install_scripts", "install_data",
+    "install_egg_info", "install_headers"})
+
+
+def _check_setup_stdin(args):
+    for word in args:
+        if word.text in _SETUP_STDIN_COMMANDS:
+            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=word.text) + "; a script read from standard "
+                               "input is run with it", code="unsupported-form")
 
 
 def _check_setup_py(args):
-    """Refuse a `setup.py` command that installs or fetches. `args` are the words after the file."""
+    """Refuse a `setup.py` command line that names a command. `args` are the words after the file."""
     texts = [a.text for a in args]
     commands = [t for t in texts if not t.startswith("-")]
     for text in texts:
@@ -1227,13 +1246,8 @@ def _check_setup_py(args):
         if word.dynamic or "$" in text:
             raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text) + "; the command is only known "
                                "when it runs", code="unsupported-form")
-        if text.startswith("-"):
-            continue
-        if text.startswith("install") or text in _SETUP_PY_INSTALL:
+        if not text.startswith("-"):
             raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text), code="unsupported-form")
-        if text not in _SETUP_PY_BUILD and "-f" in texts:
-            raise _Unsupported(_SETUP_PY_MESSAGE.format(command=text)
-                               + "; `-f` names a directory to find packages in", code="unsupported-form")
 
 
 # Modules that install, or run an installer, and that are not read as `pip` or `uv`
@@ -1781,6 +1795,11 @@ def _check_bench_env(assignments):
     prefixes = tuple(table["refuse_prefixes"]["retarget"])
     for assignment in assignments:
         name = _assignment(assignment)[0]
+        if name.upper() in verbs.BENCH_RESOLUTION_VARS:
+            raise _Unsupported(
+                f"{name!r} changes which release uv picks (a pre-release, the lowest, one newer than the "
+                "cool-down), and a bench's uv chooses the release of a range and of its default build "
+                "requirement: run the bench command without it", code="unknown-setting")
         if name.upper() in refused or name.upper().startswith(prefixes):
             raise _Unsupported(
                 f"{name!r} changes which program or interpreter bench's installs run: run the "
